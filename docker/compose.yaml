@@ -1,17 +1,20 @@
-# ZelliMobile — zellimserver gRPC rig.
+# ZelliMobile — dev rig: zellimserver + zellimctl over SSH.
 #
 # Loopback (default — safe, nothing exposed):
 #   docker compose -f docker/compose.yaml up --build
 #
 # LAN exposure (a phone on the same network can reach the server):
-#   BIND_ADDR=<lan-ip> DEV_HOST=<lan-ip> \
-#     docker compose -f docker/compose.yaml up --build
+#   BIND_ADDR=<lan-ip> docker compose -f docker/compose.yaml up --build
 #
 # Or use the helper wrapper:
 #   ./docker/run.sh --host <lan-ip>
 #
-# Connect: https://<DEV_HOST>:50051  +  token from the startup banner / logs.
-# Cert is self-signed — trust the PEM or use the app's insecure-dev mode.
+# Then SSH in and drive it with zellimctl (a TTY is required — note the -t):
+#   ssh -t root@<host> -p 2222     # no password
+#   zellimctl                      # Configure → Cert → Tokens → Server → Pair
+#
+# zellimctl starts the gRPC server on :50051; the cert is self-signed (pair by
+# scanning the QR, or trust the PEM / use the app's insecure-dev mode).
 services:
   zellimserver:
     build:
@@ -19,15 +22,15 @@ services:
       dockerfile: docker/Dockerfile
     image: zellimobile-grpc-rig
     container_name: zellimobile-grpc-rig
-    # BIND_ADDR controls which host interface is published.
+    # BIND_ADDR controls which host interface the ports are published on.
     # Default 127.0.0.1 → loopback only (nothing leaves the host).
     # Set to a LAN IP to publish on the network.
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${GRPC_PORT:-50051}:50051"
+      # SSH — attach and drive zellimctl.
+      - "${BIND_ADDR:-127.0.0.1}:${SSH_PORT:-2222}:22"
     environment:
       SESSION: "${SESSION:-backend-dev}"
-      DEV_HOST: "${DEV_HOST:-127.0.0.1}"
-      GRPC_PORT: "${GRPC_PORT:-50051}"
     volumes:
       # Persist token DB, cert, session state, and zellij config across restarts.
       # zellimserver data lives under zellij's XDG share dir.

@@ -2,15 +2,16 @@
 # ZelliMobile — zellimserver gRPC backend rig
 #
 # Multi-stage build:
-#   builder  — rust:1.92-alpine, static musl binary (A3 recipe)
-#   runtime  — debian:trixie-slim with full terminal tooling + zellij 0.44.3
+#   builder  — rust:1.92-alpine, static musl binaries (zellimserver + zellimctl)
+#   runtime  — debian:trixie-slim with full terminal tooling + zellij 0.44.3,
+#              an SSH server, and zellimctl to configure/start the server
 #
 # Build context: repo root  (compose sets context: ..)
 #   docker compose -f docker/compose.yaml up --build
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 1 — builder: compile zellimserver as a static musl binary
+# Stage 1 — builder: compile the workspace (zellimserver + zellimctl) as musl
 # ══════════════════════════════════════════════════════════════════════════════
 FROM rust:1.92-alpine AS builder
 
@@ -49,17 +50,18 @@ RUN apk add --no-cache \
 
 WORKDIR /build
 
-# Copy only the crate we need to compile (minimise cache invalidation)
+# Copy the whole Cargo workspace (zellimctl path-depends on zellimserver) so
+# both binaries build from the same locked dependency set.
+COPY Cargo.toml Cargo.lock ./
 COPY zellimserver/ ./zellimserver/
+COPY zellimctl/ ./zellimctl/
 
-WORKDIR /build/zellimserver
-
-# Build the static binary.
+# Build both static release binaries (zellimserver + zellimctl).
 # On rust:alpine the native target IS musl — no --target flag needed.
 # OPENSSL_STATIC=1  → openssl-sys links statically
 # PKG_CONFIG_ALL_STATIC=1 → all pkg-config deps linked statically
 RUN OPENSSL_STATIC=1 PKG_CONFIG_ALL_STATIC=1 \
-    cargo build --release
+    cargo build --release --workspace
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Stage 2 — runtime: Debian tooling image + zellij 0.44.3 pinned
@@ -74,6 +76,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ── Base + a broad set of terminal tooling (core: strict) ────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git openssl xz-utils unzip \
+      openssh-server \
       locales procps iproute2 less man-db \
       bash zsh \
       neovim \
@@ -120,9 +123,25 @@ RUN mkdir -p /root/projects/api/src \
     && git -C /root/projects/api add -A \
     && git -C /root/projects/api -c user.email=test@example.com -c user.name=test commit -qm "init" || true
 
-# ── zellimserver binary (static musl, from builder stage) ────────────────────
-COPY --from=builder /build/zellimserver/target/release/zellimserver /usr/local/bin/zellimserver
-RUN chmod +x /usr/local/bin/zellimserver
+# ── zellimserver + zellimctl binaries (static musl, from builder stage) ──────
+COPY --from=builder /build/target/release/zellimserver /usr/local/bin/zellimserver
+COPY --from=builder /build/target/release/zellimctl /usr/local/bin/zellimctl
+RUN chmod +x /usr/local/bin/zellimserver /usr/local/bin/zellimctl
+
+# Bind on all interfaces by default so the gRPC server is reachable through the
+# published port. The Docker port mapping (compose) still gates host exposure;
+# override per-run via zellimctl's Configure screen or ZELLIMSERVER_BIND.
+ENV ZELLIMSERVER_BIND=0.0.0.0:50051
+
+# ── SSH access (dev rig) ─────────────────────────────────────────────────────
+# Passwordless root login over SSH so you can attach and drive zellimctl. Host
+# keys are generated at build time; the entrypoint clears root's password so no
+# credential is needed. This is a dev/test affordance — see the security note.
+RUN ssh-keygen -A \
+    && mkdir -p /run/sshd \
+    && sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && sed -ri 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
+    && sed -ri 's/^#?PermitEmptyPasswords.*/PermitEmptyPasswords yes/' /etc/ssh/sshd_config
 
 WORKDIR /root
 
@@ -130,7 +149,7 @@ COPY docker/layout.kdl /root/.config/zellij/layouts/zellimobile.kdl
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# gRPC port
-EXPOSE 50051
+# gRPC port + SSH
+EXPOSE 50051 22
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

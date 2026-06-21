@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# run.sh — convenience wrapper for the ZelliMobile gRPC rig.
+# run.sh — convenience wrapper for the ZelliMobile dev rig.
 #
 # Usage:
 #   ./docker/run.sh [OPTIONS] [-- EXTRA_COMPOSE_ARGS...]
 #
 # Options:
-#   --host <IP>     Bind the gRPC port to this host interface and set DEV_HOST
-#                   (used for the cert SAN and banner URL).
+#   --host <IP>     Publish the gRPC + SSH ports on this host interface.
 #                   Default: 127.0.0.1 (loopback — nothing exposed on the network).
 #   --host=<IP>     Same, equals-sign form.
 #   -h, --help      Show this help and exit.
@@ -21,8 +20,9 @@
 #   # Build without cache, then run:
 #   ./docker/run.sh --host 192.168.1.50 -- --no-deps
 #
-# The token and cert are printed at startup; also in:
-#   sudo docker compose -f docker/compose.yaml logs
+# Once it is up, SSH in (no password) and start the server with zellimctl:
+#   ssh -t root@<host> -p 2222
+#   zellimctl
 
 set -euo pipefail
 
@@ -63,23 +63,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# DEV_HOST: the hostname/IP placed in the cert SAN and the banner URL.
-# When BIND_ADDR is non-loopback (a real network address), DEV_HOST should
-# match it so the phone can validate the self-signed cert.
-if [[ -z "${DEV_HOST:-}" ]]; then
-  if [[ "${BIND_ADDR}" != "127.0.0.1" && "${BIND_ADDR}" != "::1" && "${BIND_ADDR}" != "localhost" ]]; then
-    DEV_HOST="${BIND_ADDR}"
-  else
-    DEV_HOST="127.0.0.1"
-  fi
-fi
-
 export BIND_ADDR
-export DEV_HOST
 
-echo "[run.sh] BIND_ADDR=${BIND_ADDR}  DEV_HOST=${DEV_HOST}"
-echo "[run.sh] gRPC will be published at: ${BIND_ADDR}:${GRPC_PORT:-50051}"
-echo "[run.sh] Cert SAN will cover:       ${DEV_HOST}"
+echo "[run.sh] BIND_ADDR=${BIND_ADDR}"
+echo "[run.sh] publishing  gRPC ${BIND_ADDR}:${GRPC_PORT:-50051}  +  SSH ${BIND_ADDR}:${SSH_PORT:-2222}"
+echo "[run.sh] after boot:  ssh -t root@${BIND_ADDR} -p ${SSH_PORT:-2222}  then run  zellimctl"
 echo ""
 
 exec sudo docker compose -f "${COMPOSE_FILE}" up --build "${EXTRA_ARGS[@]}"
