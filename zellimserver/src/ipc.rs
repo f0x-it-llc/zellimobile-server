@@ -4,9 +4,6 @@
 //! gRPC layer (grpc.rs / relay.rs in B2) can open a session attach and
 //! exchange render/input messages without touching zellij internals
 //! directly.
-//!
-//! **Phase A behaviour is preserved** — the `spike` example (`examples/spike.rs`)
-//! uses these helpers directly, reproducing the A1/A2 proof.
 
 use std::path::PathBuf;
 use std::time::Duration;

@@ -1,9 +1,0 @@
-// W2 FA spike — a tab with a 2-pane vertical split, to test focus-while-fullscreen geometry.
-layout {
-    tab name="split" focus=true {
-        pane split_direction="vertical" {
-            pane command="bash" size="60%" { args "-c" "i=0; while true; do echo \"AAA $i\"; i=$((i+1)); sleep 0.3; done"; }
-            pane command="bash" { args "-c" "i=0; while true; do echo \"BBB $i\"; i=$((i+1)); sleep 0.3; done"; }
-        }
-    }
-}

@@ -15,10 +15,6 @@ path = "src/bin/zellimserver.rs"
 # ─── Examples ────────────────────────────────────────────────────────────────
 
 [[example]]
-name = "spike"
-path = "examples/spike.rs"
-
-[[example]]
 name = "grpc_client"
 path = "examples/grpc_client.rs"
 
@@ -41,10 +37,6 @@ path = "examples/action_client.rs"
 [[example]]
 name = "session_client"
 path = "examples/session_client.rs"
-
-[[example]]
-name = "spike_relay_query"
-path = "examples/spike_relay_query.rs"
 
 # ─── Runtime deps ────────────────────────────────────────────────────────────
 
