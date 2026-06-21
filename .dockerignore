@@ -1,0 +1,13 @@
+# .dockerignore — keep the Docker build context small.
+# The build only needs docker/ + zellimserver/; exclude the rest.
+
+# Rust build artifacts (huge — must exclude)
+target/
+**/target/
+
+# Git internals
+.git/
+
+# Dart test client artifacts
+**/.dart_tool/
+**/build/

@@ -1,0 +1,53 @@
+//! zellimctl — install / configure / pair TUI for zellimserver.
+//!
+//! A standalone ratatui control panel that drives zellimserver's library + CLI
+//! surface (config / cert / tokens / control / pairing). This binary wires up
+//! logging, the terminal, the panic hook, the tokio runtime, and hands off to
+//! the event loop in [`tui::runner`].
+//!
+//! Architecture (TEA, single crate):
+//! - [`app`] — pure state / message / update / action (no ratatui).
+//! - [`tui`] — terminal lifecycle, event loop, theme, screen rendering.
+
+mod app;
+mod pairing;
+mod server;
+mod tui;
+
+use anyhow::Result;
+
+use app::AppState;
+
+fn main() -> Result<()> {
+    // Logging to stderr. The TUI owns stdout (alternate screen), so env_logger's
+    // default stderr target does not corrupt the rendered frame. Quiet by
+    // default; raise with e.g. `RUST_LOG=zellimctl=debug`.
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Warn)
+        .init();
+
+    // Build the multi-thread runtime explicitly so async UpdateAction tasks
+    // (later waves: spawn server, mint token, poll status) have an executor.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(run())
+}
+
+/// Initialize the terminal, install the panic hook, run the event loop, and
+/// restore the terminal on exit (panic restoration is handled by the hook).
+async fn run() -> Result<()> {
+    let mut terminal = tui::terminal::init();
+
+    // Install AFTER init so our restore hook wraps ratatui's (see terminal.rs).
+    tui::terminal::install_panic_hook();
+
+    let mut state = AppState::new();
+    let result = tui::runner::run(&mut terminal, &mut state);
+
+    // Restore on normal exit too (the panic hook covers the panic path).
+    tui::terminal::restore();
+
+    result
+}

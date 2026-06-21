@@ -1,0 +1,3 @@
+[workspace]
+members = ["zellimserver", "zellimctl"]
+resolver = "2"

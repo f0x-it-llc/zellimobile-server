@@ -1,0 +1,39 @@
+// ZelliMobile test session layout — a realistic multi-tab / multi-pane setup so
+// the mobile client's session list and pane picker have interesting content.
+layout {
+    tab name="editor" focus=true {
+        pane split_direction="vertical" {
+            pane command="nvim" size="70%" {
+                args "src/main.rs"
+                cwd "/root/projects/api"
+            }
+            pane split_direction="horizontal" {
+                pane cwd="/root/projects/api"
+                pane command="btop"
+            }
+        }
+    }
+    tab name="shell" {
+        pane cwd="/root"
+        pane command="htop"
+    }
+    tab name="logs" {
+        pane command="bash" {
+            args "-c" "while true; do echo \"[$(date +%T)] nginx: GET / 200\"; sleep 2; done"
+        }
+    }
+    // Floating pane fixture — exercises the floating-fullscreen code path
+    // (BE-HANG fix). Bare integer coords required; percent strings silently
+    // drop the whole tab in zellij 0.44.3.
+    tab name="float-test" {
+        pane cwd="/root"
+        floating_panes {
+            pane name="floaty" {
+                x 8
+                y 5
+                width 30
+                height 12
+            }
+        }
+    }
+}

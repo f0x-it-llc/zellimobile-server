@@ -1,0 +1,9 @@
+# Rust build output (workspace target dir lives at the root).
+/target
+
+# Cargo backup files.
+**/*.rs.bk
+
+# Dart test client build artifacts.
+**/.dart_tool/
+**/build/

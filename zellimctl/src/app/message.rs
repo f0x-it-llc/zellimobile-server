@@ -1,0 +1,103 @@
+//! Messages: the only way state changes.
+//!
+//! A `Message` is produced by the runner (terminal input, ticks) or by async
+//! tasks spawned from [`super::action::UpdateAction`], then fed to
+//! [`super::update::update`]. This is the sole input to the TEA update cycle.
+
+use crossterm::event::KeyEvent;
+
+use crate::server::tokens::TokenRecord;
+
+use super::state::{Screen, ServerInfo};
+
+/// A lightweight snapshot of the effective server configuration.
+///
+/// Plain struct (no ratatui, no proto types) that the Config screen renders.
+/// Populated from `server::effective_config()` + `pairing::net::reachable_ipv4()`.
+#[derive(Debug, Clone)]
+pub struct ConfigSnapshot {
+    /// The resolved bind address (e.g. `"127.0.0.1:50051"`).
+    pub bind_addr: String,
+    /// Directory where the TLS cert files are stored.
+    pub cert_dir: String,
+    /// Non-loopback IPv4 addresses the mobile client could reach.
+    pub reachable_ips: Vec<std::net::Ipv4Addr>,
+}
+
+/// Everything that can drive a state change.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Some variants emitted only by async tasks or later waves.
+pub enum Message {
+    /// A key was pressed (delivered by the runner's input poll).
+    Key(KeyEvent),
+    /// The ~50 ms wall-clock tick (poll timeout path). Drives animations + live poll counter.
+    Tick,
+    /// Request a clean shutdown; the runner restores the terminal and exits.
+    Quit,
+    /// Navigate to a specific screen.
+    NavTo(Screen),
+
+    // ── Async task results ──────────────────────────────────────────────────
+    /// Server status result, posted by a `RefreshStatus` task.
+    ///
+    /// `Some(info)` when the server is running; `None` when it is stopped /
+    /// unreachable. The `server/` facade converts the infra `StatusInfo` into
+    /// the app-layer [`ServerInfo`] mirror before this message is posted.
+    StatusLoaded(Option<ServerInfo>),
+    /// Config + reachable-IP snapshot, posted by a `LoadConfig` task.
+    ConfigLoaded(ConfigSnapshot),
+    /// Cert was ensured; fingerprint + active SANs returned.
+    CertEnsured {
+        fingerprint: String,
+        sans: Vec<String>,
+    },
+    /// A background action failed with a human-readable error message.
+    ActionFailed(String),
+    /// A background action completed successfully with an optional message.
+    ActionOk(String),
+
+    // ── Token screen messages ─────────────────────────────────────────────────
+    /// Tokens list loaded from the token DB.
+    TokensLoaded(Vec<TokenRecord>),
+
+    /// A fresh token was just created; the plaintext secret is available once.
+    TokenCreated {
+        /// The one-time plaintext token secret.
+        token: String,
+        /// The display name assigned to the new token.
+        name: String,
+    },
+
+    /// A token operation (create/revoke) completed; the list needs a refresh.
+    TokensChanged,
+
+    // ── Pairing screen messages ───────────────────────────────────────────────
+    /// Pairing QR is ready: URI to encode + client baseline to detect connection.
+    ///
+    /// Only accepted if the carried `seq` matches the current pairing seq.
+    PairingReady {
+        /// The `zellimobile://pair?...` URI to encode into a QR.
+        uri: String,
+        /// Number of mobile clients attached when the QR was generated.
+        baseline_clients: usize,
+        /// The advertise host that was embedded in the URI.
+        host: String,
+        /// The port embedded in the URI.
+        port: u16,
+        /// Short fingerprint excerpt for display below the QR.
+        fingerprint_short: String,
+        /// Name of the pairing token minted for this QR (carried so a later
+        /// regenerate / screen-leave can revoke it).
+        token_name: String,
+        /// Sequence number (must match current pairing seq to be accepted).
+        seq: u64,
+    },
+
+    /// Pairing generation failed; carries human-readable error + seq.
+    PairingFailed {
+        /// Error message to display.
+        err: String,
+        /// Sequence number (must match current pairing seq to be accepted).
+        seq: u64,
+    },
+}

@@ -1,0 +1,193 @@
+//! Shared types, aliases, and constants used across the relay submodules.
+
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+use tonic::Status;
+
+use zellij_utils::data::PaneId;
+
+use crate::proto::ServerFrame;
+
+// ─── RelayControl ─────────────────────────────────────────────────────────────
+
+/// Client-supplied floating-pane context for a fullscreen toggle (Bug 2c).
+///
+/// Lets the relay decide fill-vs-hide-vs-tiled without a synchronous IPC query
+/// on the select-loop hot path. Derived by the mobile client from its last
+/// polled layout. Staleness tradeoff: if another client toggled floating
+/// visibility within the client's poll window, the hint may be stale and the
+/// toggle may need a second tap — accepted for v1 (the sole-/mobile-client case
+/// is always accurate). When a caller does NOT attest a hint (the
+/// `ToggleFullscreen` variant carries `None`) the relay runs the live query
+/// instead.
+#[derive(Debug, Clone, Copy)]
+pub struct FloatingHint {
+    /// The target pane is a floating pane (`Pane.is_floating`).
+    pub target_is_floating: bool,
+    /// Floating panes are visible in the target's tab (`Tab.floating_panes_visible`).
+    pub floating_visible: bool,
+    /// The target is the currently-focused, visible floating pane.
+    pub target_is_focused_floating: bool,
+}
+
+/// Control command routed to a live relay's AttachClient connection
+/// (W2.0a/b spike). Sent by the unary `GoToTab`/`FocusPane` RPCs through the
+/// per-session [`ControlRegistry`] so the action targets the *rendering* client
+/// (`is_cli_client:false`) rather than an ephemeral CLI client.
+#[derive(Debug)]
+pub enum RelayControl {
+    /// Switch the rendering client to the tab with this id.
+    SwitchTab(u64),
+    /// Focus a specific pane (and, in single-pane mode, re-point the display
+    /// subscription to it).
+    FocusPane(PaneId),
+    /// Toggle fullscreen (or floating-fill) for a specific pane.
+    /// Tiled panes: focus then active-pane toggle (clean parity toggle).
+    /// Floating panes: fill-or-hide via [`fill_floating_pane`]/[`hide_floating_panes`].
+    ///
+    /// `hint` (Bug 2c): client-supplied floating context so the relay can skip a
+    /// synchronous `pane_is_floating_with_visibility` IPC query on the hot path.
+    /// `None` → the relay falls back to a live query (keyboard-driven / hint-less
+    /// callers).
+    ToggleFullscreen {
+        pane: PaneId,
+        hint: Option<FloatingHint>,
+    },
+    /// Query the current tab+pane layout over this relay's existing persistent
+    /// connection (B-QUERY, BE-LAYOUT; FX-QUERY redesign).
+    ///
+    /// The inbound arm does NOT await the reply: it hands an
+    /// [`InFlightQuery`] (carrying this `reply`) to the render thread, sends
+    /// `Action::ListTabs` then `Action::ListPanes`, and returns immediately. The
+    /// render thread — the sole owner of `recv()` — captures the two `Log`
+    /// replies (tabs then panes) and fulfills `reply`. The single timeout bound
+    /// is `RELAY_QUERY_TIMEOUT` in `grpc.rs`; on timeout it drops the receiver,
+    /// which the render thread observes and uses to retire the query.
+    QueryLayout {
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<(String, String)>>,
+    },
+}
+
+// ─── RelayViewState ───────────────────────────────────────────────────────────
+
+/// Per-session relay-client view state (B-FOCUS, BE-LAYOUT).
+///
+/// The relay routes every tab-switch and focus action through its own
+/// persistent client, so it knows this client's exact active tab and focused
+/// pane — independently of how many other desktop clients are attached (zellij
+/// reports the union across all clients in ListTabs/ListPanes).
+///
+/// `get_layout` uses this to OVERRIDE `TabMsg.active` and `PaneMsg.is_focused`
+/// with per-relay-client values, giving single-client correctness for the mobile
+/// user regardless of desktop clients.
+#[derive(Debug, Clone, Default)]
+pub struct RelayViewState {
+    /// The tab_id of the currently active tab for this relay client.
+    /// `None` until first confirmed from attach-time query or a SwitchTab.
+    pub active_tab: Option<u64>,
+    /// The focused pane for this relay client.
+    /// `None` when unknown (e.g. just after a bare tab switch or on init failure).
+    pub focused_pane: Option<PaneId>,
+}
+
+/// Per-session registry of relay view state (B-FOCUS). Keyed by session name.
+/// Populated on relay attach (queried from live zellij state); updated on each
+/// routed SwitchTab/FocusPane/ToggleFullscreen; removed on teardown.
+pub type ViewStateRegistry = Arc<dashmap::DashMap<String, RelayViewState>>;
+
+/// Per-session registry of live relay control senders (W2.0a/b spike). The gRPC
+/// service holds one; each relay registers its sender on attach and removes it
+/// on teardown. Last attach for a session wins (fine for the single-client
+/// spike).
+pub type ControlRegistry = Arc<dashmap::DashMap<String, mpsc::UnboundedSender<RelayControl>>>;
+
+// ─── Internal types ───────────────────────────────────────────────────────────
+
+/// Reply channel handed to `get_layout` for a single layout query (FX-QUERY).
+pub(crate) type QueryReply = tokio::sync::oneshot::Sender<anyhow::Result<(String, String)>>;
+
+/// An in-flight layout query, OWNED by the render thread (FX-QUERY).
+///
+/// The inbound `QueryLayout` arm constructs one (with a fresh monotonic `seq`)
+/// and hands it to the render thread over `query_tx`, then sends the two query
+/// actions and returns — it never awaits. The render thread fills `tabs` from
+/// the first captured `Log` and `panes` from the second, then fulfills `reply`
+/// and clears its slot. See the module-level FX-QUERY notes for the invariants.
+pub(crate) struct InFlightQuery {
+    /// Monotonic id; lets the render thread log/assert ordering and lets a newer
+    /// query replace an older one deterministically.
+    pub(crate) seq: u64,
+    /// Fulfilled with `(tabs_json, panes_json)` once both Logs are captured, or
+    /// dropped (cancelling the receiver) if replaced. `get_layout`'s outer
+    /// timeout drops the *receiver*, which we detect via `reply.is_closed()`.
+    pub(crate) reply: QueryReply,
+    /// First captured Log → ListTabs JSON. The second Log (panes) is consumed
+    /// inline at fulfillment, so it needs no field.
+    pub(crate) tabs: Option<String>,
+}
+
+/// Sender side of the inbound-task → render-thread query channel (std mpsc).
+pub(crate) type QueryTx = std::sync::mpsc::Sender<InFlightQuery>;
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/// Settle gap (ms) between un-fullscreening one pane and re-fullscreening another
+/// in the SAME tab. zellij's `unset_fullscreen` resets pane geom-overrides and
+/// resizes the tab; an immediate re-enter computes `panes_to_hide` on transitional
+/// geometry and bails (no-op). A short gap — matching the manual keyboard cadence,
+/// which works — lets the layout settle so the re-enter succeeds.
+// Kept in case future UX needs it (tiled parity toggle does not need a settle gap).
+#[allow(dead_code)]
+pub(crate) const FS_SETTLE_MS: u64 = 250;
+
+/// Backstop timeout for the live-state floating-pane visibility query in the
+/// `ToggleFullscreen` arm (BE-HANG). The per-recv socket timeout in
+/// `query_session` (`RECV_TIMEOUT` = 5 s) is the first line of defence; this
+/// outer bound covers two IPC round-trips plus codec overhead. On timeout the
+/// arm degrades to a no-op rather than wedging the `select!` loop.
+///
+/// (FX-QUERY: hoisted to module level from the former block-local const for
+/// consistency with the other timeout constants. The layout query no longer has
+/// a per-arm timeout — its single bound is `RELAY_QUERY_TIMEOUT` in `grpc.rs`,
+/// since the render thread now owns reply-fulfillment and the inbound arm never
+/// awaits.)
+pub(crate) const FLOAT_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// How often to re-validate the bearer token of a live attach stream.
+///
+/// The tower auth layer validates the token once at stream open (Major H).  A
+/// revoked/expired token would otherwise keep the stream alive indefinitely
+/// (remember_me tokens last 28 days), so we re-check on this interval and tear
+/// the stream down on the first failure.
+pub(crate) const TOKEN_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound on the outbound render channel.
+///
+/// Renders are coalesced full-screen ANSI snapshots; a small bound gives
+/// backpressure (a slow client makes the reader thread block in
+/// `blocking_send` rather than buffering unbounded memory) without starving
+/// a healthy client.
+pub(crate) const RENDER_CHANNEL_BOUND: usize = 64;
+
+/// Neutral fallback size for a **read-only** attach when the session's current
+/// size can't be queried (review round-2 Major A).
+///
+/// Deliberately modest — large enough not to shrink a typical writer's session,
+/// but small enough to avoid a giant grid allocation (a huge sentinel like
+/// 1000×1000 is rejected on memory grounds). The preferred path is the actual
+/// current session size; this is only a last resort.
+pub(crate) const RO_FALLBACK_ROWS: u16 = 50;
+pub(crate) const RO_FALLBACK_COLS: u16 = 200;
+
+/// Upper bound on a single inbound terminal `Input` frame (1 MiB), matching the
+/// `WriteToPane` cap in `grpc.rs`.  A read-write client could otherwise push an
+/// unbounded write into the session IPC channel in one frame; oversized frames
+/// are dropped with a warning (review round-2 minor).
+pub(crate) const MAX_INPUT_FRAME_BYTES: usize = 1024 * 1024;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/// Type of the outbound stream returned to tonic.
+pub type ServerFrameStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<ServerFrame, Status>> + Send>>;

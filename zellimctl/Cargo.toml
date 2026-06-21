@@ -1,0 +1,45 @@
+[package]
+name = "zellimctl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "zellimctl"
+path = "src/main.rs"
+
+[dependencies]
+# zellimserver library — pure ops (config/control/tls/tokens) reused by the TUI.
+# Wired now so later waves compile; not called from this skeleton.
+zellimserver = { path = "../zellimserver" }
+
+# TUI stack. tui-qrcode (later wave) requires ratatui >= 0.30, so pin to 0.30.
+# crossterm is re-exported by ratatui; we depend on it directly for KeyEvent /
+# event polling. We poll (no event-stream feature needed).
+ratatui = "0.30"
+crossterm = "0.29"
+
+# Async runtime — UpdateAction tasks post results back over an mpsc channel.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
+
+# QR pairing stack (later wave). default-features=false keeps the build lean.
+qrcode = { version = "0.14", default-features = false }
+tui-qrcode = { version = "0.2.4", default-features = false }
+
+# Interface enumeration for the reachable-address picker.
+# 0.15 has build failures; pin to 0.14.
+if-addrs = "0.14"
+
+# Zellij utils — token DB ops (web_authentication_tokens).
+# Same pin/features as zellimserver so the shared SQLite DB stays compatible.
+zellij-utils = { version = "0.44.3", default-features = false, features = ["web_server_capability"] }
+
+# Base64url encoding for the pairing token in the QR URI.
+base64 = "0.22"
+
+# Utility
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
