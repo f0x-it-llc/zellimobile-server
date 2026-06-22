@@ -31,6 +31,12 @@ use crate::app::state::Screen;
 use crate::tui::theme::{palette, styles};
 
 /// Render the dashboard chrome and the active-screen body.
+///
+/// On the Pair screen the global footer row is suppressed: the Pair screen's
+/// combined strip already carries the key-binding hints, so the footer is
+/// redundant.  Suppressing it reclaims 1 row for the QR body, giving
+/// `phase_body.height = total − 1(title) − 1(strip)` instead of
+/// `total − 1(title) − 1(footer) − 1(strip)`.
 pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
     // Paint the base background across the whole area first.
     frame.render_widget(
@@ -38,19 +44,32 @@ pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
         area,
     );
 
-    // Vertical split: title bar / body / footer hint.
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    render_title(frame, rows[0]);
-    render_body(frame, state, rows[1]);
-    render_footer(frame, rows[2]);
+    if state.screen == Screen::Pair {
+        // Pair screen: suppress the global footer to reclaim 1 row for the QR.
+        // The Pair combined strip carries its own key-binding hints.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // title bar
+                Constraint::Min(3),    // body (no footer)
+            ])
+            .split(area);
+        render_title(frame, rows[0]);
+        render_body(frame, state, rows[1]);
+    } else {
+        // All other screens: standard title / body / footer layout.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        render_title(frame, rows[0]);
+        render_body(frame, state, rows[1]);
+        render_footer(frame, rows[2]);
+    }
 }
 
 /// Top title bar.
@@ -70,11 +89,18 @@ fn render_title(frame: &mut Frame, area: Rect) {
 /// When the Pair screen is active the tab column is suppressed so the QR +
 /// info layout has the full terminal width.  No breadcrumb row is used here —
 /// the Pair screen's combined strip carries the "Pair" label in its single
-/// footer row, reclaiming that row for the QR body.
+/// strip row, reclaiming that row for the QR body.
 ///
-/// Row budget at 80×24: title(1)+footer(1)=2 → body=22 → Pair gets 22 rows
-/// directly to `pairing::render` → phase_body = 22 − 1 (strip) = 21 ≥
-/// `QrWidget::MIN_HEIGHT` (19).
+/// Row budget for the Pair screen (footer suppressed in `render`):
+/// ```text
+///   title(1) + body(total−1) → pair_area = body
+///   pairing::render: phase_body(Min 3) + strip(1) → phase_body = body − 1
+/// ```
+/// The real production pairing URI (~185 bytes) encodes to QR version 8
+/// (49 modules, block ≈ 57 cols × 27 rows including quiet zone).  At terminal
+/// width ≥ 85 cols the Showing phase uses a side-by-side split; the QR renders
+/// when `phase_body.height ≥ 27` (total ≥ 29 rows).  At 80×24 the block
+/// (27 rows) exceeds the phase_body (22 rows), so the fallback text renders.
 fn render_body(frame: &mut Frame, state: &AppState, area: Rect) {
     if state.screen == Screen::Pair {
         // Full-width body for the Pair screen: pass the entire body area

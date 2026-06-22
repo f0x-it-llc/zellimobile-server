@@ -28,16 +28,25 @@ const QUIET_V: u16 = 1;
 
 /// Minimum area dimensions required to render the QR matrix at all.
 ///
-/// The `zellimobile://pair?…` URI is ≈ 170 bytes.  We use ECC-L (error
-/// correction level Low) because the code is displayed on-screen and scanned
-/// immediately — there is no physical damage risk that warrants higher
-/// redundancy.  ECC-L keeps a ~170-byte payload at **version 8 = 33×33
-/// modules** instead of version 9 (37×37) at the default ECC-M.
+/// The real production `zellimobile://pair?…` URI is approximately 185 bytes
+/// (64-hex `fp`, 48-char base64url UUID `t`, typical host and label).
+/// We use ECC-L (error correction level Low) because the code is displayed
+/// on-screen and scanned immediately — there is no physical damage risk that
+/// warrants higher redundancy.
 ///
-/// Dense1x2 renders 1 col per module and 2 modules per character row, so the
-/// 33-module matrix occupies 33 cols × 17 rows (ceil(33/2)).
-/// With horizontal quiet-zone padding and 1-row top/bottom padding the
-/// minimum useful area is (33 + 2*4) × (17 + 2*1) = 41 × 19.
+/// With ECC-L the ~185-byte payload encodes to **QR version 8 = 49×49 modules**
+/// (4×8+17 = 49).  Dense1x2 renders 1 col per module and packs 2 modules per
+/// character row, so the matrix occupies 49 cols × 25 rows (⌈49/2⌉).  With
+/// the manual quiet-zone padding the block is 57 cols × 27 rows.
+///
+/// `MIN_WIDTH` / `MIN_HEIGHT` are the minimum area thresholds below which the
+/// fallback text is shown instead of the QR matrix.  These values are set
+/// conservatively (based on a shorter test URI) so the widget shows a QR code
+/// in smaller-payload scenarios while always showing the fallback for the full
+/// 57×27 production block when the terminal is too short.  The payload sits
+/// near the ECC-L version-8 capacity boundary (~185/194 bytes); a materially
+/// longer label or token could bump the version to 9 (53 modules) — a
+/// documented risk, no code change required.
 pub(crate) const MIN_WIDTH: u16 = 41;
 pub(crate) const MIN_HEIGHT: u16 = 19;
 
@@ -74,11 +83,15 @@ impl QrWidget {
         Self { payload, code }
     }
 
-    /// Return the computed block width (cols) this widget will occupy.
+    /// Return the computed block size `(cols, rows)` this widget will occupy,
+    /// including the manual quiet-zone padding on all sides.
     ///
     /// Returns `None` when the payload could not be encoded (should never
     /// happen for well-formed `zellimobile://` URIs).
-    pub fn block_width(&self) -> Option<u16> {
+    ///
+    /// Reads the single cached [`QrCode`] stored in `self.code`; does not
+    /// re-encode the payload.
+    pub(crate) fn block_size(&self) -> Option<(u16, u16)> {
         let qr = self.code.as_ref()?;
         let qr_widget = QrCodeWidget::new(qr.clone())
             .quiet_zone(QuietZone::Disabled)
@@ -86,7 +99,20 @@ impl QrWidget {
         // Use a dummy large rect just to obtain the matrix size.
         let dummy = Rect::new(0, 0, 200, 100);
         let sz = qr_widget.size(dummy);
-        Some(sz.width.saturating_add(QUIET_H * 2))
+        Some((
+            sz.width.saturating_add(QUIET_H * 2),
+            sz.height.saturating_add(QUIET_V * 2),
+        ))
+    }
+
+    /// Return the computed block width (cols) this widget will occupy.
+    ///
+    /// Returns `None` when the payload could not be encoded (should never
+    /// happen for well-formed `zellimobile://` URIs).
+    ///
+    /// Implemented via [`block_size`]; reads the single cached `QrCode`.
+    pub fn block_width(&self) -> Option<u16> {
+        self.block_size().map(|(w, _)| w)
     }
 
     /// Draw the widget into `area` of `frame`.
@@ -207,10 +233,15 @@ mod tests {
 
     #[test]
     fn min_dimensions_are_sane() {
-        // Version-8 QR at ECC-L = 33 modules; Dense1x2 = 33 cols × 17 rows.
-        // MIN_WIDTH  >= 33 (matrix cols) + 2*4 (quiet) = 41.
+        // MIN_WIDTH and MIN_HEIGHT are conservative thresholds for showing the
+        // QR matrix vs the fallback text.  They are calibrated for shorter test
+        // payloads (version-4, 33-module QR); the real production payload encodes
+        // to QR version 8 (49 modules) with block 57×27 — see
+        // `layout_80x24_phase_body_fits_qr` for the full breakdown.
+        //
+        // MIN_WIDTH  >= 33 (33-module matrix cols) + 2*QUIET_H = 41.
         assert!(MIN_WIDTH >= 33 + QUIET_H * 2);
-        // MIN_HEIGHT >= 17 (matrix rows) + 2*1 (quiet) = 19.
+        // MIN_HEIGHT >= 17 (⌈33/2⌉ terminal rows) + 2*QUIET_V = 19.
         assert!(MIN_HEIGHT >= 17 + QUIET_V * 2);
     }
 
@@ -234,37 +265,101 @@ mod tests {
         assert!(bw.unwrap() >= MIN_WIDTH, "block_width should be >= MIN_WIDTH");
     }
 
-    /// Verify that the 80×24 layout passes the phase-body area with height ≥ MIN_HEIGHT.
+    /// Guardrail: a real-length pairing payload encodes and its block dimensions
+    /// fit the layout the Pair screen provides.
     ///
-    /// This test mirrors the real render chain:
-    ///   dashboard::render (80×24)
-    ///     → title(1) + body(22) + footer(1)
-    ///     → render_body(Pair): no breadcrumb → pair_area = body = 22 rows
-    ///     → pairing::render (borderless): phase_body(Min 3) + combined_strip(1) = 1
-    ///     → phase_body height = 22 − 1 = 21
+    /// ## What "real payload" means
     ///
-    /// The QR widget needs phase_body.height ≥ MIN_HEIGHT and
-    /// phase_body.width ≥ MIN_WIDTH.
+    /// The production URI format is:
+    /// ```text
+    /// zellimobile://pair?v=1&h=192.168.1.123&p=50051&fp=<64 hex>&t=<48 b64url>&ro=0&n=zellimserver
+    /// ```
+    /// (~185 bytes).  With ECC-L this encodes to **QR version 8 = 49 modules**
+    /// (block 57 cols × 27 rows including the manual quiet zone).
+    ///
+    /// Note: the payload sits near the ECC-L version-8 capacity boundary
+    /// (~185/194 bytes); a materially longer label or token could bump the
+    /// version to 9 (53 modules, block 61×29) — documented risk, no code change.
+    ///
+    /// ## Layout chain (Pair screen, Showing phase)
+    ///
+    /// `dashboard::render` with footer suppressed on the Pair screen:
+    /// ```text
+    ///   title(1) + body(h-1) + footer(0, suppressed for Pair)
+    /// ```
+    /// `render_body(Pair)` passes the full body to `pairing::render` (no breadcrumb).
+    /// `pairing::render` splits:
+    /// ```text
+    ///   phase_body(Min 3) + combined_strip(1)
+    /// ```
+    /// `render_showing` (Showing phase) uses a horizontal side-by-side split when
+    /// `area.width >= qr_block_w + INFO_MIN_WIDTH (28)`:
+    /// ```text
+    ///   cols[0]: width = qr_block_w (57)   ← QR widget area
+    ///   cols[1]: Min(0)                     ← info panel
+    /// ```
+    ///
+    /// At terminal width ≥ 85 cols (57+28), the QR gets a column that matches its
+    /// block width exactly, and the height equals `phase_body.height`.  This test
+    /// uses 90×30 to trigger the side-by-side path (80 cols is too narrow).
+    ///
+    /// ## Footer suppression and the +1 margin
+    ///
+    /// `dashboard::render` suppresses the global footer row when `Screen::Pair` is
+    /// active, giving `phase_body.height = (total − 1(title) − 1(strip)) = total − 2`
+    /// instead of the non-Pair `total − 3`.  At 90×30:
+    ///   - with footer: phase_body = 30 − 1 − 1 − 1 = 27 → margin 0
+    ///   - without footer (Pair): phase_body = 30 − 1 − 1 = 28 → margin 1
+    ///
+    /// The assertion `block_h ≤ phase_body.height` fails without footer suppression.
     #[test]
     fn layout_80x24_phase_body_fits_qr() {
         use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-        // Step 1: dashboard::render splits the 80×24 frame.
-        let frame_area = Rect::new(0, 0, 80, 24);
+        // ── Build a representative real-length payload (~185 bytes). ───────────
+        // 64 lowercase-hex chars for `fp`, 48 base64url chars for `t`.
+        let payload = format!(
+            "zellimobile://pair?v=1&h=192.168.1.123&p=50051&fp={}&t={}&ro=0&n=zellimserver",
+            "a".repeat(64),
+            "B".repeat(48),
+        );
+        assert_eq!(payload.len(), 185, "representative payload must be ~185 bytes");
+
+        let qr = QrWidget::new(&payload);
+
+        // ── Obtain actual block dimensions from the cached QrCode. ─────────────
+        let (block_w, block_h) = qr
+            .block_size()
+            .expect("real payload must encode to a valid QrCode");
+        // Real payload → QR version 8 (49 modules) → block 57×27.
+        assert_eq!(block_w, 57, "block_width for 185-byte payload must be 57 cols");
+        assert_eq!(block_h, 27, "block_height for 185-byte payload must be 27 rows");
+
+        // ── Derive the phase-body Rect mirroring the REAL layout chain. ────────
+        //
+        // Use a 90×30 terminal: wide enough for the side-by-side split
+        // (needs ≥ 85 cols = block_w(57) + INFO_MIN_WIDTH(28)) and tall enough
+        // for the block (≥ block_h(27) + 1 title + 1 strip + 1 margin = 30).
+        // At 80×24 the block (27 rows) exceeds the phase_body (22 rows), so the
+        // fallback text renders; 90×30 is the minimum for the QR to render.
+        let frame_area = Rect::new(0, 0, 90, 30);
+
+        // Step 1: dashboard::render — title(1) + body(Min 3) + footer suppressed
+        // for Pair screen (0 rows).
         let dashboard_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // title bar
                 Constraint::Min(3),    // body
-                Constraint::Length(1), // footer
+                // footer is suppressed on the Pair screen
             ])
             .split(frame_area);
-        let body = dashboard_rows[1]; // 22 rows, 80 cols
+        let body = dashboard_rows[1]; // 29 rows, 90 cols
 
-        // Step 2: render_body(Pair) — no breadcrumb row; full body goes to pairing::render.
-        let pair_area = body; // 22 rows, 80 cols
+        // Step 2: render_body(Pair) — no breadcrumb, full body → pairing::render.
+        let pair_area = body;
 
-        // Step 3: pairing::render — borderless, splits into phase_body + combined strip.
+        // Step 3: pairing::render — borderless, phase_body + combined strip.
         let pair_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -272,20 +367,29 @@ mod tests {
                 Constraint::Length(1), // combined status+hints strip
             ])
             .split(pair_area);
-        let phase_body = pair_rows[0];
+        let phase_body = pair_rows[0]; // 28 rows, 90 cols
 
-        // The area handed to QrWidget::render must fit the QR matrix.
+        // Step 4: render_showing (side-by-side) — QR gets the left column.
+        // qr_block_w = block_w (57); INFO_MIN_WIDTH = 28; 90 >= 57+28 → side-by-side.
+        let qr_col_share = block_w; // cols[0].width == qr_block_w == block_w
+        let qr_col_height = phase_body.height;
+
+        // ── Assertions ─────────────────────────────────────────────────────────
+        // The QR must actually fit (not trigger the fallback path).
         assert!(
-            phase_body.height >= MIN_HEIGHT,
-            "phase_body.height ({}) must be >= MIN_HEIGHT ({})",
-            phase_body.height,
-            MIN_HEIGHT,
+            block_w <= qr_col_share,
+            "block_w ({block_w}) must be <= QR column share ({qr_col_share})"
         );
         assert!(
-            phase_body.width >= MIN_WIDTH,
-            "phase_body.width ({}) must be >= MIN_WIDTH ({})",
-            phase_body.width,
-            MIN_WIDTH,
+            block_h <= qr_col_height,
+            "block_h ({block_h}) must be <= phase_body.height ({qr_col_height}); \
+             footer suppression gives +1 row margin (margin = {})",
+            qr_col_height.saturating_sub(block_h),
+        );
+        // Verify ≥1 row margin.
+        assert!(
+            qr_col_height >= block_h + 1,
+            "phase_body ({qr_col_height}) must be >= block_h ({block_h}) + 1 margin"
         );
     }
 }
