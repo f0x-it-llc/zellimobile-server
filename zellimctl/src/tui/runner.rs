@@ -292,8 +292,9 @@ fn start_pairing_task(read_only: bool, seq: u64) -> Message {
         }
     };
 
-    // 4. Pick the advertise host (prefer the configured bind IP).
-    let advertise_host = choose_advertise_host(&bind_host);
+    // 4. Pick the advertise host (prefer the configured bind IP, then an explicit
+    //    ZELLIMSERVER_SAN advertise address, then a discovered interface IP).
+    let advertise_host = choose_advertise_host(&bind_host, &crate::server::env_extra_sans());
 
     // 5. Pin the fingerprint of the cert the running server actually serves.
     //    NEVER regenerate here — that would pin a fingerprint the server won't
@@ -366,13 +367,28 @@ fn start_pairing_task(read_only: bool, seq: u64) -> Message {
 
 /// Choose the host to advertise in the pairing QR.
 ///
-/// Prefer the user's configured bind host when it is a concrete reachable
-/// address (not loopback, not the unspecified `0.0.0.0` / `::` wildcard). Only
-/// when the bind host is loopback / unspecified do we fall back to the first
-/// reachable non-loopback IPv4 discovered from local interfaces.
-fn choose_advertise_host(bind_host: &str) -> String {
+/// Priority:
+/// 1. The configured bind host, when it is a concrete reachable address (not
+///    loopback, not the unspecified `0.0.0.0` / `::` wildcard) — the user bound
+///    to a specific address deliberately.
+/// 2. An explicit advertise SAN from `ZELLIMSERVER_SAN` (`advertise_sans`) — the
+///    operator's externally-reachable address. This is essential in a container
+///    bound to `0.0.0.0`, where the externally-reachable IP (e.g. a tailnet IP
+///    reached via host-side NAT) is NOT a local interface and so would never be
+///    discovered by interface enumeration. The pairing QR must point the phone
+///    at *this* address, not the container-internal bridge IP.
+/// 3. The first reachable non-loopback IPv4 discovered from local interfaces
+///    (the native LAN case).
+/// 4. The bind host as a last resort.
+fn choose_advertise_host(bind_host: &str, advertise_sans: &[String]) -> String {
     if is_concrete_advertise_host(bind_host) {
         return bind_host.to_string();
+    }
+    if let Some(adv) = advertise_sans
+        .iter()
+        .find(|s| is_concrete_advertise_host(s))
+    {
+        return adv.trim().to_string();
     }
     crate::pairing::net::reachable_ipv4()
         .into_iter()
@@ -420,13 +436,23 @@ mod tests {
     fn concrete_host_keeps_configured_bind_ip() {
         // A user-configured LAN IP must be advertised as-is (review Major #5).
         assert!(is_concrete_advertise_host("192.168.1.50"));
-        assert_eq!(choose_advertise_host("192.168.1.50"), "192.168.1.50");
+        assert_eq!(choose_advertise_host("192.168.1.50", &[]), "192.168.1.50");
     }
 
     #[test]
     fn dns_bind_host_is_treated_as_concrete() {
         assert!(is_concrete_advertise_host("server.local"));
-        assert_eq!(choose_advertise_host("server.local"), "server.local");
+        assert_eq!(choose_advertise_host("server.local", &[]), "server.local");
+    }
+
+    #[test]
+    fn wildcard_bind_prefers_advertise_san_over_reachable() {
+        // The tailnet/container case: bind 0.0.0.0, ZELLIMSERVER_SAN advertises the
+        // externally-reachable IP. The pairing QR host must be that advertise IP —
+        // NOT a discovered container-internal interface IP — so the phone can dial
+        // it. An unspecified/loopback advertise entry is skipped.
+        let adv = vec!["0.0.0.0".to_string(), "100.71.31.57".to_string()];
+        assert_eq!(choose_advertise_host("0.0.0.0", &adv), "100.71.31.57");
     }
 
     #[test]
@@ -444,7 +470,7 @@ mod tests {
         // With an unspecified bind host, choose_advertise_host returns either a
         // discovered reachable IP or (if none) the original host — never panics,
         // and never returns the wildcard when a reachable IP exists.
-        let chosen = choose_advertise_host("0.0.0.0");
+        let chosen = choose_advertise_host("0.0.0.0", &[]);
         if let Some(ip) = crate::pairing::net::reachable_ipv4().into_iter().next() {
             assert_eq!(chosen, ip.to_string());
         } else {
