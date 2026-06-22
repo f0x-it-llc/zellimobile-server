@@ -207,6 +207,7 @@ fn load_config_snapshot() -> Message {
         bind_addr: cfg.bind_addr,
         cert_dir: cfg.cert_dir.display().to_string(),
         reachable_ips,
+        advertise_sans: crate::server::env_extra_sans(),
     })
 }
 

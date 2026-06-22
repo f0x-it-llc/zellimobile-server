@@ -206,6 +206,26 @@ pub fn effective_config() -> Result<EffectiveConfig> {
     zellimserver::config::resolve(None).context("effective_config: failed to resolve config")
 }
 
+/// Extra advertise SANs requested via the `ZELLIMSERVER_SAN` env var
+/// (comma-separated), returned as plain strings.
+///
+/// The TUI Cert path merges these into the generated cert's SANs so a
+/// TUI-generated cert matches what the daemon's `collect_sans` would produce —
+/// e.g. a tailnet IP that is a host-side NAT publish and therefore is NOT a
+/// local interface discoverable inside a container. Reuses the same env parser
+/// the server binary uses (`zellimserver::tls::SanEntry::from_env`) so the two
+/// paths can never diverge.
+#[allow(dead_code)]
+pub fn env_extra_sans() -> Vec<String> {
+    zellimserver::tls::SanEntry::from_env()
+        .iter()
+        .map(|s| match s {
+            SanEntry::Ip(ip) => ip.to_string(),
+            SanEntry::Dns(d) => d.clone(),
+        })
+        .collect()
+}
+
 /// Persist a new bind address to the config file.
 #[allow(dead_code)]
 pub fn set_bind_addr(addr: &str) -> Result<()> {

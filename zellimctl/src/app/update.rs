@@ -47,6 +47,7 @@ pub fn update(state: &mut AppState, message: Message) -> Vec<UpdateAction> {
             state.config.apply_bind_addr(&snapshot.bind_addr);
             state.config.cert_dir = snapshot.cert_dir;
             state.config.reachable_ips = snapshot.reachable_ips;
+            state.config.advertise_sans = snapshot.advertise_sans;
             if state.config.ip_cursor >= state.config.reachable_ips.len() {
                 state.config.ip_cursor = 0;
             }
@@ -720,7 +721,10 @@ fn handle_pair_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
 /// 2. If the configured bind host is itself a concrete (non-empty, non-unspecified)
 ///    IP or DNS name, it is also included so that a user who has pinned a specific
 ///    LAN IP in Config gets a cert valid for that address.
-/// 3. De-duplication preserves first-seen order.
+/// 3. Advertise SANs from the `ZELLIMSERVER_SAN` env (loaded via `ConfigLoaded`)
+///    are merged in — these cover externally-advertised addresses that are not
+///    local interfaces (e.g. a tailnet IP behind a container's NAT publish).
+/// 4. De-duplication preserves first-seen order.
 ///
 /// When the bind host is `0.0.0.0` (wildcard) — the common tailnet scenario — it
 /// is **omitted** as a SAN (a wildcard SAN is meaningless to TLS clients). Only the
@@ -752,6 +756,26 @@ fn build_sans_from_config(state: &AppState) -> Vec<San> {
             .unwrap_or(false); // DNS names are never "unspecified"
         if !is_unspecified && seen.insert(host.to_string()) {
             sans.push(San::from_host(host));
+        }
+    }
+
+    // 3. Merge advertise SANs from the `ZELLIMSERVER_SAN` env (loaded via
+    //    `ConfigLoaded`). These cover externally-advertised addresses that are
+    //    NOT discoverable as local interfaces — e.g. a tailnet IP that reaches
+    //    the server through a host-side NAT publish inside a container. Without
+    //    this, a TUI-generated cert would miss the address the phone dials, even
+    //    though the daemon's `collect_sans` honours the same env var.
+    for entry in &state.config.advertise_sans {
+        let val = entry.trim();
+        if val.is_empty() {
+            continue;
+        }
+        let is_unspecified = val
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_unspecified())
+            .unwrap_or(false);
+        if !is_unspecified && seen.insert(val.to_string()) {
+            sans.push(San::from_host(val));
         }
     }
 
@@ -1063,6 +1087,7 @@ mod tests {
             bind_addr: "0.0.0.0:9090".to_string(),
             cert_dir: "/tmp/certs".to_string(),
             reachable_ips: vec![],
+            advertise_sans: vec![],
         };
         update(&mut state, Message::ConfigLoaded(snap));
         assert_eq!(state.config.host, "0.0.0.0");
@@ -1440,6 +1465,43 @@ mod tests {
         let values: Vec<&str> = sans.iter().map(|s| s.value()).collect();
         let count = values.iter().filter(|&&v| v == "192.168.1.10").count();
         assert_eq!(count, 1, "IP should appear exactly once; got: {values:?}");
+    }
+
+    #[test]
+    fn build_sans_merges_advertise_sans_and_dedupes() {
+        // The tailnet/docker scenario: bind 0.0.0.0, the only reachable IP is the
+        // container's internal address, and ZELLIMSERVER_SAN advertises the
+        // externally-reachable tailnet IP. The cert must include BOTH the
+        // reachable IP and the advertise SAN, and not duplicate one that overlaps.
+        use std::net::Ipv4Addr;
+        let mut state = AppState::new();
+        state.config.host = "0.0.0.0".to_string();
+        state.config.reachable_ips = vec![Ipv4Addr::new(172, 19, 0, 2)];
+        state.config.advertise_sans =
+            vec!["100.71.31.57".to_string(), "172.19.0.2".to_string()];
+        let values: Vec<String> = build_sans_from_config(&state)
+            .iter()
+            .map(|s| s.value().to_string())
+            .collect();
+        assert!(
+            values.iter().any(|v| v.as_str() == "172.19.0.2"),
+            "reachable IP missing: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v.as_str() == "100.71.31.57"),
+            "advertise SAN (tailnet IP) missing: {values:?}"
+        );
+        // 0.0.0.0 (wildcard bind host) must never become a SAN.
+        assert!(
+            !values.iter().any(|v| v.as_str() == "0.0.0.0"),
+            "wildcard leaked as SAN: {values:?}"
+        );
+        // The overlapping 172.19.0.2 appears exactly once.
+        assert_eq!(
+            values.iter().filter(|v| v.as_str() == "172.19.0.2").count(),
+            1,
+            "duplicate SAN: {values:?}"
+        );
     }
 
     #[test]
