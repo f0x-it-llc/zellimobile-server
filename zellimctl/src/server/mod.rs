@@ -82,28 +82,98 @@ pub fn is_running() -> bool {
 
 // ── Daemon launch ─────────────────────────────────────────────────────────────
 
+/// Read the persisted SAN sidecar (`<cert_dir>/server.san.json`) and return the
+/// raw string values of each entry (IP address strings or DNS names).
+///
+/// Delegates to `zellimserver::tls::read_san_sidecar` — the single parser for
+/// the cert-identity sidecar — rather than reimplementing JSON parsing here.
+/// Tolerates a missing file or a parse error (both return an empty vec inside
+/// `read_san_sidecar`), which causes no `--san` flags to be appended.
+///
+/// NOTE: This function lives in the `server/` facade (the only layer allowed to
+/// import `zellimserver::` types) so the `app/` layer stays clean.
+#[allow(dead_code)]
+pub fn persisted_extra_sans() -> Vec<String> {
+    let cfg = match effective_config() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("server: persisted_extra_sans: config error: {e}");
+            return vec![];
+        }
+    };
+    zellimserver::tls::read_san_sidecar(&cfg.cert_dir)
+        .into_iter()
+        .map(|e| match e {
+            zellimserver::tls::SanEntry::Ip(ip) => ip.to_string(),
+            zellimserver::tls::SanEntry::Dns(d) => d,
+        })
+        .collect()
+}
+
+/// Assemble the argument list for the `zellimserver start` command.
+///
+/// Extracted into a pure function so unit tests can assert the produced args
+/// without spawning a real process.
+///
+/// Arguments:
+/// - `bind_addr` — current effective bind address (forwarded as `--bind` only
+///   when non-default).
+/// - `extra_sans` — raw SAN strings read from the cert sidecar; each becomes a
+///   `--san <value>` pair so the daemon never regenerates the cert away from the
+///   one `zellimctl` pinned.
+/// - `default_bind` — the default bind address constant from `zellimserver`
+///   (passed in so this function is pure / not cfg-dependent).
+///
+/// Always starts with `["start", "--daemonize"]`.
+#[allow(dead_code)]
+pub fn build_daemon_args(bind_addr: &str, extra_sans: &[String], default_bind: &str) -> Vec<String> {
+    let mut args = vec!["start".to_string(), "--daemonize".to_string()];
+
+    if bind_addr != default_bind {
+        args.push("--bind".to_string());
+        args.push(bind_addr.to_string());
+    }
+
+    for san in extra_sans {
+        args.push("--san".to_string());
+        args.push(san.clone());
+    }
+
+    args
+}
+
 /// Spawn the `zellimserver` daemon process and return immediately.
 ///
 /// The binary is located by checking the directory that contains the current
 /// executable first (the workspace target dir places both binaries together),
 /// then falling back to `zellimserver` on `$PATH`.
 ///
+/// Forwards `--bind` (when non-default) and one `--san <value>` per entry from
+/// the persisted SAN sidecar, so the daemon always serves exactly the cert that
+/// `zellimctl` generated rather than re-deriving SANs from scratch.
+///
 /// Readiness must be confirmed by the caller via polling [`status()`].
 #[allow(dead_code)]
 pub fn start_daemon() -> Result<()> {
     let bin = find_server_binary();
 
-    // Build the base command.
+    let (bind_addr, extra_sans) = match effective_config() {
+        Ok(cfg) => {
+            let sans = persisted_extra_sans();
+            (cfg.bind_addr, sans)
+        }
+        Err(e) => {
+            // If we cannot resolve config, proceed with defaults and no SANs
+            // so the daemon can still start (it will use its own defaults).
+            log::warn!("start_daemon: could not resolve config: {e}");
+            (zellimserver::config::DEFAULT_BIND.to_string(), vec![])
+        }
+    };
+
+    let args = build_daemon_args(&bind_addr, &extra_sans, zellimserver::config::DEFAULT_BIND);
+
     let mut cmd = std::process::Command::new(&bin);
-    cmd.args(["start", "--daemonize"]);
-
-    // Forward a non-default bind address so the daemon uses the persisted config.
-    if let Ok(cfg) = effective_config()
-        && cfg.bind_addr != zellimserver::config::DEFAULT_BIND
-    {
-        cmd.args(["--bind", &cfg.bind_addr]);
-    }
-
+    cmd.args(&args);
     cmd.spawn()
         .with_context(|| format!("start_daemon: failed to spawn {}", bin.display()))?;
 
@@ -134,6 +204,26 @@ fn find_server_binary() -> std::path::PathBuf {
 #[allow(dead_code)]
 pub fn effective_config() -> Result<EffectiveConfig> {
     zellimserver::config::resolve(None).context("effective_config: failed to resolve config")
+}
+
+/// Extra advertise SANs requested via the `ZELLIMSERVER_SAN` env var
+/// (comma-separated), returned as plain strings.
+///
+/// The TUI Cert path merges these into the generated cert's SANs so a
+/// TUI-generated cert matches what the daemon's `collect_sans` would produce —
+/// e.g. a tailnet IP that is a host-side NAT publish and therefore is NOT a
+/// local interface discoverable inside a container. Reuses the same env parser
+/// the server binary uses (`zellimserver::tls::SanEntry::from_env`) so the two
+/// paths can never diverge.
+#[allow(dead_code)]
+pub fn env_extra_sans() -> Vec<String> {
+    zellimserver::tls::SanEntry::from_env()
+        .iter()
+        .map(|s| match s {
+            SanEntry::Ip(ip) => ip.to_string(),
+            SanEntry::Dns(d) => d.clone(),
+        })
+        .collect()
 }
 
 /// Persist a new bind address to the config file.
@@ -193,4 +283,83 @@ pub fn current_cert_fingerprint() -> Result<Option<String>> {
     let fp = zellimserver::tls::cert_sha256_fingerprint(&pem)
         .context("current_cert_fingerprint: failed to compute SHA-256 fingerprint")?;
     Ok(Some(fp))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEFAULT: &str = zellimserver::config::DEFAULT_BIND;
+
+    #[test]
+    fn build_daemon_args_default_bind_omits_bind_flag() {
+        // When the bind address matches the default, --bind must NOT be emitted
+        // (the server already defaults to that address).
+        let args = build_daemon_args(DEFAULT, &[], DEFAULT);
+        assert_eq!(args, vec!["start", "--daemonize"]);
+    }
+
+    #[test]
+    fn build_daemon_args_non_default_bind_included() {
+        let args = build_daemon_args("0.0.0.0:50051", &[], DEFAULT);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--bind" && w[1] == "0.0.0.0:50051"),
+            "expected --bind 0.0.0.0:50051 in {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_daemon_args_each_san_becomes_flag_pair() {
+        let sans = vec!["100.64.1.2".to_string(), "192.168.1.10".to_string()];
+        let args = build_daemon_args(DEFAULT, &sans, DEFAULT);
+        // Each SAN must appear as an adjacent ("--san", "<value>") pair.
+        let pairs: Vec<(&str, &str)> = args
+            .windows(2)
+            .filter_map(|w| {
+                if w[0] == "--san" {
+                    Some((w[0].as_str(), w[1].as_str()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(pairs.len(), 2, "expected 2 --san pairs; got: {args:?}");
+        assert!(
+            pairs.iter().any(|&(_, v)| v == "100.64.1.2"),
+            "100.64.1.2 missing from --san flags: {args:?}"
+        );
+        assert!(
+            pairs.iter().any(|&(_, v)| v == "192.168.1.10"),
+            "192.168.1.10 missing from --san flags: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_daemon_args_bind_and_sans_combined() {
+        let sans = vec!["100.64.0.5".to_string()];
+        let args = build_daemon_args("0.0.0.0:50051", &sans, DEFAULT);
+        // Must have both --bind and --san.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--bind" && w[1] == "0.0.0.0:50051"),
+            "--bind missing: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--san" && w[1] == "100.64.0.5"),
+            "--san missing: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_daemon_args_empty_sans_no_san_flags() {
+        let args = build_daemon_args("0.0.0.0:50051", &[], DEFAULT);
+        assert!(
+            !args.iter().any(|a| a == "--san"),
+            "no --san flags expected with empty sans: {args:?}"
+        );
+    }
 }

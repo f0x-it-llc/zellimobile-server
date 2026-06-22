@@ -47,6 +47,7 @@ pub fn update(state: &mut AppState, message: Message) -> Vec<UpdateAction> {
             state.config.apply_bind_addr(&snapshot.bind_addr);
             state.config.cert_dir = snapshot.cert_dir;
             state.config.reachable_ips = snapshot.reachable_ips;
+            state.config.advertise_sans = snapshot.advertise_sans;
             if state.config.ip_cursor >= state.config.reachable_ips.len() {
                 state.config.ip_cursor = 0;
             }
@@ -59,6 +60,16 @@ pub fn update(state: &mut AppState, message: Message) -> Vec<UpdateAction> {
             state.cert.sans = sans;
             state.cert.loading = false;
             state.cert.status = "Certificate ready.".to_string();
+            Vec::new()
+        }
+        // ── Dashboard cert-info (read-only passive load) ──────────────────────
+        Message::CertInfoLoaded { fingerprint, sans } => {
+            // Passive: populate cert fields without touching the status line.
+            // (The status line is only set by `CertEnsured`, which signals active
+            // regeneration. This path is a silent background read for the Dashboard.)
+            state.cert.fingerprint = fingerprint.unwrap_or_default();
+            state.cert.sans = sans;
+            state.cert.loading = false;
             Vec::new()
         }
         Message::ActionFailed(msg) => {
@@ -220,6 +231,22 @@ fn on_enter_screen(state: &mut AppState, screen: Screen) -> Vec<UpdateAction> {
             state.tokens.form_name = String::new();
             vec![UpdateAction::LoadTokens]
         }
+        Screen::Cert => {
+            // Load config + reachable IPs so that `build_sans_from_config` has
+            // real interface addresses even when the user navigates directly to
+            // the Cert screen without visiting Config first.
+            //
+            // DECISION: we reuse `LoadConfig` (which returns `reachable_ips` via
+            // `ConfigLoaded`) rather than adding a focused `LoadReachableIps`
+            // action/message.  The only side-effect beyond populating IPs is that
+            // `state.config.status` is overwritten with "Config loaded." and
+            // `state.config.loading` is set briefly.  Because the Cert screen
+            // does not render `config.status`, this is invisible to the user and
+            // causes no perceptible churn.  Avoiding a new action + message keeps
+            // the spine surface minimal.
+            state.config.loading = true;
+            vec![UpdateAction::LoadConfig]
+        }
         Screen::Pair => {
             // Reset pairing state when entering the screen.
             state.pairing.phase = PairingPhase::Idle;
@@ -227,7 +254,22 @@ fn on_enter_screen(state: &mut AppState, screen: Screen) -> Vec<UpdateAction> {
             state.pairing.pending_token_name = None;
             Vec::new()
         }
-        _ => Vec::new(),
+        Screen::Dashboard => {
+            // Load a fresh at-a-glance snapshot of all sub-systems.
+            // Flags are set so individual sub-states show their loading indicators
+            // until results arrive.  Re-entering the Dashboard re-fetches
+            // everything (idempotent by design).
+            state.server.loading = true;
+            state.config.loading = true;
+            state.tokens.loading = true;
+            state.cert.loading = true;
+            vec![
+                UpdateAction::RefreshStatus,
+                UpdateAction::LoadConfig,
+                UpdateAction::LoadTokens,
+                UpdateAction::LoadCertInfo,
+            ]
+        }
     }
 }
 
@@ -500,6 +542,7 @@ fn handle_server_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
         KeyCode::Char('s') => {
             if !state.server.loading {
                 state.server.loading = true;
+                state.server.stopped = false;
                 state.server.action_msg = "Starting server…".to_string();
                 vec![UpdateAction::StartServer]
             } else {
@@ -665,16 +708,78 @@ fn handle_pair_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
     }
 }
 
-/// Build a SAN list from the host currently entered in the Config screen.
+/// Build a SAN list from the reachable IPs discovered for the Config screen.
 ///
 /// Returns app-layer [`San`] mirrors (the `server/` facade converts them into
-/// infra `SanEntry`). Tries to parse the host as an IP first; falls back to DNS.
+/// infra `SanEntry`).
+///
+/// ## SAN derivation rules
+///
+/// 1. Each IP in `state.config.reachable_ips` is included as `San::Ip`, **except**
+///    unspecified addresses (`0.0.0.0`, `::`) — `reachable_ipv4` should never
+///    return them, but we guard here as belt-and-suspenders.
+/// 2. If the configured bind host is itself a concrete (non-empty, non-unspecified)
+///    IP or DNS name, it is also included so that a user who has pinned a specific
+///    LAN IP in Config gets a cert valid for that address.
+/// 3. Advertise SANs from the `ZELLIMSERVER_SAN` env (loaded via `ConfigLoaded`)
+///    are merged in — these cover externally-advertised addresses that are not
+///    local interfaces (e.g. a tailnet IP behind a container's NAT publish).
+/// 4. De-duplication preserves first-seen order.
+///
+/// When the bind host is `0.0.0.0` (wildcard) — the common tailnet scenario — it
+/// is **omitted** as a SAN (a wildcard SAN is meaningless to TLS clients). Only the
+/// real interface IPs from `reachable_ips` are added.
 fn build_sans_from_config(state: &AppState) -> Vec<San> {
-    let host = state.config.host.trim();
-    if host.is_empty() {
-        return vec![];
+    let mut seen = std::collections::HashSet::new();
+    let mut sans: Vec<San> = Vec::new();
+
+    // 1. Add each reachable IP (already filtered for loopback/link-local by
+    //    pairing::net::reachable_ipv4), guarding against unspecified here too.
+    for ip in &state.config.reachable_ips {
+        if ip.is_unspecified() {
+            continue;
+        }
+        let key = ip.to_string();
+        if seen.insert(key.clone()) {
+            sans.push(San::Ip(key));
+        }
     }
-    vec![San::from_host(host)]
+
+    // 2. Include the bind host if it is a concrete (non-empty, non-unspecified)
+    //    IP or DNS name.  This covers the case where the user configured a
+    //    specific LAN IP directly in the Config host field.
+    let host = state.config.host.trim();
+    if !host.is_empty() {
+        let is_unspecified = host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_unspecified())
+            .unwrap_or(false); // DNS names are never "unspecified"
+        if !is_unspecified && seen.insert(host.to_string()) {
+            sans.push(San::from_host(host));
+        }
+    }
+
+    // 3. Merge advertise SANs from the `ZELLIMSERVER_SAN` env (loaded via
+    //    `ConfigLoaded`). These cover externally-advertised addresses that are
+    //    NOT discoverable as local interfaces — e.g. a tailnet IP that reaches
+    //    the server through a host-side NAT publish inside a container. Without
+    //    this, a TUI-generated cert would miss the address the phone dials, even
+    //    though the daemon's `collect_sans` honours the same env var.
+    for entry in &state.config.advertise_sans {
+        let val = entry.trim();
+        if val.is_empty() {
+            continue;
+        }
+        let is_unspecified = val
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_unspecified())
+            .unwrap_or(false);
+        if !is_unspecified && seen.insert(val.to_string()) {
+            sans.push(San::from_host(val));
+        }
+    }
+
+    sans
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -782,6 +887,25 @@ mod tests {
         let mut state = AppState::new();
         state.screen = Screen::Server;
         let actions = update(&mut state, Message::Key(key(KeyCode::Char('s'))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::StartServer))
+        );
+    }
+
+    #[test]
+    fn server_s_key_clears_stopped_flag() {
+        // Regression: pressing `s` (StartServer) while the daemon is known-stopped
+        // must clear `stopped` so the renderer doesn't hold a stale "Stopped" panel
+        // for the one cycle before the first StatusLoaded(Some(_)) arrives.
+        let mut state = AppState::new();
+        state.screen = Screen::Server;
+        state.server.stopped = true;
+        state.server.status = None;
+        let actions = update(&mut state, Message::Key(key(KeyCode::Char('s'))));
+        assert!(!state.server.stopped, "stopped should be cleared on StartServer");
+        assert!(state.server.loading);
         assert!(
             actions
                 .iter()
@@ -963,6 +1087,7 @@ mod tests {
             bind_addr: "0.0.0.0:9090".to_string(),
             cert_dir: "/tmp/certs".to_string(),
             reachable_ips: vec![],
+            advertise_sans: vec![],
         };
         update(&mut state, Message::ConfigLoaded(snap));
         assert_eq!(state.config.host, "0.0.0.0");
@@ -1299,5 +1424,254 @@ mod tests {
             .expect("t= param missing");
         let decoded = URL_SAFE_NO_PAD.decode(t_val).unwrap();
         assert_eq!(std::str::from_utf8(&decoded).unwrap(), "secret-token-value");
+    }
+
+    // ── build_sans_from_config tests ──────────────────────────────────────────
+
+    /// Helper to call `build_sans_from_config` with a minimal state.
+    fn sans_for(host: &str, reachable: &[std::net::Ipv4Addr]) -> Vec<San> {
+        let mut state = AppState::new();
+        state.config.host = host.to_string();
+        state.config.reachable_ips = reachable.to_vec();
+        build_sans_from_config(&state)
+    }
+
+    #[test]
+    fn build_sans_filters_unspecified_bind_host() {
+        // When bind host is 0.0.0.0 and reachable IPs are real addresses, the
+        // result must NOT include 0.0.0.0 but MUST include the real IPs.
+        use std::net::Ipv4Addr;
+        let reachable = [Ipv4Addr::new(100, 64, 1, 2), Ipv4Addr::new(192, 168, 1, 10)];
+        let sans = sans_for("0.0.0.0", &reachable);
+        let values: Vec<&str> = sans.iter().map(|s| s.value()).collect();
+        assert!(
+            !values.contains(&"0.0.0.0"),
+            "0.0.0.0 must not appear as a SAN; got: {values:?}"
+        );
+        assert!(values.contains(&"100.64.1.2"), "tailnet IP missing: {values:?}");
+        assert!(
+            values.contains(&"192.168.1.10"),
+            "LAN IP missing: {values:?}"
+        );
+    }
+
+    #[test]
+    fn build_sans_deduplicates_when_bind_host_matches_reachable() {
+        // If the user sets the bind host to a specific LAN IP that also appears
+        // in reachable_ips, it should only appear once in the SAN list.
+        use std::net::Ipv4Addr;
+        let ip = Ipv4Addr::new(192, 168, 1, 10);
+        let sans = sans_for("192.168.1.10", &[ip]);
+        let values: Vec<&str> = sans.iter().map(|s| s.value()).collect();
+        let count = values.iter().filter(|&&v| v == "192.168.1.10").count();
+        assert_eq!(count, 1, "IP should appear exactly once; got: {values:?}");
+    }
+
+    #[test]
+    fn build_sans_merges_advertise_sans_and_dedupes() {
+        // The tailnet/docker scenario: bind 0.0.0.0, the only reachable IP is the
+        // container's internal address, and ZELLIMSERVER_SAN advertises the
+        // externally-reachable tailnet IP. The cert must include BOTH the
+        // reachable IP and the advertise SAN, and not duplicate one that overlaps.
+        use std::net::Ipv4Addr;
+        let mut state = AppState::new();
+        state.config.host = "0.0.0.0".to_string();
+        state.config.reachable_ips = vec![Ipv4Addr::new(172, 19, 0, 2)];
+        state.config.advertise_sans =
+            vec!["100.71.31.57".to_string(), "172.19.0.2".to_string()];
+        let values: Vec<String> = build_sans_from_config(&state)
+            .iter()
+            .map(|s| s.value().to_string())
+            .collect();
+        assert!(
+            values.iter().any(|v| v.as_str() == "172.19.0.2"),
+            "reachable IP missing: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v.as_str() == "100.71.31.57"),
+            "advertise SAN (tailnet IP) missing: {values:?}"
+        );
+        // 0.0.0.0 (wildcard bind host) must never become a SAN.
+        assert!(
+            !values.iter().any(|v| v.as_str() == "0.0.0.0"),
+            "wildcard leaked as SAN: {values:?}"
+        );
+        // The overlapping 172.19.0.2 appears exactly once.
+        assert_eq!(
+            values.iter().filter(|v| v.as_str() == "172.19.0.2").count(),
+            1,
+            "duplicate SAN: {values:?}"
+        );
+    }
+
+    #[test]
+    fn build_sans_includes_concrete_bind_host_not_in_reachable() {
+        // A user-configured specific LAN IP that reachable_ipv4 didn't pick up
+        // (e.g. an alias) should still appear in the SANs.
+        use std::net::Ipv4Addr;
+        let reachable = [Ipv4Addr::new(10, 0, 0, 1)];
+        let sans = sans_for("192.168.99.5", &reachable);
+        let values: Vec<&str> = sans.iter().map(|s| s.value()).collect();
+        assert!(
+            values.contains(&"192.168.99.5"),
+            "concrete bind host missing: {values:?}"
+        );
+    }
+
+    #[test]
+    fn build_sans_dns_bind_host_included() {
+        // A DNS bind host (e.g. "tailscale-host.example.com") should be added as
+        // a DNS SAN.
+        use std::net::Ipv4Addr;
+        let reachable = [Ipv4Addr::new(10, 0, 0, 1)];
+        let sans = sans_for("myserver.local", &reachable);
+        let values: Vec<&str> = sans.iter().map(|s| s.value()).collect();
+        assert!(
+            values.contains(&"myserver.local"),
+            "DNS bind host missing: {values:?}"
+        );
+        // Confirm it was captured as a Dns SAN.
+        assert!(
+            sans.iter().any(|s| matches!(s, San::Dns(d) if d == "myserver.local")),
+            "DNS bind host should be San::Dns; got: {sans:?}"
+        );
+    }
+
+    #[test]
+    fn build_sans_empty_when_no_reachable_and_unspecified_bind() {
+        // No reachable IPs + wildcard bind → empty SAN list (avoids meaningless
+        // 0.0.0.0 SAN that would pass vacuously in sidecar_covers).
+        let sans = sans_for("0.0.0.0", &[]);
+        assert!(sans.is_empty(), "expected empty SANs; got: {sans:?}");
+    }
+
+    #[test]
+    fn enter_cert_screen_dispatches_load_config() {
+        // Navigating to the Cert screen must dispatch LoadConfig so reachable_ips
+        // are populated even without visiting the Config screen first.
+        let mut state = AppState::new();
+        let actions = update(&mut state, Message::NavTo(Screen::Cert));
+        assert_eq!(state.screen, Screen::Cert);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::LoadConfig)),
+            "entering Cert must dispatch LoadConfig to populate reachable_ips"
+        );
+    }
+
+    // ── Dashboard screen tests ────────────────────────────────────────────────
+
+    #[test]
+    fn enter_dashboard_dispatches_all_four_read_actions() {
+        // Entering the Dashboard must dispatch RefreshStatus + LoadConfig +
+        // LoadTokens + LoadCertInfo so all sub-states populate.
+        let mut state = AppState::new();
+        // Start on a different screen so we can navigate *to* Dashboard.
+        state.screen = Screen::Server;
+        let actions = update(&mut state, Message::NavTo(Screen::Dashboard));
+        assert_eq!(state.screen, Screen::Dashboard);
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::RefreshStatus)),
+            "Dashboard on_enter must dispatch RefreshStatus; got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::LoadConfig)),
+            "Dashboard on_enter must dispatch LoadConfig; got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::LoadTokens)),
+            "Dashboard on_enter must dispatch LoadTokens; got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::LoadCertInfo)),
+            "Dashboard on_enter must dispatch LoadCertInfo; got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn enter_dashboard_sets_loading_flags() {
+        // All relevant loading flags must be raised so the overview can show
+        // per-section loading indicators until results arrive.
+        let mut state = AppState::new();
+        state.screen = Screen::Config;
+        update(&mut state, Message::NavTo(Screen::Dashboard));
+        assert!(state.server.loading, "server.loading should be set");
+        assert!(state.config.loading, "config.loading should be set");
+        assert!(state.tokens.loading, "tokens.loading should be set");
+        assert!(state.cert.loading, "cert.loading should be set");
+    }
+
+    #[test]
+    fn cert_info_loaded_sets_fingerprint_and_sans_without_touching_status() {
+        // CertInfoLoaded is a passive read: it populates fingerprint/sans but
+        // must NOT overwrite the status line (that is reserved for CertEnsured,
+        // the active regeneration path).
+        let mut state = AppState::new();
+        // Pre-populate a status line to prove it is not cleared.
+        state.cert.status = "Certificate ready.".to_string();
+
+        update(
+            &mut state,
+            Message::CertInfoLoaded {
+                fingerprint: Some("aabbccddeeff0011".to_string()),
+                sans: vec!["192.168.1.1".to_string(), "server.local".to_string()],
+            },
+        );
+
+        assert_eq!(state.cert.fingerprint, "aabbccddeeff0011");
+        assert_eq!(
+            state.cert.sans,
+            vec!["192.168.1.1".to_string(), "server.local".to_string()]
+        );
+        // Status must be unchanged — passive load does not set "Certificate ready.".
+        assert_eq!(
+            state.cert.status, "Certificate ready.",
+            "CertInfoLoaded must not overwrite cert.status"
+        );
+        assert!(!state.cert.loading, "cert.loading should be cleared");
+    }
+
+    #[test]
+    fn cert_info_loaded_none_fingerprint_stores_empty_string() {
+        // When no cert exists on disk, fingerprint is None → stored as "".
+        let mut state = AppState::new();
+        update(
+            &mut state,
+            Message::CertInfoLoaded {
+                fingerprint: None,
+                sans: vec![],
+            },
+        );
+        assert!(
+            state.cert.fingerprint.is_empty(),
+            "None fingerprint must map to empty string"
+        );
+        assert!(state.cert.sans.is_empty());
+    }
+
+    /// Structural assertion: `LoadCertInfo` action must never be confused with
+    /// `EnsureCert`.  The action enum variants are distinct types — this test
+    /// documents and protects that invariant by exhaustive matching.
+    #[test]
+    fn load_cert_info_action_is_distinct_from_ensure_cert() {
+        let load_info = UpdateAction::LoadCertInfo;
+        let ensure = UpdateAction::EnsureCert(vec![]);
+
+        // These pattern-matches would be compile errors if the variants didn't exist.
+        assert!(matches!(load_info, UpdateAction::LoadCertInfo));
+        assert!(matches!(ensure, UpdateAction::EnsureCert(_)));
+        // Cross-checks: each matches only its own variant.
+        assert!(!matches!(load_info, UpdateAction::EnsureCert(_)));
+        assert!(!matches!(ensure, UpdateAction::LoadCertInfo));
     }
 }

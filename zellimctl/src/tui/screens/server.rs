@@ -40,6 +40,17 @@ pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
     render_hints(frame, rows[2]);
 }
 
+/// Returns `true` while the very first status load is still in progress —
+/// i.e. we have never received a result yet (`status` is `None`) and we do not
+/// yet know whether the daemon is stopped (`stopped == false`).
+///
+/// Once `stopped` is set to `true` by a `StatusLoaded(None)` result, background
+/// polls that set `loading = true` every ~1 s must **not** show the "Querying…"
+/// banner, because the daemon is known-stopped and the panel should stay steady.
+pub(crate) fn is_first_load(loading: bool, status_is_none: bool, stopped: bool) -> bool {
+    loading && status_is_none && !stopped
+}
+
 /// Render the main status info block.
 fn render_status_panel(frame: &mut Frame, state: &AppState, area: Rect) {
     let srv = &state.server;
@@ -48,8 +59,8 @@ fn render_status_panel(frame: &mut Frame, state: &AppState, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let body: Vec<Line> = if srv.loading && srv.status.is_none() {
-        // First load in progress.
+    let body: Vec<Line> = if is_first_load(srv.loading, srv.status.is_none(), srv.stopped) {
+        // First load in progress — stopped is not yet known.
         vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -166,6 +177,27 @@ fn format_uptime(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── is_first_load predicate ───────────────────────────────────────────────
+
+    /// The "Querying…" banner must only appear on the very first load cycle,
+    /// before stopped/running is known. Once `stopped` is `true`, background
+    /// polls must not trigger the banner even when `loading == true`.
+    #[test]
+    fn first_load_true_only_when_loading_and_no_status_and_not_stopped() {
+        // True only on the genuine first-load case.
+        assert!(is_first_load(true, true, false));
+        // Stopped + loading → must NOT show "Querying…" (the flicker case).
+        assert!(!is_first_load(true, true, true));
+        // Not loading yet → not first-load.
+        assert!(!is_first_load(false, true, false));
+        // Status already present → not first-load.
+        assert!(!is_first_load(true, false, false));
+        // Running daemon (status present, not stopped, not loading).
+        assert!(!is_first_load(false, false, false));
+    }
+
+    // ── format_uptime ─────────────────────────────────────────────────────────
 
     #[test]
     fn format_uptime_seconds() {

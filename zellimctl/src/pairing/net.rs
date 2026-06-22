@@ -34,6 +34,12 @@ pub fn reachable_ipv4() -> Vec<Ipv4Addr> {
             if is_link_local(ip) {
                 continue;
             }
+            // Guard against the unspecified address (0.0.0.0).  Real interfaces
+            // should never be assigned this, but we exclude it explicitly so that
+            // build_sans_from_config never receives a wildcard in reachable_ips.
+            if ip.is_unspecified() {
+                continue;
+            }
             if seen.insert(ip) {
                 out.push(ip);
             }
@@ -88,5 +94,27 @@ mod tests {
             unique.len(),
             "reachable_ipv4 should not return duplicates"
         );
+    }
+
+    #[test]
+    fn reachable_ipv4_excludes_unspecified() {
+        // The unspecified address (0.0.0.0) must never appear in the output.
+        // Real interfaces are never assigned this address, but we guard explicitly
+        // so that build_sans_from_config never receives a wildcard in reachable_ips.
+        let addrs = reachable_ipv4();
+        for ip in &addrs {
+            assert!(
+                !ip.is_unspecified(),
+                "unspecified address {ip} should be excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn is_link_local_boundary_cases() {
+        // Verify the link-local check covers the exact /16 boundary.
+        assert!(is_link_local(Ipv4Addr::new(169, 254, 255, 255)));
+        assert!(!is_link_local(Ipv4Addr::new(169, 255, 0, 0)));
+        assert!(!is_link_local(Ipv4Addr::new(168, 254, 0, 0)));
     }
 }

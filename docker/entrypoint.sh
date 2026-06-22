@@ -14,6 +14,20 @@ set -euo pipefail
 
 SESSION="${SESSION:-backend-dev}"
 
+# ── 0. Propagate the zellim env to SSH login shells ──────────────────────────
+# sshd does NOT pass the container's docker `ENV` (ZELLIMSERVER_BIND /
+# ZELLIMSERVER_SAN) to interactive sessions, so `zellimctl` run over SSH would
+# not see them — the cert SAN and the pairing-QR advertise host would silently
+# fall back to the container-internal bridge IP instead of the advertised
+# tailnet/LAN address. The entrypoint runs WITH the container env, so mirror the
+# relevant vars where SSH logins pick them up: /etc/environment (read by PAM for
+# every session) and /etc/profile.d (sourced by login shells).
+printf 'ZELLIMSERVER_BIND=%s\nZELLIMSERVER_SAN=%s\n' \
+  "${ZELLIMSERVER_BIND:-}" "${ZELLIMSERVER_SAN:-}" > /etc/environment
+printf "export ZELLIMSERVER_BIND='%s'\nexport ZELLIMSERVER_SAN='%s'\n" \
+  "${ZELLIMSERVER_BIND:-}" "${ZELLIMSERVER_SAN:-}" > /etc/profile.d/zellim-env.sh
+chmod 0644 /etc/profile.d/zellim-env.sh
+
 # ── 1. Clear root's password so SSH login needs no credential (dev rig) ──────
 passwd -d root
 

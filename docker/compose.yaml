@@ -6,6 +6,20 @@
 # LAN exposure (a phone on the same network can reach the server):
 #   BIND_ADDR=<lan-ip> docker compose -f docker/compose.yaml up --build
 #
+# Tailnet / remote IP exposure:
+#   The container binds 0.0.0.0 internally; BIND_ADDR selects which host
+#   interface the ports are published on. Inside the container the tailnet IP
+#   is not a local interface (it's a host-side NAT), so the server cannot
+#   discover it automatically. ZELLIMSERVER_SAN injects it into the TLS cert
+#   SAN so clients connecting on that IP get a valid cert. By default
+#   ZELLIMSERVER_SAN falls back to BIND_ADDR, so just setting BIND_ADDR is
+#   enough for the common case:
+#
+#   BIND_ADDR=100.x.y.z docker compose -f docker/compose.yaml up --build
+#
+#   Override ZELLIMSERVER_SAN explicitly if the cert must cover a different
+#   or additional address (comma-separated list accepted).
+#
 # Or use the helper wrapper:
 #   ./docker/run.sh --host <lan-ip>
 #
@@ -31,6 +45,12 @@ services:
       - "${BIND_ADDR:-127.0.0.1}:${SSH_PORT:-2222}:22"
     environment:
       SESSION: "${SESSION:-backend-dev}"
+      # Inject the tailnet/LAN IP into the TLS cert SANs. Inside the container
+      # the host's tailnet IP is not a local interface (it's a host-side NAT
+      # publish), so the server cannot auto-discover it. This falls back to
+      # BIND_ADDR so that `BIND_ADDR=<ip> docker compose up` is all that's
+      # needed. Stays empty when the default loopback is used — safe/unchanged.
+      ZELLIMSERVER_SAN: "${ZELLIMSERVER_SAN:-${BIND_ADDR:-}}"
     volumes:
       # Persist token DB, cert, session state, and zellij config across restarts.
       # zellimserver data lives under zellij's XDG share dir.

@@ -34,7 +34,6 @@ pub fn render_screen_body(frame: &mut Frame, state: &AppState, area: ratatui::la
         Screen::Server => server::render(frame, state, area),
         Screen::Tokens => tokens::render(frame, state, area),
         Screen::Pair => pairing::render(frame, state, area),
-        // Dashboard uses a simple placeholder.
-        Screen::Dashboard => dashboard::render_placeholder(frame, state, area),
+        Screen::Dashboard => dashboard::render_overview(frame, state, area),
     }
 }

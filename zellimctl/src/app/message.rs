@@ -22,6 +22,13 @@ pub struct ConfigSnapshot {
     pub cert_dir: String,
     /// Non-loopback IPv4 addresses the mobile client could reach.
     pub reachable_ips: Vec<std::net::Ipv4Addr>,
+    /// Extra advertise SANs from the `ZELLIMSERVER_SAN` env var (comma-separated).
+    ///
+    /// Needed because an externally-advertised address (e.g. a tailnet IP that
+    /// is a host-side NAT publish, not a local interface inside a container) is
+    /// not discoverable via interface enumeration. Merged into the cert SANs so
+    /// the TUI-generated cert matches what the daemon's `collect_sans` produces.
+    pub advertise_sans: Vec<String>,
 }
 
 /// Everything that can drive a state change.
@@ -99,5 +106,17 @@ pub enum Message {
         err: String,
         /// Sequence number (must match current pairing seq to be accepted).
         seq: u64,
+    },
+
+    // ── Dashboard screen messages ─────────────────────────────────────────────
+    /// Read-only cert info for the Dashboard overview.
+    ///
+    /// Posted by a [`super::action::UpdateAction::LoadCertInfo`] task via the
+    /// read-only facade — never regenerates the cert.
+    CertInfoLoaded {
+        /// SHA-256 fingerprint of the on-disk cert, or `None` if no cert exists.
+        fingerprint: Option<String>,
+        /// SANs read from the persisted SAN sidecar (`server.san.json`).
+        sans: Vec<String>,
     },
 }

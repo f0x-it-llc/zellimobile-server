@@ -74,4 +74,12 @@ pub enum UpdateAction {
     /// it does not refresh the Tokens list or surface status — it just tidies up
     /// the bearer secret. The result is ignored.
     RevokePairingToken(String),
+
+    // ── Dashboard ─────────────────────────────────────────────────────────────
+    /// Read the persisted cert fingerprint + SAN sidecar **without** generating
+    /// anything; posts `Message::CertInfoLoaded`.
+    ///
+    /// Never calls `ensure_cert` / `load_or_generate_identity`.  The Dashboard
+    /// overview uses this for a read-only cert summary.
+    LoadCertInfo,
 }
