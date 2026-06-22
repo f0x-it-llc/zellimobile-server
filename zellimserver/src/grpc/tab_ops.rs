@@ -50,13 +50,17 @@ impl ZelliService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "GoToTab")?;
         let req = request.into_inner();
+        let connection_id = req.connection_id.clone();
         let (session, tab_id) = resolve_tab_target(&req)?;
-        log::info!("GoToTab: session='{session}' tab_id={tab_id}");
-        // W2.0a: route through the live relay client if attached, so the tab
-        // switch applies to the *rendering* client (deterministic, no ephemeral).
+        log::info!("GoToTab: session='{session}' tab_id={tab_id} connection_id='{connection_id}'");
+        // Route through the live relay client if attached, so the tab switch
+        // applies to the *rendering* client (deterministic, no ephemeral).
+        // connection_id targets the exact relay that sent the request; falls
+        // back to any relay for the session when id is absent/stale.
         if let Some(resp) = try_route_control(
             &self.control,
             &session,
+            &connection_id,
             crate::relay::RelayControl::SwitchTab(tab_id),
         ) {
             log::info!("GoToTab: routed via relay client (session='{session}', tab_id={tab_id})");

@@ -7,24 +7,75 @@ use crate::proto::{ActionAck as ProtoAck, PaneTarget, TabTarget};
 
 // ─── Control routing ──────────────────────────────────────────────────────────
 
-/// Try to route a control command through a live relay's AttachClient (W2.0a/b
-/// spike). Returns `Some(ok-ack)` if a relay is registered for `session` and the
-/// command was queued; `None` → caller falls back to the ephemeral CLI path.
+/// Try to route a control command through a live relay's AttachClient.
+///
+/// Routing priority:
+/// 1. If `connection_id` is non-empty AND an entry with that key exists AND its
+///    stored session matches `session` → route to that specific relay.
+/// 2. Otherwise → scan all entries for any relay attached to `session` and route
+///    to the first found (session-scoped fallback; preserves solo-client and
+///    legacy-client behavior where the client doesn't send a connection_id).
+///
+/// Returns `Some(ok-ack)` if a relay was found and the command was queued;
+/// `None` → caller falls back to the ephemeral CLI path.
+///
+/// Never errors on a stale / unknown / mismatched `connection_id`.
 pub(super) fn try_route_control(
     control: &crate::relay::ControlRegistry,
     session: &str,
+    connection_id: &str,
     cmd: crate::relay::RelayControl,
 ) -> Option<Response<ProtoAck>> {
+    // ── Resolve sender + info string (no .await — this is a sync helper) ──────
     // Clone the sender out so the DashMap Ref (shard read-lock) is released
     // before we send — never hold a shard guard across the channel send.
-    let tx = control.get(session).map(|r| r.value().clone())?;
+    //
+    // Routing priority:
+    //   1. Per-connection: connection_id non-empty + session matches.
+    //   2. Session fallback: any relay for the session (preserves solo-client
+    //      and legacy-client behavior).
+    //   3. Neither found → return None (caller uses ephemeral CLI path).
+    let (tx, info): (
+        tokio::sync::mpsc::UnboundedSender<crate::relay::RelayControl>,
+        &str,
+    ) = if !connection_id.is_empty() {
+        let maybe = control
+            .get(connection_id)
+            .filter(|entry| entry.session == session)
+            .map(|entry| entry.sender.clone());
+        if let Some(sender) = maybe {
+            (sender, "routed via relay client (per-connection)")
+        } else {
+            // connection_id absent/stale/mismatched — session fallback.
+            let maybe_fallback = control
+                .iter()
+                .find(|entry| entry.session == session)
+                .map(|entry| entry.sender.clone());
+            (
+                maybe_fallback?,
+                "routed via relay client (session fallback)",
+            )
+        }
+    } else {
+        // No connection_id — session fallback.
+        let maybe_fallback = control
+            .iter()
+            .find(|entry| entry.session == session)
+            .map(|entry| entry.sender.clone());
+        (
+            maybe_fallback?,
+            "routed via relay client (session fallback)",
+        )
+    };
+
     if tx.send(cmd).is_ok() {
         Some(Response::new(ProtoAck {
             ok: true,
             error: String::new(),
-            info: "routed via relay client (spike)".to_owned(),
+            info: info.to_owned(),
         }))
     } else {
+        // Sender dead (relay tearing down); caller falls back to ephemeral.
         None
     }
 }
@@ -175,6 +226,164 @@ pub(super) fn resolve_tab_target(target: &TabTarget) -> Result<(String, u64), St
 mod tests {
     use super::*;
     use crate::auth::SessionReadOnly;
+    use crate::relay::{ControlEntry, ControlRegistry, RelayControl};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    // ─── try_route_control tests ─────────────────────────────────────────────
+
+    /// Build a ControlRegistry with one entry and return the receiver so tests
+    /// can inspect what was sent.
+    fn make_registry(
+        conn_id: &str,
+        session: &str,
+    ) -> (ControlRegistry, mpsc::UnboundedReceiver<RelayControl>) {
+        let registry: ControlRegistry = Arc::new(dashmap::DashMap::new());
+        let (tx, rx) = mpsc::unbounded_channel::<RelayControl>();
+        registry.insert(
+            conn_id.to_owned(),
+            ControlEntry {
+                session: session.to_owned(),
+                sender: tx,
+            },
+        );
+        (registry, rx)
+    }
+
+    #[test]
+    fn routes_by_connection_id_when_session_matches() {
+        // A request carrying the exact connection_id that matches an entry for
+        // the same session must be routed to that relay's sender.
+        let (reg, mut rx) = make_registry("conn-1", "my-session");
+        let result = try_route_control(&reg, "my-session", "conn-1", RelayControl::SwitchTab(42));
+        assert!(result.is_some(), "should route via connection_id");
+        // Verify the command arrived on the relay's receiver.
+        match rx.try_recv() {
+            Ok(RelayControl::SwitchTab(42)) => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_session_when_connection_id_is_empty() {
+        // Empty connection_id → session-scoped fallback: route to any relay for
+        // the session.
+        let (reg, mut rx) = make_registry("conn-2", "session-A");
+        let result = try_route_control(
+            &reg,
+            "session-A",
+            "", // empty — no connection_id from client
+            RelayControl::SwitchTab(99),
+        );
+        assert!(result.is_some(), "session fallback should route");
+        match rx.try_recv() {
+            Ok(RelayControl::SwitchTab(99)) => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_session_when_connection_id_is_stale() {
+        // A stale/unknown connection_id must NOT error; it falls back to the
+        // session-scoped relay.
+        let (reg, mut rx) = make_registry("conn-3", "session-B");
+        let result = try_route_control(
+            &reg,
+            "session-B",
+            "stale-id-xyz", // not in the registry
+            RelayControl::SwitchTab(7),
+        );
+        assert!(
+            result.is_some(),
+            "stale id should fall back to session relay"
+        );
+        match rx.try_recv() {
+            Ok(RelayControl::SwitchTab(7)) => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_route_when_connection_id_session_mismatches() {
+        // A connection_id that exists but is registered under a DIFFERENT
+        // session must not route to it. If there's no other relay for the
+        // requested session, None is returned.
+        let (reg, mut rx) = make_registry("conn-4", "session-C");
+        let result = try_route_control(
+            &reg,
+            "OTHER-SESSION", // mismatch — conn-4 belongs to session-C
+            "conn-4",
+            RelayControl::SwitchTab(1),
+        );
+        assert!(result.is_none(), "session mismatch should not route");
+        // The relay for session-C must NOT have received anything.
+        assert!(
+            rx.try_recv().is_err(),
+            "mismatched session must not deliver to relay"
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_relay_for_session() {
+        // No relay registered for the requested session at all → None.
+        let registry: ControlRegistry = Arc::new(dashmap::DashMap::new());
+        let result = try_route_control(
+            &registry,
+            "nonexistent-session",
+            "",
+            RelayControl::SwitchTab(1),
+        );
+        assert!(
+            result.is_none(),
+            "no relay → None (caller uses ephemeral path)"
+        );
+    }
+
+    #[test]
+    fn per_connection_routing_targets_exact_relay_among_two() {
+        // Two relays on the same session. A request with conn-A's id must route
+        // to relay A, NOT relay B.
+        let reg: ControlRegistry = Arc::new(dashmap::DashMap::new());
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel::<RelayControl>();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel::<RelayControl>();
+
+        reg.insert(
+            "conn-A".to_owned(),
+            ControlEntry {
+                session: "shared-session".to_owned(),
+                sender: tx_a,
+            },
+        );
+        reg.insert(
+            "conn-B".to_owned(),
+            ControlEntry {
+                session: "shared-session".to_owned(),
+                sender: tx_b,
+            },
+        );
+
+        let result = try_route_control(
+            &reg,
+            "shared-session",
+            "conn-A",
+            RelayControl::SwitchTab(11),
+        );
+        assert!(result.is_some(), "should route via conn-A");
+
+        // Relay A got the command.
+        match rx_a.try_recv() {
+            Ok(RelayControl::SwitchTab(11)) => {}
+            other => panic!("relay A: unexpected: {other:?}"),
+        }
+        // Relay B must NOT have received anything.
+        assert!(
+            rx_b.try_recv().is_err(),
+            "relay B must not receive cmd for conn-A"
+        );
+    }
+
+    // ─── reject_if_read_only tests ───────────────────────────────────────────
 
     #[test]
     fn reject_if_read_only_denies_when_extension_absent() {

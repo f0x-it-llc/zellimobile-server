@@ -59,13 +59,16 @@ impl ZelliService {
     ) -> Result<Response<ProtoAck>, Status> {
         // Focus is a read — no read-only gate.
         let target = request.into_inner();
+        let connection_id = target.connection_id.clone();
         let (session, pane) = resolve_pane_target(&target)?;
-        log::info!("FocusPane: session='{session}' pane={pane:?}");
-        // W2.0a/b: route through the live relay client if attached, so focus
-        // applies to the rendering client (and re-points the single-pane sub).
+        log::info!("FocusPane: session='{session}' pane={pane:?} connection_id='{connection_id}'");
+        // Route through the live relay client if attached, so focus applies to
+        // the rendering client (and re-points the single-pane sub).
+        // connection_id targets the exact relay that sent the request.
         if let Some(resp) = try_route_control(
             &self.control,
             &session,
+            &connection_id,
             crate::relay::RelayControl::FocusPane(pane),
         ) {
             log::info!("FocusPane: routed via relay client (session='{session}')");
@@ -187,6 +190,7 @@ impl ZelliService {
             .target
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("TogglePaneFullscreen: missing target"))?;
+        let connection_id = target.connection_id.clone();
         let (session, pane) = resolve_pane_target(target)?;
         // Bug 2c: forward the client's floating hint so the relay can skip a
         // synchronous IPC query on its hot path. Only trust the hint when the
@@ -204,12 +208,17 @@ impl ZelliService {
         } else {
             None
         };
-        log::info!("TogglePaneFullscreen: session='{session}' pane={pane:?} hint={hint:?}");
+        log::info!(
+            "TogglePaneFullscreen: session='{session}' pane={pane:?} hint={hint:?} \
+             connection_id='{connection_id}'"
+        );
         // Route through the live relay client if attached so the fullscreen
         // toggle applies to the *rendering* client (is_cli_client:false).
+        // connection_id targets the exact relay that sent the request.
         if let Some(resp) = try_route_control(
             &self.control,
             &session,
+            &connection_id,
             crate::relay::RelayControl::ToggleFullscreen { pane, hint },
         ) {
             log::info!("TogglePaneFullscreen: routed via relay client (session='{session}')");
