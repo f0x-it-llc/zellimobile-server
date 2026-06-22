@@ -500,6 +500,7 @@ fn handle_server_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
         KeyCode::Char('s') => {
             if !state.server.loading {
                 state.server.loading = true;
+                state.server.stopped = false;
                 state.server.action_msg = "Starting server…".to_string();
                 vec![UpdateAction::StartServer]
             } else {
@@ -782,6 +783,25 @@ mod tests {
         let mut state = AppState::new();
         state.screen = Screen::Server;
         let actions = update(&mut state, Message::Key(key(KeyCode::Char('s'))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::StartServer))
+        );
+    }
+
+    #[test]
+    fn server_s_key_clears_stopped_flag() {
+        // Regression: pressing `s` (StartServer) while the daemon is known-stopped
+        // must clear `stopped` so the renderer doesn't hold a stale "Stopped" panel
+        // for the one cycle before the first StatusLoaded(Some(_)) arrives.
+        let mut state = AppState::new();
+        state.screen = Screen::Server;
+        state.server.stopped = true;
+        state.server.status = None;
+        let actions = update(&mut state, Message::Key(key(KeyCode::Char('s'))));
+        assert!(!state.server.stopped, "stopped should be cleared on StartServer");
+        assert!(state.server.loading);
         assert!(
             actions
                 .iter()
