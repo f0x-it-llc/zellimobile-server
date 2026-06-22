@@ -127,6 +127,7 @@ async fn list_tabs(client: &mut AuthedClient, session: &str) -> Result<Vec<(u32,
     let layout = client
         .get_layout(SessionRef {
             session: session.to_owned(),
+            ..Default::default()
         })
         .await
         .context("GetLayout RPC failed")?
@@ -153,6 +154,7 @@ async fn first_terminal_pane(client: &mut AuthedClient, session: &str) -> Result
     let layout = client
         .get_layout(SessionRef {
             session: session.to_owned(),
+            ..Default::default()
         })
         .await
         .context("GetLayout RPC failed")?
@@ -276,6 +278,7 @@ async fn main() -> Result<()> {
             .go_to_tab(TabTarget {
                 session: session.clone(),
                 tab_id: new_tab_id as u64,
+                ..Default::default()
             })
             .await
             .context("GoToTab RPC failed")?
@@ -289,6 +292,7 @@ async fn main() -> Result<()> {
             .close_tab(TabTarget {
                 session: session.clone(),
                 tab_id: new_tab_id as u64,
+                ..Default::default()
             })
             .await
             .context("CloseTab RPC failed")?
@@ -321,6 +325,7 @@ async fn main() -> Result<()> {
                 session: session.clone(),
                 pane_id,
                 is_plugin: false,
+                ..Default::default()
             }),
             direction: ScrollDirection::PageUp as i32,
         })
@@ -336,6 +341,7 @@ async fn main() -> Result<()> {
                 session: session.clone(),
                 pane_id,
                 is_plugin: false,
+                ..Default::default()
             }),
             direction: ScrollDirection::ToBottom as i32,
         })
@@ -396,6 +402,7 @@ async fn main() -> Result<()> {
     let ks = rw
         .kill_session(SessionRef {
             session: "d2new".to_owned(),
+            ..Default::default()
         })
         .await
         .context("KillSession RPC failed")?
@@ -426,6 +433,7 @@ async fn main() -> Result<()> {
                     session: "d2demo-renamed".to_owned(),
                     pane_id,
                     is_plugin: false,
+                    ..Default::default()
                 }),
                 direction: ScrollDirection::Up as i32,
             })
@@ -452,6 +460,7 @@ async fn main() -> Result<()> {
             .go_to_tab(TabTarget {
                 session: "d2demo-renamed".to_owned(),
                 tab_id: 0,
+                ..Default::default()
             })
             .await;
         check_permission_denied("GoToTab", ro_goto, &mut pass);
@@ -469,6 +478,7 @@ async fn main() -> Result<()> {
         let ro_ks = ro
             .kill_session(SessionRef {
                 session: "d2demo-renamed".to_owned(),
+                ..Default::default()
             })
             .await;
         check_permission_denied("KillSession", ro_ks, &mut pass);

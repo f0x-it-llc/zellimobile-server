@@ -196,6 +196,8 @@ message ControlEvent {
 // Reference to a named zellij session (used in GetLayout).
 message SessionRef {
   string session = 1;
+  // optional; echoed from AttachTerminal's minted id to route per-connection (empty = legacy/fallback routing)
+  string connection_id = 2;
 }
 
 // List of sessions returned by ListSessions.
@@ -292,6 +294,8 @@ message PaneTarget {
   uint32 pane_id   = 2;
   // True if this is a plugin pane → PaneId::Plugin; else PaneId::Terminal.
   bool   is_plugin = 3;
+  // optional; echoed from AttachTerminal's minted id to route per-connection (empty = legacy/fallback routing)
+  string connection_id = 4;
 }
 
 // Toggle-fullscreen request with an optional floating-pane hint (Bug 2c).
@@ -326,6 +330,8 @@ message ToggleFullscreenReq {
 message TabTarget {
   string session = 1;
   uint64 tab_id  = 2;
+  // optional; echoed from AttachTerminal's minted id to route per-connection (empty = legacy/fallback routing)
+  string connection_id = 3;
 }
 
 // Generic acknowledgement returned by action RPCs.

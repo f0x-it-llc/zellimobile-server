@@ -291,12 +291,14 @@ const SessionRef$json = {
   '1': 'SessionRef',
   '2': [
     {'1': 'session', '3': 1, '4': 1, '5': 9, '10': 'session'},
+    {'1': 'connection_id', '3': 2, '4': 1, '5': 9, '10': 'connectionId'},
   ],
 };
 
 /// Descriptor for `SessionRef`. Decode as a `google.protobuf.DescriptorProto`.
-final $typed_data.Uint8List sessionRefDescriptor = $convert
-    .base64Decode('CgpTZXNzaW9uUmVmEhgKB3Nlc3Npb24YASABKAlSB3Nlc3Npb24=');
+final $typed_data.Uint8List sessionRefDescriptor = $convert.base64Decode(
+    'CgpTZXNzaW9uUmVmEhgKB3Nlc3Npb24YASABKAlSB3Nlc3Npb24SIwoNY29ubmVjdGlvbl9pZB'
+    'gCIAEoCVIMY29ubmVjdGlvbklk');
 
 @$core.Deprecated('Use sessionListDescriptor instead')
 const SessionList$json = {
@@ -446,13 +448,15 @@ const PaneTarget$json = {
     {'1': 'session', '3': 1, '4': 1, '5': 9, '10': 'session'},
     {'1': 'pane_id', '3': 2, '4': 1, '5': 13, '10': 'paneId'},
     {'1': 'is_plugin', '3': 3, '4': 1, '5': 8, '10': 'isPlugin'},
+    {'1': 'connection_id', '3': 4, '4': 1, '5': 9, '10': 'connectionId'},
   ],
 };
 
 /// Descriptor for `PaneTarget`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List paneTargetDescriptor = $convert.base64Decode(
     'CgpQYW5lVGFyZ2V0EhgKB3Nlc3Npb24YASABKAlSB3Nlc3Npb24SFwoHcGFuZV9pZBgCIAEoDV'
-    'IGcGFuZUlkEhsKCWlzX3BsdWdpbhgDIAEoCFIIaXNQbHVnaW4=');
+    'IGcGFuZUlkEhsKCWlzX3BsdWdpbhgDIAEoCFIIaXNQbHVnaW4SIwoNY29ubmVjdGlvbl9pZBgE'
+    'IAEoCVIMY29ubmVjdGlvbklk');
 
 @$core.Deprecated('Use toggleFullscreenReqDescriptor instead')
 const ToggleFullscreenReq$json = {
@@ -499,13 +503,14 @@ const TabTarget$json = {
   '2': [
     {'1': 'session', '3': 1, '4': 1, '5': 9, '10': 'session'},
     {'1': 'tab_id', '3': 2, '4': 1, '5': 4, '10': 'tabId'},
+    {'1': 'connection_id', '3': 3, '4': 1, '5': 9, '10': 'connectionId'},
   ],
 };
 
 /// Descriptor for `TabTarget`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List tabTargetDescriptor = $convert.base64Decode(
     'CglUYWJUYXJnZXQSGAoHc2Vzc2lvbhgBIAEoCVIHc2Vzc2lvbhIVCgZ0YWJfaWQYAiABKARSBX'
-    'RhYklk');
+    'RhYklkEiMKDWNvbm5lY3Rpb25faWQYAyABKAlSDGNvbm5lY3Rpb25JZA==');
 
 @$core.Deprecated('Use actionAckDescriptor instead')
 const ActionAck$json = {
