@@ -163,29 +163,46 @@ impl ZelliService {
         })?;
 
         // ── B-FOCUS: read relay view state for active_tab / focused_pane ────
-        // Only meaningful when a relay is attached. We snapshot it once and use
-        // it for the override pass below so we hold the DashMap guard briefly
-        // (never across an .await).
+        // Only meaningful when a relay is attached AND the relay that served the
+        // query is the CALLER'S OWN relay. We snapshot it once and use it for
+        // the override pass below so we hold the DashMap guard briefly (never
+        // across an .await).
         //
-        // Use relay_conn_id (the connection_id of the relay that served the query)
-        // to look up the exact per-connection view state. This ensures that when
-        // two relays are attached to the same session, each client's GetLayout
-        // response is overridden with ITS OWN active_tab / focused_pane — not
-        // those of another relay on the same session (the multi-client fix).
+        // Override condition (Issue A fix):
+        //   - `connection_id` must be non-empty (caller has a known relay id),
+        //   - `relay_conn_id` must equal `connection_id` (the exact-connection
+        //     path was taken — the query was served by the caller's own relay).
+        //
+        // When the fallback path was taken (request connection_id is empty, OR
+        // the query fell back to an arbitrary sibling relay whose conn_id differs
+        // from the request's), relay_vs is set to None so the override pass is
+        // skipped entirely. Raw zellij tab/pane values are returned unchanged,
+        // which is always correct because we have no reliable per-caller view
+        // state in that case — applying a sibling relay's active_tab/focused_pane
+        // would produce an actively wrong indicator (worse than the raw union).
         let relay_vs: Option<crate::relay::RelayViewState> =
-            if via_relay && !relay_conn_id.is_empty() {
+            if should_apply_view_state_override(via_relay, &connection_id, &relay_conn_id) {
+                // Exact-connection match: the query was served by the caller's own
+                // relay. Apply the per-connection view-state override.
                 self.view_state
                     .get(&relay_conn_id)
                     .map(|entry| entry.state.clone())
             } else {
+                // Fallback path or no relay: skip the override.
                 None
             };
         if let Some(ref vs) = relay_vs {
             log::debug!(
-                "GetLayout: relay view state (conn={relay_conn_id}): \
+                "GetLayout: relay view state override applied (conn={relay_conn_id}): \
                  active_tab={:?} focused_pane={:?}",
                 vs.active_tab,
                 vs.focused_pane
+            );
+        } else if via_relay {
+            log::debug!(
+                "GetLayout: relay view state override SUPPRESSED (request \
+                 connection_id='{connection_id}', relay_conn_id='{relay_conn_id}') — \
+                 returning raw zellij values"
             );
         }
 
@@ -290,5 +307,82 @@ impl ZelliService {
         );
 
         Ok(Response::new(Layout { tabs: tab_msgs }))
+    }
+}
+
+// ─── Pure helper (also used by tests) ────────────────────────────────────────
+
+/// Decide whether the B-FOCUS view-state override should be applied.
+///
+/// The override is only correct when the relay that served the query is the
+/// CALLER'S OWN relay (exact `connection_id` match). When the fallback path was
+/// taken (request `connection_id` is empty, or the resolved `relay_conn_id`
+/// differs from the request's `connection_id`), applying a sibling relay's
+/// `active_tab`/`focused_pane` would give the caller an actively wrong indicator
+/// — worse than returning raw zellij values (Issue A fix).
+///
+/// Returns `true` only when all three conditions hold:
+/// 1. the query was served via a relay (`via_relay`),
+/// 2. the request carried a non-empty `connection_id` (caller has a known relay),
+/// 3. the relay that served the query is the caller's own relay
+///    (`relay_conn_id == request_connection_id`).
+pub(crate) fn should_apply_view_state_override(
+    via_relay: bool,
+    request_connection_id: &str,
+    relay_conn_id: &str,
+) -> bool {
+    via_relay && !request_connection_id.is_empty() && relay_conn_id == request_connection_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── Issue A: view-state override suppression ─────────────────────────────
+
+    #[test]
+    fn override_applied_on_exact_connection_id_match() {
+        // Exact match: via_relay + non-empty id + relay_conn_id == request id.
+        assert!(
+            should_apply_view_state_override(true, "conn-1", "conn-1"),
+            "override must be applied when relay_conn_id == request connection_id"
+        );
+    }
+
+    #[test]
+    fn override_suppressed_when_request_connection_id_is_empty() {
+        // Empty request connection_id → fallback path; no reliable caller identity.
+        assert!(
+            !should_apply_view_state_override(true, "", "conn-2"),
+            "override must be suppressed when request connection_id is empty"
+        );
+    }
+
+    #[test]
+    fn override_suppressed_when_relay_conn_id_differs() {
+        // relay_conn_id is a sibling relay's id — applying its view-state would
+        // give the caller an actively wrong active_tab / focused_pane.
+        assert!(
+            !should_apply_view_state_override(true, "conn-A", "conn-B"),
+            "override must be suppressed when relay_conn_id != request connection_id"
+        );
+    }
+
+    #[test]
+    fn override_suppressed_when_not_via_relay() {
+        // Ephemeral query path: no relay view state at all.
+        assert!(
+            !should_apply_view_state_override(false, "conn-1", "conn-1"),
+            "override must be suppressed when query was not served via relay"
+        );
+    }
+
+    #[test]
+    fn override_suppressed_when_all_empty() {
+        // No connection_id and no relay: definitely no override.
+        assert!(
+            !should_apply_view_state_override(false, "", ""),
+            "override must be suppressed with no relay and no connection_id"
+        );
     }
 }

@@ -12,9 +12,15 @@ use crate::proto::{ActionAck as ProtoAck, PaneTarget, TabTarget};
 /// Routing priority:
 /// 1. If `connection_id` is non-empty AND an entry with that key exists AND its
 ///    stored session matches `session` → route to that specific relay.
-/// 2. Otherwise → scan all entries for any relay attached to `session` and route
-///    to the first found (session-scoped fallback; preserves solo-client and
-///    legacy-client behavior where the client doesn't send a connection_id).
+/// 2. Otherwise → scan all entries for any **writable** relay attached to
+///    `session` (session-scoped fallback; preserves solo-client and legacy-client
+///    behavior where the client doesn't send a connection_id).
+///
+/// All commands routed through this function are mutating (`SwitchTab`,
+/// `FocusPane`, `ToggleFullscreen`). The session-scoped fallback explicitly
+/// skips read-only relay entries: sending to a read-only relay would succeed at
+/// the channel level but the inbound task would silently drop the command at its
+/// own guard → false `ok:true` response and client UI desync (Issue B).
 ///
 /// Returns `Some(ok-ack)` if a relay was found and the command was queued;
 /// `None` → caller falls back to the ephemeral CLI path.
@@ -32,8 +38,13 @@ pub(super) fn try_route_control(
     //
     // Routing priority:
     //   1. Per-connection: connection_id non-empty + session matches.
-    //   2. Session fallback: any relay for the session (preserves solo-client
-    //      and legacy-client behavior).
+    //      (The exact-connection_id path is not filtered for read_only — the
+    //      caller's own upstream `reject_if_read_only` gate already denied the
+    //      RPC if the CALLER'S token is read-only. Routing to the exact relay
+    //      is always intentional for a non-read-only caller.)
+    //   2. Session fallback: any WRITABLE relay for the session. Read-only
+    //      entries are skipped: their inbound tasks would drop the command
+    //      silently → false ok:true (Issue B fix).
     //   3. Neither found → return None (caller uses ephemeral CLI path).
     let (tx, info): (
         tokio::sync::mpsc::UnboundedSender<crate::relay::RelayControl>,
@@ -47,24 +58,26 @@ pub(super) fn try_route_control(
             (sender, "routed via relay client (per-connection)")
         } else {
             // connection_id absent/stale/mismatched — session fallback.
+            // Only writable relays: a read-only relay's inbound task would
+            // silently drop mutating commands (Issue B).
             let maybe_fallback = control
                 .iter()
-                .find(|entry| entry.session == session)
+                .find(|entry| entry.session == session && !entry.read_only)
                 .map(|entry| entry.sender.clone());
             (
                 maybe_fallback?,
-                "routed via relay client (session fallback)",
+                "routed via relay client (session fallback, writable)",
             )
         }
     } else {
-        // No connection_id — session fallback.
+        // No connection_id — session fallback (writable relays only).
         let maybe_fallback = control
             .iter()
-            .find(|entry| entry.session == session)
+            .find(|entry| entry.session == session && !entry.read_only)
             .map(|entry| entry.sender.clone());
         (
             maybe_fallback?,
-            "routed via relay client (session fallback)",
+            "routed via relay client (session fallback, writable)",
         )
     };
 
@@ -232,11 +245,20 @@ mod tests {
 
     // ─── try_route_control tests ─────────────────────────────────────────────
 
-    /// Build a ControlRegistry with one entry and return the receiver so tests
-    /// can inspect what was sent.
+    /// Build a ControlRegistry with one writable entry and return the receiver
+    /// so tests can inspect what was sent.
     fn make_registry(
         conn_id: &str,
         session: &str,
+    ) -> (ControlRegistry, mpsc::UnboundedReceiver<RelayControl>) {
+        make_registry_with_flags(conn_id, session, false)
+    }
+
+    /// Build a ControlRegistry with one entry of the given `read_only` flag.
+    fn make_registry_with_flags(
+        conn_id: &str,
+        session: &str,
+        read_only: bool,
     ) -> (ControlRegistry, mpsc::UnboundedReceiver<RelayControl>) {
         let registry: ControlRegistry = Arc::new(dashmap::DashMap::new());
         let (tx, rx) = mpsc::unbounded_channel::<RelayControl>();
@@ -245,6 +267,7 @@ mod tests {
             ControlEntry {
                 session: session.to_owned(),
                 sender: tx,
+                read_only,
             },
         );
         (registry, rx)
@@ -353,6 +376,7 @@ mod tests {
             ControlEntry {
                 session: "shared-session".to_owned(),
                 sender: tx_a,
+                read_only: false,
             },
         );
         reg.insert(
@@ -360,6 +384,7 @@ mod tests {
             ControlEntry {
                 session: "shared-session".to_owned(),
                 sender: tx_b,
+                read_only: false,
             },
         );
 
@@ -380,6 +405,115 @@ mod tests {
         assert!(
             rx_b.try_recv().is_err(),
             "relay B must not receive cmd for conn-A"
+        );
+    }
+
+    // ─── Issue B: read-only fallback filtering ───────────────────────────────
+
+    #[test]
+    fn fallback_skips_read_only_and_routes_to_writable() {
+        // Two relays on the same session: one read-only, one writable.
+        // A mutating command with an empty/stale connection_id must skip the
+        // read-only entry and route to the writable one (Issue B fix).
+        let reg: ControlRegistry = Arc::new(dashmap::DashMap::new());
+
+        let (tx_ro, mut rx_ro) = mpsc::unbounded_channel::<RelayControl>();
+        let (tx_rw, mut rx_rw) = mpsc::unbounded_channel::<RelayControl>();
+
+        // Insert read-only first so the deterministic scan encounters it first.
+        reg.insert(
+            "conn-ro".to_owned(),
+            ControlEntry {
+                session: "sess".to_owned(),
+                sender: tx_ro,
+                read_only: true,
+            },
+        );
+        reg.insert(
+            "conn-rw".to_owned(),
+            ControlEntry {
+                session: "sess".to_owned(),
+                sender: tx_rw,
+                read_only: false,
+            },
+        );
+
+        // Empty connection_id → session fallback.
+        let result = try_route_control(&reg, "sess", "", RelayControl::SwitchTab(5));
+        assert!(
+            result.is_some(),
+            "should route to the writable relay, not be blocked by read-only entry"
+        );
+
+        // Writable relay got the command.
+        match rx_rw.try_recv() {
+            Ok(RelayControl::SwitchTab(5)) => {}
+            other => panic!("writable relay: unexpected: {other:?}"),
+        }
+        // Read-only relay must NOT have received anything.
+        assert!(
+            rx_ro.try_recv().is_err(),
+            "read-only relay must not receive a mutating command via session fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_returns_none_when_only_read_only_relay_exists() {
+        // Only a read-only relay registered for the session. A mutating command
+        // with no connection_id must return None so the caller falls through to
+        // the ephemeral path — never a false ok:true (Issue B fix).
+        let (reg, mut rx_ro) = make_registry_with_flags("conn-ro-only", "sess-ro", true);
+
+        let result = try_route_control(&reg, "sess-ro", "", RelayControl::SwitchTab(9));
+        assert!(
+            result.is_none(),
+            "only read-only relay → None (must fall through to ephemeral)"
+        );
+        // Confirm nothing was sent to the read-only relay.
+        assert!(
+            rx_ro.try_recv().is_err(),
+            "read-only relay must not receive any command"
+        );
+    }
+
+    #[test]
+    fn stale_id_fallback_skips_read_only_and_routes_to_writable() {
+        // Stale connection_id + one read-only relay + one writable relay.
+        // The stale-id fallback path must also skip the read-only entry.
+        let reg: ControlRegistry = Arc::new(dashmap::DashMap::new());
+
+        let (tx_ro, mut rx_ro) = mpsc::unbounded_channel::<RelayControl>();
+        let (tx_rw, mut rx_rw) = mpsc::unbounded_channel::<RelayControl>();
+
+        reg.insert(
+            "conn-ro".to_owned(),
+            ControlEntry {
+                session: "sess2".to_owned(),
+                sender: tx_ro,
+                read_only: true,
+            },
+        );
+        reg.insert(
+            "conn-rw".to_owned(),
+            ControlEntry {
+                session: "sess2".to_owned(),
+                sender: tx_rw,
+                read_only: false,
+            },
+        );
+
+        let result = try_route_control(&reg, "sess2", "stale-xyz", RelayControl::SwitchTab(3));
+        assert!(
+            result.is_some(),
+            "stale id fallback should route to writable relay"
+        );
+        match rx_rw.try_recv() {
+            Ok(RelayControl::SwitchTab(3)) => {}
+            other => panic!("writable relay: unexpected: {other:?}"),
+        }
+        assert!(
+            rx_ro.try_recv().is_err(),
+            "read-only relay must not receive the command"
         );
     }
 

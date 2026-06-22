@@ -273,9 +273,16 @@ pub async fn attach_relay(
         };
         // The channel is empty and the receiver hasn't been given to the stream
         // yet, so this cannot block. If somehow it fails (channel full from a
-        // very small RENDER_CHANNEL_BOUND — not the case with 64) we just
-        // silently skip: the client falls back to session-scoped routing.
-        let _ = tx.try_send(Ok(conn_event));
+        // very small RENDER_CHANNEL_BOUND — not the case with 64) the client
+        // never receives its connection_id and falls back to session-scoped
+        // routing for all subsequent RPCs.
+        if let Err(e) = tx.try_send(Ok(conn_event)) {
+            log::warn!(
+                "relay [{session_name}]: failed to send connection_id frame to client \
+                 (connection_id={connection_id}): {e} — client will fall back to \
+                 session-scoped routing"
+            );
+        }
     }
 
     // FX-QUERY: channel from inbound task → render thread carrying in-flight
@@ -372,6 +379,7 @@ pub async fn attach_relay(
         ControlEntry {
             session: session_name.clone(),
             sender: ctrl_tx.clone(),
+            read_only,
         },
     );
 

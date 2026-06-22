@@ -103,6 +103,15 @@ pub struct ControlEntry {
     pub session: String,
     /// The channel used to send [`RelayControl`] commands to the relay's inbound task.
     pub sender: mpsc::UnboundedSender<RelayControl>,
+    /// Whether the relay was opened with a read-only token.
+    ///
+    /// The inbound task drops all mutating commands (`SwitchTab`, `FocusPane`,
+    /// `ToggleFullscreen`) for read-only relays at its own guard. This flag is
+    /// stored here so the session-scoped fallback path in `try_route_control` can
+    /// skip read-only entries when routing a mutating command — preventing a silent
+    /// false-success where the channel send returns `ok:true` but the command is
+    /// then dropped by the inbound guard (Issue B).
+    pub read_only: bool,
 }
 
 /// A registry entry pairing a relay's owning session name with its view state.
