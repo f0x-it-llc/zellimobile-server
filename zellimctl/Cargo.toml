@@ -39,10 +39,6 @@ zellij-utils = { version = "0.44.3", default-features = false, features = ["web_
 # Base64url encoding for the pairing token in the QR URI.
 base64 = "0.22"
 
-# JSON — used by server/mod.rs to parse the SAN sidecar (server.san.json)
-# produced by zellimserver::tls so we can forward --san flags to the daemon.
-serde_json = "1"
-
 # Utility
 anyhow = "1"
 log = "0.4"

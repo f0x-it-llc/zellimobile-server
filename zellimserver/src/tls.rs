@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 use rcgen::{CertificateParams, KeyPair, SanType};
 use sha2::Digest;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tonic::transport::Identity;
 
 // ─── SAN entry ────────────────────────────────────────────────────────────────
@@ -115,7 +115,10 @@ fn cert_dir() -> Result<PathBuf> {
 ///
 /// Returns an empty vec if the file is absent or unparseable (that means the
 /// cert was generated without extras → no extra SANs covered).
-fn read_san_sidecar(dir: &PathBuf) -> Vec<SanEntry> {
+///
+/// Exposed as `pub` so the `zellimctl` server facade can reuse this parser
+/// instead of duplicating it with its own `serde_json` call.
+pub fn read_san_sidecar(dir: &Path) -> Vec<SanEntry> {
     let path = dir.join("server.san.json");
     let raw = match std::fs::read_to_string(&path) {
         Ok(r) => r,
@@ -128,7 +131,7 @@ fn read_san_sidecar(dir: &PathBuf) -> Vec<SanEntry> {
 }
 
 /// Persist the extra-SAN list to `server.san.json`.
-fn write_san_sidecar(dir: &PathBuf, sans: &[SanEntry]) -> Result<()> {
+fn write_san_sidecar(dir: &Path, sans: &[SanEntry]) -> Result<()> {
     let path = dir.join("server.san.json");
     let json = serde_json::to_string(sans).context("tls: serialize SAN list")?;
     write_restricted(&path, &json)

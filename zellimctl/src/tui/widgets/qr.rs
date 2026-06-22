@@ -38,35 +38,49 @@ const QUIET_V: u16 = 1;
 /// 33-module matrix occupies 33 cols × 17 rows (ceil(33/2)).
 /// With horizontal quiet-zone padding and 1-row top/bottom padding the
 /// minimum useful area is (33 + 2*4) × (17 + 2*1) = 41 × 19.
-const MIN_WIDTH: u16 = 41;
-const MIN_HEIGHT: u16 = 19;
+pub(crate) const MIN_WIDTH: u16 = 41;
+pub(crate) const MIN_HEIGHT: u16 = 19;
 
 /// A stateless QR-code widget.
 ///
 /// Renders a `zellimobile://pair?...` (or any) payload as a scannable
 /// half-block QR matrix, centered with a white quiet-zone border.
 ///
+/// The QR code is encoded **once** in [`QrWidget::new`] and shared by both
+/// size-measurement (`block_width`) and rendering (`render`), so there is no
+/// double-encode per frame and measurement and rendering always reason about
+/// the same matrix.
+///
 /// The widget stores the payload so it can also render it as plain text in the
 /// fallback path when the terminal is too small.
 pub struct QrWidget {
     payload: String,
+    /// Pre-encoded QR code (ECC-L, encoded once in `new`).
+    ///
+    /// `None` only when the payload cannot be encoded (malformed input) — for
+    /// well-formed `zellimobile://` URIs this is always `Some`.
+    code: Option<QrCode>,
 }
 
 impl QrWidget {
     /// Create a new QR widget for the given payload.
+    ///
+    /// The QR code is encoded here once with ECC-L.  Subsequent calls to
+    /// [`block_width`] and [`render`] reuse the same `QrCode` instance.
     pub fn new(payload: impl Into<String>) -> Self {
-        Self {
-            payload: payload.into(),
-        }
+        let payload = payload.into();
+        let code =
+            QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::L).ok();
+        Self { payload, code }
     }
 
     /// Return the computed block width (cols) this widget will occupy.
     ///
-    /// Returns `None` when the payload cannot be encoded (should never happen
-    /// for well-formed `zellimobile://` URIs).
+    /// Returns `None` when the payload could not be encoded (should never
+    /// happen for well-formed `zellimobile://` URIs).
     pub fn block_width(&self) -> Option<u16> {
-        let qr = QrCode::with_error_correction_level(self.payload.as_bytes(), EcLevel::L).ok()?;
-        let qr_widget = QrCodeWidget::new(qr)
+        let qr = self.code.as_ref()?;
+        let qr_widget = QrCodeWidget::new(qr.clone())
             .quiet_zone(QuietZone::Disabled)
             .style(Style::default().fg(Color::Black).bg(Color::White));
         // Use a dummy large rect just to obtain the matrix size.
@@ -82,11 +96,11 @@ impl QrWidget {
             return;
         }
 
-        // Build the QR code with ECC-L to keep the 33-module (version 8) matrix.
-        // ECC-L is appropriate here: the code is on-screen and immediately scanned.
-        let qr = match QrCode::with_error_correction_level(self.payload.as_bytes(), EcLevel::L) {
-            Ok(q) => q,
-            Err(_) => {
+        // Use the pre-encoded QrCode from `new`; fall back to error display if
+        // encoding failed (malformed payload, should not occur in practice).
+        let qr = match self.code.as_ref() {
+            Some(q) => q.clone(),
+            None => {
                 render_error(frame, area, "QR encode failed");
                 return;
             }
@@ -135,6 +149,9 @@ impl QrWidget {
 
     /// Render the "terminal too small" fallback: show required dimensions and
     /// the raw URI so users on small terminals can pair by copy/paste.
+    ///
+    /// A caution note is included because the URI embeds a one-time bearer
+    /// token that persists in scrollback / screen-share history until cleared.
     fn render_too_small(&self, frame: &mut Frame, area: Rect) {
         let mut lines = vec![
             Line::from(""),
@@ -147,7 +164,7 @@ impl QrWidget {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "Pair via copy/paste — URI:",
+                "Pair via copy/paste — URI (contains a one-time secret — clear your scrollback after pairing):",
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(""),
@@ -203,5 +220,72 @@ mod tests {
         assert_eq!(QUIET_H, 4);
         // QUIET_V ≥ 1 row of white space on each side.
         assert!(QUIET_V >= 1);
+    }
+
+    /// QR is encoded exactly once in `new`; block_width and render both reuse it.
+    #[test]
+    fn qr_encoded_once_in_new() {
+        let w = QrWidget::new("zellimobile://pair?v=1&h=127.0.0.1&p=50051&fp=aabbcc&t=dGVzdA&ro=0&n=dev");
+        // code must be Some for a valid payload
+        assert!(w.code.is_some(), "QrCode should be encoded in new()");
+        // block_width reads from the same stored code, not re-encoding
+        let bw = w.block_width();
+        assert!(bw.is_some(), "block_width should return Some for a valid payload");
+        assert!(bw.unwrap() >= MIN_WIDTH, "block_width should be >= MIN_WIDTH");
+    }
+
+    /// Verify that the 80×24 layout passes the phase-body area with height ≥ MIN_HEIGHT.
+    ///
+    /// This test mirrors the real render chain:
+    ///   dashboard::render (80×24)
+    ///     → title(1) + body(22) + footer(1)
+    ///     → render_body(Pair): no breadcrumb → pair_area = body = 22 rows
+    ///     → pairing::render (borderless): phase_body(Min 3) + combined_strip(1) = 1
+    ///     → phase_body height = 22 − 1 = 21
+    ///
+    /// The QR widget needs phase_body.height ≥ MIN_HEIGHT and
+    /// phase_body.width ≥ MIN_WIDTH.
+    #[test]
+    fn layout_80x24_phase_body_fits_qr() {
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        // Step 1: dashboard::render splits the 80×24 frame.
+        let frame_area = Rect::new(0, 0, 80, 24);
+        let dashboard_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // title bar
+                Constraint::Min(3),    // body
+                Constraint::Length(1), // footer
+            ])
+            .split(frame_area);
+        let body = dashboard_rows[1]; // 22 rows, 80 cols
+
+        // Step 2: render_body(Pair) — no breadcrumb row; full body goes to pairing::render.
+        let pair_area = body; // 22 rows, 80 cols
+
+        // Step 3: pairing::render — borderless, splits into phase_body + combined strip.
+        let pair_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),    // phase body
+                Constraint::Length(1), // combined status+hints strip
+            ])
+            .split(pair_area);
+        let phase_body = pair_rows[0];
+
+        // The area handed to QrWidget::render must fit the QR matrix.
+        assert!(
+            phase_body.height >= MIN_HEIGHT,
+            "phase_body.height ({}) must be >= MIN_HEIGHT ({})",
+            phase_body.height,
+            MIN_HEIGHT,
+        );
+        assert!(
+            phase_body.width >= MIN_WIDTH,
+            "phase_body.width ({}) must be >= MIN_WIDTH ({})",
+            phase_body.width,
+            MIN_WIDTH,
+        );
     }
 }

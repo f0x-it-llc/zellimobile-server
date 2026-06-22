@@ -85,8 +85,10 @@ pub fn is_running() -> bool {
 /// Read the persisted SAN sidecar (`<cert_dir>/server.san.json`) and return the
 /// raw string values of each entry (IP address strings or DNS names).
 ///
-/// Tolerates a missing file or a parse error — both map to an empty vec, which
-/// causes no `--san` flags to be appended (the daemon re-derives its own defaults).
+/// Delegates to `zellimserver::tls::read_san_sidecar` — the single parser for
+/// the cert-identity sidecar — rather than reimplementing JSON parsing here.
+/// Tolerates a missing file or a parse error (both return an empty vec inside
+/// `read_san_sidecar`), which causes no `--san` flags to be appended.
 ///
 /// NOTE: This function lives in the `server/` facade (the only layer allowed to
 /// import `zellimserver::` types) so the `app/` layer stays clean.
@@ -99,22 +101,7 @@ pub fn persisted_extra_sans() -> Vec<String> {
             return vec![];
         }
     };
-    let path = cfg.cert_dir.join("server.san.json");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(_) => return vec![], // file absent → no extra SANs
-    };
-    let entries: Vec<zellimserver::tls::SanEntry> = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!(
-                "server: persisted_extra_sans: failed to parse {}: {e}",
-                path.display()
-            );
-            return vec![];
-        }
-    };
-    entries
+    zellimserver::tls::read_san_sidecar(&cfg.cert_dir)
         .into_iter()
         .map(|e| match e {
             zellimserver::tls::SanEntry::Ip(ip) => ip.to_string(),

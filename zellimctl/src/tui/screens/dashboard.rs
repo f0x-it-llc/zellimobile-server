@@ -18,7 +18,7 @@
 //! ```
 //!
 //! When the Pair screen is active the tab column is suppressed (full-width for
-//! the QR code), replaced by a one-line breadcrumb.
+//! the QR code); the Pair screen's own combined strip carries the screen label.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -68,29 +68,18 @@ fn render_title(frame: &mut Frame, area: Rect) {
 /// Body: a left tab column + the active-screen body panel.
 ///
 /// When the Pair screen is active the tab column is suppressed so the QR +
-/// info layout has the full terminal width.  A one-line breadcrumb is shown
-/// at the top of the body area instead.
+/// info layout has the full terminal width.  No breadcrumb row is used here —
+/// the Pair screen's combined strip carries the "Pair" label in its single
+/// footer row, reclaiming that row for the QR body.
+///
+/// Row budget at 80×24: title(1)+footer(1)=2 → body=22 → Pair gets 22 rows
+/// directly to `pairing::render` → phase_body = 22 − 1 (strip) = 21 ≥
+/// `QrWidget::MIN_HEIGHT` (19).
 fn render_body(frame: &mut Frame, state: &AppState, area: Rect) {
     if state.screen == Screen::Pair {
-        // Full-width body for the Pair screen: show a minimal breadcrumb then
-        // delegate to the pairing renderer for the rest.
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(area);
-
-        let breadcrumb = ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled("Screens", crate::tui::theme::styles::muted()),
-            ratatui::text::Span::styled(" › ", crate::tui::theme::styles::muted()),
-            ratatui::text::Span::styled("Pair", crate::tui::theme::styles::accent_bold()),
-        ]);
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(breadcrumb)
-                .style(Style::default().bg(palette::BG_BASE)),
-            rows[0],
-        );
-
-        crate::tui::screens::render_screen_body(frame, state, rows[1]);
+        // Full-width body for the Pair screen: pass the entire body area
+        // directly to the pairing renderer (no breadcrumb row consumed).
+        crate::tui::screens::render_screen_body(frame, state, area);
     } else {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -156,7 +145,7 @@ fn render_overview_sections(frame: &mut Frame, state: &AppState, area: Rect) {
     // ── Daemon ───────────────────────────────────────────────────────────────
     lines.push(Line::from(Span::styled("  Daemon", styles::heading())));
     let srv = &state.server;
-    if srv.loading && srv.status.is_none() && !srv.stopped {
+    if crate::tui::screens::server::is_first_load(srv.loading, srv.status.is_none(), srv.stopped) {
         lines.push(Line::from(vec![
             Span::styled("    Status:  ", styles::muted()),
             Span::styled("Querying…", styles::status_warn()),
