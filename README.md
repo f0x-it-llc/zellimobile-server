@@ -54,6 +54,16 @@ same network. See [`docker/README.md`](docker/README.md).
 docker compose -f docker/compose.yaml up --build
 ```
 
+**Tailnet / LAN exposure:** set `BIND_ADDR` to the host IP you want to publish
+on — the cert's SAN is automatically set to that IP so clients connecting on it
+get a valid TLS cert. Override `ZELLIMSERVER_SAN` explicitly to cover a
+different or additional address (comma-separated).
+
+```bash
+# Publish + cert-valid on a tailnet IP:
+BIND_ADDR=100.x.y.z docker compose -f docker/compose.yaml up --build
+```
+
 ## gRPC contract
 
 The wire contract is `zellimserver/proto/zellimserver.proto` (package

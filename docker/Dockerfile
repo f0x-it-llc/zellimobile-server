@@ -131,6 +131,11 @@ RUN chmod +x /usr/local/bin/zellimserver /usr/local/bin/zellimctl
 # Bind on all interfaces by default so the gRPC server is reachable through the
 # published port. The Docker port mapping (compose) still gates host exposure;
 # override per-run via zellimctl's Configure screen or ZELLIMSERVER_BIND.
+#
+# ZELLIMSERVER_SAN — comma-separated extra SANs to include in the self-signed
+# TLS cert (e.g. a tailnet or LAN IP that is not a local interface inside the
+# container). Set at runtime via compose.yaml or `docker run -e`; do NOT
+# hard-code a SAN in the image, since the IP depends on the deployment site.
 ENV ZELLIMSERVER_BIND=0.0.0.0:50051
 
 # ── SSH access (dev rig) ─────────────────────────────────────────────────────
