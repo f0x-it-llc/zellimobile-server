@@ -1,9 +1,24 @@
-//! Dashboard placeholder.
+//! Dashboard screen rendering.
 //!
-//! A bordered full-screen layout: a title bar, a left tab list of the six
-//! screens (active = teal), a body panel showing "<Screen> — coming soon", and
-//! a footer hint. Later waves replace the body per-screen; the chrome
-//! (title / tabs / footer) stays.
+//! Owns the shared chrome (title bar, left tab list, footer) used by every
+//! screen, and provides the Dashboard overview body shown when
+//! [`crate::app::state::Screen::Dashboard`] is active.
+//!
+//! ## Layout
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────────────┐
+//! │ title bar (1 line)                                                      │
+//! ├──────────────┬──────────────────────────────────────────────────────────┤
+//! │ Screens tab  │ body (per-screen panel)                                  │
+//! │ list (18 ch) │                                                          │
+//! ├──────────────┴──────────────────────────────────────────────────────────┤
+//! │ footer hint (1 line)                                                    │
+//! └─────────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! When the Pair screen is active the tab column is suppressed (full-width for
+//! the QR code), replaced by a one-line breadcrumb.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -15,7 +30,7 @@ use crate::app::AppState;
 use crate::app::state::Screen;
 use crate::tui::theme::{palette, styles};
 
-/// Render the dashboard chrome and the placeholder body for the active screen.
+/// Render the dashboard chrome and the active-screen body.
 pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
     // Paint the base background across the whole area first.
     frame.render_widget(
@@ -108,25 +123,173 @@ fn render_tabs(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Body panel for the active screen — placeholder for screens without a dedicated renderer.
-pub fn render_placeholder(frame: &mut Frame, state: &AppState, area: Rect) {
-    let title = format!(" {} ", state.screen.label());
-    let block = styles::panel(true).title(Span::styled(title, styles::heading()));
+/// Dashboard overview body — shows at-a-glance status for all sub-systems.
+///
+/// Sections:
+/// - **Daemon** — running (bind / PID / uptime / clients) or stopped.
+/// - **Cert** — short fingerprint excerpt + SAN count.
+/// - **Tokens** — count of stored tokens.
+/// - **Network** — configured bind addr + reachable IPs.
+/// - **Hints** — one-line hints pointing to each action screen.
+pub fn render_overview(frame: &mut Frame, state: &AppState, area: Rect) {
+    let block = styles::panel(true).title(Span::styled(" Dashboard ", styles::heading()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let body = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("{} — coming soon", state.screen.label()),
-            styles::body(),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "This screen will be implemented in a later wave.",
-            styles::muted(),
-        )),
-    ];
+    // Split inner area vertically: sections stacked top-to-bottom, hints at bottom.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),    // all overview sections
+            Constraint::Length(2), // hints line
+        ])
+        .split(inner);
 
-    frame.render_widget(Paragraph::new(body).block(block), area);
+    render_overview_sections(frame, state, rows[0]);
+    render_overview_hints(frame, rows[1]);
+}
+
+/// Render the four overview sections (Daemon / Cert / Tokens / Network).
+fn render_overview_sections(frame: &mut Frame, state: &AppState, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // ── Daemon ───────────────────────────────────────────────────────────────
+    lines.push(Line::from(Span::styled("  Daemon", styles::heading())));
+    let srv = &state.server;
+    if srv.loading && srv.status.is_none() && !srv.stopped {
+        lines.push(Line::from(vec![
+            Span::styled("    Status:  ", styles::muted()),
+            Span::styled("Querying…", styles::status_warn()),
+        ]));
+    } else if let Some(ref info) = srv.status {
+        lines.push(Line::from(vec![
+            Span::styled("    Status:  ", styles::muted()),
+            Span::styled("● Running", styles::status_ok()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    Bind:    ", styles::muted()),
+            Span::styled(info.bind_addr.clone(), styles::accent()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    PID:     ", styles::muted()),
+            Span::styled(info.pid.to_string(), styles::body()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    Uptime:  ", styles::muted()),
+            Span::styled(format_uptime(info.uptime_secs), styles::body()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    Clients: ", styles::muted()),
+            Span::styled(
+                info.client_count.to_string(),
+                if info.client_count > 0 {
+                    styles::status_ok()
+                } else {
+                    styles::muted()
+                },
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("    Status:  ", styles::muted()),
+            Span::styled("○ Stopped", styles::status_err()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    // ── Cert ─────────────────────────────────────────────────────────────────
+    lines.push(Line::from(Span::styled("  Cert", styles::heading())));
+    let cert = &state.cert;
+    if cert.fingerprint.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("    Fingerprint: ", styles::muted()),
+            Span::styled("(none — visit Cert screen)", styles::muted()),
+        ]));
+    } else {
+        // Display first 16 hex chars + "…" as a short fingerprint.
+        let short_fp = if cert.fingerprint.len() > 16 {
+            format!("{}…", &cert.fingerprint[..16])
+        } else {
+            cert.fingerprint.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("    Fingerprint: ", styles::muted()),
+            Span::styled(short_fp, styles::accent()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    SANs:        ", styles::muted()),
+            Span::styled(cert.sans.len().to_string(), styles::body()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    // ── Tokens ───────────────────────────────────────────────────────────────
+    lines.push(Line::from(Span::styled("  Tokens", styles::heading())));
+    lines.push(Line::from(vec![
+        Span::styled("    Count: ", styles::muted()),
+        Span::styled(state.tokens.tokens.len().to_string(), styles::body()),
+    ]));
+
+    lines.push(Line::from(""));
+
+    // ── Network ──────────────────────────────────────────────────────────────
+    lines.push(Line::from(Span::styled("  Network", styles::heading())));
+    let cfg = &state.config;
+    if cfg.host.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("    Bind: ", styles::muted()),
+            Span::styled("(not yet loaded)", styles::muted()),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("    Bind: ", styles::muted()),
+            Span::styled(cfg.bind_addr(), styles::accent()),
+        ]));
+        if cfg.reachable_ips.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("    IPs:  ", styles::muted()),
+                Span::styled("(none discovered)", styles::muted()),
+            ]));
+        } else {
+            let ip_list = cfg
+                .reachable_ips
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(Line::from(vec![
+                Span::styled("    IPs:  ", styles::muted()),
+                Span::styled(ip_list, styles::body()),
+            ]));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(palette::BG_SURFACE)),
+        area,
+    );
+}
+
+/// Render the hints line pointing to each action screen.
+fn render_overview_hints(frame: &mut Frame, area: Rect) {
+    let hints = Line::from(vec![
+        Span::styled("Config", styles::accent()),
+        Span::styled(" addr  ", styles::muted()),
+        Span::styled("Cert", styles::accent()),
+        Span::styled(" gen  ", styles::muted()),
+        Span::styled("Tokens", styles::accent()),
+        Span::styled(" manage  ", styles::muted()),
+        Span::styled("Server", styles::accent()),
+        Span::styled(" start/stop  ", styles::muted()),
+        Span::styled("Pair", styles::accent()),
+        Span::styled(" QR", styles::muted()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(hints).style(Style::default().bg(palette::BG_SURFACE)),
+        area,
+    );
 }
 
 /// Bottom footer with navigation hints.
@@ -145,4 +308,43 @@ fn render_footer(frame: &mut Frame, area: Rect) {
         Paragraph::new(hint).style(Style::default().bg(palette::BG_BASE)),
         area,
     );
+}
+
+/// Format an uptime duration in seconds as a human-readable string.
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m {}s", secs % 60);
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h {}m", mins % 60);
+    }
+    let days = hours / 24;
+    format!("{days}d {}h", hours % 24)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_uptime_seconds() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(59), "59s");
+    }
+
+    #[test]
+    fn format_uptime_minutes() {
+        assert_eq!(format_uptime(60), "1m 0s");
+        assert_eq!(format_uptime(3600), "1h 0m");
+    }
+
+    #[test]
+    fn format_uptime_days() {
+        assert_eq!(format_uptime(86400), "1d 0h");
+    }
 }

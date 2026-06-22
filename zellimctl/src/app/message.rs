@@ -100,4 +100,16 @@ pub enum Message {
         /// Sequence number (must match current pairing seq to be accepted).
         seq: u64,
     },
+
+    // ── Dashboard screen messages ─────────────────────────────────────────────
+    /// Read-only cert info for the Dashboard overview.
+    ///
+    /// Posted by a [`super::action::UpdateAction::LoadCertInfo`] task via the
+    /// read-only facade — never regenerates the cert.
+    CertInfoLoaded {
+        /// SHA-256 fingerprint of the on-disk cert, or `None` if no cert exists.
+        fingerprint: Option<String>,
+        /// SANs read from the persisted SAN sidecar (`server.san.json`).
+        sans: Vec<String>,
+    },
 }

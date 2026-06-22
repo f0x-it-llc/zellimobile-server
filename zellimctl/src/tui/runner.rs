@@ -163,6 +163,15 @@ fn apply_actions(state: &mut AppState, actions: Vec<UpdateAction>, tx: mpsc::Sen
                 });
             }
 
+            // ── Dashboard ─────────────────────────────────────────────────────
+            UpdateAction::LoadCertInfo => {
+                let tx = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let msg = load_cert_info_task();
+                    let _ = tx.blocking_send(msg);
+                });
+            }
+
             // ── Pairing ───────────────────────────────────────────────────────
             UpdateAction::StartPairing { read_only, seq } => {
                 let tx = tx.clone();
@@ -199,6 +208,19 @@ fn load_config_snapshot() -> Message {
         cert_dir: cfg.cert_dir.display().to_string(),
         reachable_ips,
     })
+}
+
+/// Read the persisted cert fingerprint + SAN sidecar **without** generating anything.
+///
+/// Calls only the read-only facade functions `current_cert_fingerprint()` and
+/// `persisted_extra_sans()`.  Never calls `ensure_cert` / `load_or_generate_identity`.
+fn load_cert_info_task() -> Message {
+    let fingerprint = match crate::server::current_cert_fingerprint() {
+        Ok(fp) => fp,
+        Err(e) => return Message::ActionFailed(format!("cert info: {e}")),
+    };
+    let sans = crate::server::persisted_extra_sans();
+    Message::CertInfoLoaded { fingerprint, sans }
 }
 
 /// Ensure (or regenerate) the TLS cert and return the appropriate `Message`.

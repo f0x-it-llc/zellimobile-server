@@ -61,6 +61,16 @@ pub fn update(state: &mut AppState, message: Message) -> Vec<UpdateAction> {
             state.cert.status = "Certificate ready.".to_string();
             Vec::new()
         }
+        // ── Dashboard cert-info (read-only passive load) ──────────────────────
+        Message::CertInfoLoaded { fingerprint, sans } => {
+            // Passive: populate cert fields without touching the status line.
+            // (The status line is only set by `CertEnsured`, which signals active
+            // regeneration. This path is a silent background read for the Dashboard.)
+            state.cert.fingerprint = fingerprint.unwrap_or_default();
+            state.cert.sans = sans;
+            state.cert.loading = false;
+            Vec::new()
+        }
         Message::ActionFailed(msg) => {
             // Surface the error on the active screen's status line.
             match state.screen {
@@ -243,7 +253,22 @@ fn on_enter_screen(state: &mut AppState, screen: Screen) -> Vec<UpdateAction> {
             state.pairing.pending_token_name = None;
             Vec::new()
         }
-        _ => Vec::new(),
+        Screen::Dashboard => {
+            // Load a fresh at-a-glance snapshot of all sub-systems.
+            // Flags are set so individual sub-states show their loading indicators
+            // until results arrive.  Re-entering the Dashboard re-fetches
+            // everything (idempotent by design).
+            state.server.loading = true;
+            state.config.loading = true;
+            state.tokens.loading = true;
+            state.cert.loading = true;
+            vec![
+                UpdateAction::RefreshStatus,
+                UpdateAction::LoadConfig,
+                UpdateAction::LoadTokens,
+                UpdateAction::LoadCertInfo,
+            ]
+        }
     }
 }
 
@@ -1471,5 +1496,120 @@ mod tests {
                 .any(|a| matches!(a, UpdateAction::LoadConfig)),
             "entering Cert must dispatch LoadConfig to populate reachable_ips"
         );
+    }
+
+    // ── Dashboard screen tests ────────────────────────────────────────────────
+
+    #[test]
+    fn enter_dashboard_dispatches_all_four_read_actions() {
+        // Entering the Dashboard must dispatch RefreshStatus + LoadConfig +
+        // LoadTokens + LoadCertInfo so all sub-states populate.
+        let mut state = AppState::new();
+        // Start on a different screen so we can navigate *to* Dashboard.
+        state.screen = Screen::Server;
+        let actions = update(&mut state, Message::NavTo(Screen::Dashboard));
+        assert_eq!(state.screen, Screen::Dashboard);
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::RefreshStatus)),
+            "Dashboard on_enter must dispatch RefreshStatus; got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::LoadConfig)),
+            "Dashboard on_enter must dispatch LoadConfig; got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::LoadTokens)),
+            "Dashboard on_enter must dispatch LoadTokens; got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::LoadCertInfo)),
+            "Dashboard on_enter must dispatch LoadCertInfo; got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn enter_dashboard_sets_loading_flags() {
+        // All relevant loading flags must be raised so the overview can show
+        // per-section loading indicators until results arrive.
+        let mut state = AppState::new();
+        state.screen = Screen::Config;
+        update(&mut state, Message::NavTo(Screen::Dashboard));
+        assert!(state.server.loading, "server.loading should be set");
+        assert!(state.config.loading, "config.loading should be set");
+        assert!(state.tokens.loading, "tokens.loading should be set");
+        assert!(state.cert.loading, "cert.loading should be set");
+    }
+
+    #[test]
+    fn cert_info_loaded_sets_fingerprint_and_sans_without_touching_status() {
+        // CertInfoLoaded is a passive read: it populates fingerprint/sans but
+        // must NOT overwrite the status line (that is reserved for CertEnsured,
+        // the active regeneration path).
+        let mut state = AppState::new();
+        // Pre-populate a status line to prove it is not cleared.
+        state.cert.status = "Certificate ready.".to_string();
+
+        update(
+            &mut state,
+            Message::CertInfoLoaded {
+                fingerprint: Some("aabbccddeeff0011".to_string()),
+                sans: vec!["192.168.1.1".to_string(), "server.local".to_string()],
+            },
+        );
+
+        assert_eq!(state.cert.fingerprint, "aabbccddeeff0011");
+        assert_eq!(
+            state.cert.sans,
+            vec!["192.168.1.1".to_string(), "server.local".to_string()]
+        );
+        // Status must be unchanged — passive load does not set "Certificate ready.".
+        assert_eq!(
+            state.cert.status, "Certificate ready.",
+            "CertInfoLoaded must not overwrite cert.status"
+        );
+        assert!(!state.cert.loading, "cert.loading should be cleared");
+    }
+
+    #[test]
+    fn cert_info_loaded_none_fingerprint_stores_empty_string() {
+        // When no cert exists on disk, fingerprint is None → stored as "".
+        let mut state = AppState::new();
+        update(
+            &mut state,
+            Message::CertInfoLoaded {
+                fingerprint: None,
+                sans: vec![],
+            },
+        );
+        assert!(
+            state.cert.fingerprint.is_empty(),
+            "None fingerprint must map to empty string"
+        );
+        assert!(state.cert.sans.is_empty());
+    }
+
+    /// Structural assertion: `LoadCertInfo` action must never be confused with
+    /// `EnsureCert`.  The action enum variants are distinct types — this test
+    /// documents and protects that invariant by exhaustive matching.
+    #[test]
+    fn load_cert_info_action_is_distinct_from_ensure_cert() {
+        let load_info = UpdateAction::LoadCertInfo;
+        let ensure = UpdateAction::EnsureCert(vec![]);
+
+        // These pattern-matches would be compile errors if the variants didn't exist.
+        assert!(matches!(load_info, UpdateAction::LoadCertInfo));
+        assert!(matches!(ensure, UpdateAction::EnsureCert(_)));
+        // Cross-checks: each matches only its own variant.
+        assert!(!matches!(load_info, UpdateAction::EnsureCert(_)));
+        assert!(!matches!(ensure, UpdateAction::LoadCertInfo));
     }
 }
