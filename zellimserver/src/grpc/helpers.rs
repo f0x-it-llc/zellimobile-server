@@ -16,11 +16,13 @@ use crate::proto::{ActionAck as ProtoAck, PaneTarget, TabTarget};
 ///    `session` (session-scoped fallback; preserves solo-client and legacy-client
 ///    behavior where the client doesn't send a connection_id).
 ///
-/// All commands routed through this function are mutating (`SwitchTab`,
-/// `FocusPane`, `ToggleFullscreen`). The session-scoped fallback explicitly
-/// skips read-only relay entries: sending to a read-only relay would succeed at
-/// the channel level but the inbound task would silently drop the command at its
-/// own guard → false `ok:true` response and client UI desync (Issue B).
+/// All commands routed through this function are mutating *at the relay level*
+/// (`SwitchTab`, `FocusPane`, `ToggleFullscreen`). `FocusPane` is accepted for
+/// read-only token holders at the RPC gate, but the inbound task still drops it
+/// for a read-only *relay*. The session-scoped fallback therefore skips read-only
+/// relay entries: sending to one would succeed at the channel level but the
+/// inbound task would silently drop the command at its own guard → false
+/// `ok:true` response and client UI desync (Issue B).
 ///
 /// Returns `Some(ok-ack)` if a relay was found and the command was queued;
 /// `None` → caller falls back to the ephemeral CLI path.
@@ -420,7 +422,9 @@ mod tests {
         let (tx_ro, mut rx_ro) = mpsc::unbounded_channel::<RelayControl>();
         let (tx_rw, mut rx_rw) = mpsc::unbounded_channel::<RelayControl>();
 
-        // Insert read-only first so the deterministic scan encounters it first.
+        // Insert the read-only entry first; DashMap shard iteration order is
+        // non-deterministic, but the `!entry.read_only` filter selects the
+        // writable entry regardless of visit order.
         reg.insert(
             "conn-ro".to_owned(),
             ControlEntry {
