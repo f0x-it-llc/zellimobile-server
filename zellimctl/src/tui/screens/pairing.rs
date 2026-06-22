@@ -25,6 +25,9 @@ use crate::app::state::PairingPhase;
 use crate::tui::theme::{palette, styles};
 use crate::tui::widgets::qr::QrWidget;
 
+/// Minimum width of the info panel (right-hand side in side-by-side layout).
+const INFO_MIN_WIDTH: u16 = 28;
+
 /// Render the Pair screen.
 pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
     let block = styles::panel(true).title(Span::styled(" Pair ", styles::heading()));
@@ -108,6 +111,14 @@ fn render_generating(frame: &mut Frame, area: Rect) {
 }
 
 /// Showing phase: render the QR code and connection metadata.
+///
+/// Layout strategy:
+/// - **Side-by-side** (preferred): QR on the left (sized to its block width),
+///   info panel on the right.  This keeps the info rows from consuming height
+///   budget, so a standard 80×24 terminal fits.
+/// - **Vertical fallback**: when the available width is too narrow for a
+///   side-by-side split (QR block width + `INFO_MIN_WIDTH`), the info is
+///   rendered below the QR as before.
 fn render_showing(
     frame: &mut Frame,
     uri: &str,
@@ -116,21 +127,48 @@ fn render_showing(
     fingerprint_short: &str,
     area: Rect,
 ) {
-    // Split: QR block (most of the height) + info text below.
-    // Reserve 4 rows for info (host:port, fingerprint, scanning prompt).
-    let info_rows = 5u16;
-    let qr_rows = area.height.saturating_sub(info_rows).max(13);
+    let qr = QrWidget::new(uri);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(qr_rows), Constraint::Min(0)])
-        .split(area);
+    // Determine the QR block width so we can decide on layout.
+    let qr_block_w = qr.block_width().unwrap_or(41);
 
-    // Render the QR widget.
-    QrWidget::new(uri).render(frame, chunks[0]);
+    let side_by_side = area.width >= qr_block_w.saturating_add(INFO_MIN_WIDTH);
 
-    // Render the info strip below the QR.
+    if side_by_side {
+        // Horizontal split: QR left (fixed cols), info right (remainder).
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(qr_block_w), Constraint::Min(0)])
+            .split(area);
+
+        // Give the QR widget the full available height.
+        qr.render(frame, cols[0]);
+        render_info_panel(frame, host, port, fingerprint_short, cols[1]);
+    } else {
+        // Vertical fallback: QR above, info below.
+        let info_rows = 5u16;
+        let qr_rows = area.height.saturating_sub(info_rows).max(13);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(qr_rows), Constraint::Min(0)])
+            .split(area);
+
+        qr.render(frame, chunks[0]);
+        render_info_panel(frame, host, port, fingerprint_short, chunks[1]);
+    }
+}
+
+/// Info panel: host:port, certificate fingerprint, scan prompt.
+fn render_info_panel(
+    frame: &mut Frame,
+    host: &str,
+    port: u16,
+    fingerprint_short: &str,
+    area: Rect,
+) {
     let info_lines = vec![
+        Line::from(""),
         Line::from(vec![
             Span::styled("  Server: ", styles::muted()),
             Span::styled(format!("{host}:{port}"), styles::accent()),
@@ -141,13 +179,19 @@ fn render_showing(
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Scan with the Zelli app to connect…",
+            "  Scan with the Zelli app",
+            styles::muted(),
+        )),
+        Line::from(Span::styled(
+            "  to connect…",
             styles::muted(),
         )),
     ];
     frame.render_widget(
-        Paragraph::new(info_lines).style(Style::default().bg(palette::BG_SURFACE)),
-        chunks[1],
+        Paragraph::new(info_lines)
+            .alignment(Alignment::Left)
+            .style(Style::default().bg(palette::BG_SURFACE)),
+        area,
     );
 }
 

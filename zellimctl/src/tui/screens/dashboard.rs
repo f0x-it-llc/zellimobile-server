@@ -51,15 +51,41 @@ fn render_title(frame: &mut Frame, area: Rect) {
 }
 
 /// Body: a left tab column + the active-screen body panel.
+///
+/// When the Pair screen is active the tab column is suppressed so the QR +
+/// info layout has the full terminal width.  A one-line breadcrumb is shown
+/// at the top of the body area instead.
 fn render_body(frame: &mut Frame, state: &AppState, area: Rect) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(18), Constraint::Min(20)])
-        .split(area);
+    if state.screen == Screen::Pair {
+        // Full-width body for the Pair screen: show a minimal breadcrumb then
+        // delegate to the pairing renderer for the rest.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
 
-    render_tabs(frame, state, cols[0]);
-    // Delegate to the screens module which dispatches per-screen renders.
-    crate::tui::screens::render_screen_body(frame, state, cols[1]);
+        let breadcrumb = ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled("Screens", crate::tui::theme::styles::muted()),
+            ratatui::text::Span::styled(" › ", crate::tui::theme::styles::muted()),
+            ratatui::text::Span::styled("Pair", crate::tui::theme::styles::accent_bold()),
+        ]);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(breadcrumb)
+                .style(Style::default().bg(palette::BG_BASE)),
+            rows[0],
+        );
+
+        crate::tui::screens::render_screen_body(frame, state, rows[1]);
+    } else {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(18), Constraint::Min(20)])
+            .split(area);
+
+        render_tabs(frame, state, cols[0]);
+        // Delegate to the screens module which dispatches per-screen renders.
+        crate::tui::screens::render_screen_body(frame, state, cols[1]);
+    }
 }
 
 /// Left tab list. The active screen is teal+bold; others are muted.
