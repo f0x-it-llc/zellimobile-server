@@ -129,13 +129,13 @@ pub fn persisted_extra_sans() -> Vec<String> {
 /// without spawning a real process.
 ///
 /// Arguments:
-/// - `bind_addr`     — current effective bind address (forwarded as `--bind`
-///                     only when non-default).
-/// - `extra_sans`    — raw SAN strings read from the cert sidecar; each becomes
-///                     a `--san <value>` pair so the daemon never regenerates
-///                     the cert away from the one `zellimctl` pinned.
-/// - `default_bind`  — the default bind address constant from `zellimserver`
-///                     (passed in so this function is pure / not cfg-dependent).
+/// - `bind_addr` — current effective bind address (forwarded as `--bind` only
+///   when non-default).
+/// - `extra_sans` — raw SAN strings read from the cert sidecar; each becomes a
+///   `--san <value>` pair so the daemon never regenerates the cert away from the
+///   one `zellimctl` pinned.
+/// - `default_bind` — the default bind address constant from `zellimserver`
+///   (passed in so this function is pure / not cfg-dependent).
 ///
 /// Always starts with `["start", "--daemonize"]`.
 #[allow(dead_code)]
