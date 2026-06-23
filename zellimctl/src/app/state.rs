@@ -78,18 +78,16 @@ pub enum Screen {
     Cert,
     Tokens,
     Server,
-    Pair,
 }
 
 impl Screen {
     /// All screens in navigation order. Drives the dashboard tab list.
-    pub const ALL: [Screen; 6] = [
+    pub const ALL: [Screen; 5] = [
         Screen::Dashboard,
         Screen::Config,
         Screen::Cert,
         Screen::Tokens,
         Screen::Server,
-        Screen::Pair,
     ];
 
     /// Human-readable label for tab lists and panel headings.
@@ -100,7 +98,6 @@ impl Screen {
             Screen::Cert => "Cert",
             Screen::Tokens => "Tokens",
             Screen::Server => "Server",
-            Screen::Pair => "Pair",
         }
     }
 
@@ -216,7 +213,7 @@ pub struct TokensState {
     /// Transient status / error line.
     pub status: String,
     /// The one-time minted secret (shown after creation until next action).
-    pub last_minted_secret: Option<(String, String)>, // (name, plaintext)
+    pub last_minted_secret: Option<(String, String, bool)>, // (name, plaintext, read_only)
     /// Current phase of the mini create-form.
     pub form_phase: TokensFormPhase,
     /// Text typed into the "name" field while creating.
@@ -232,26 +229,23 @@ impl TokensState {
     }
 }
 
-// ── Pairing screen state ──────────────────────────────────────────────────────
+// ── Token QR overlay state ────────────────────────────────────────────────────
 
-/// Phase of the pairing QR flow.
-#[derive(Debug, Clone, Default)]
-pub enum PairingPhase {
-    /// Not started yet (or was reset).
-    #[default]
-    Idle,
-    /// Generation is in progress (task is in flight).
+/// Phase of the app-level QR overlay shown for an already-created token.
+///
+/// Unlike the old pairing flow, this builds a QR for the **existing** plaintext
+/// token the user just minted (the only one whose plaintext we still hold). No
+/// throwaway token is minted, and the displayed token is never revoked on close.
+#[derive(Debug, Clone)]
+pub enum QrOverlayPhase {
+    /// The QR URI is being built (task is in flight).
     Generating,
     /// QR is ready; displaying the code and waiting for a client to connect.
     Showing {
         uri: String,
-        baseline_clients: usize,
         host: String,
         port: u16,
         fingerprint_short: String,
-        /// Name of the pairing token minted for this QR (so it can be revoked
-        /// on supersede / leave).
-        token_name: String,
     },
     /// A new client connected (client_count > baseline).
     Connected,
@@ -259,26 +253,26 @@ pub enum PairingPhase {
     Failed { err: String },
 }
 
-/// State for the Pairing screen.
-#[derive(Debug, Clone, Default)]
-pub struct PairingState {
-    /// Current phase of the pairing state machine.
-    pub phase: PairingPhase,
-    /// Process-monotonic sequence counter for seq-guarded state transitions.
-    ///
-    /// Incremented each time a new `StartPairing` action is dispatched.
-    /// Async results carry the seq they were started with; stale results
-    /// (seq < current) are discarded.
+/// The app-level QR overlay opened from the Tokens screen for a freshly minted
+/// token. While present, it intercepts all input and renders fullscreen over the
+/// active screen. Closing it (`Esc`/`q`) never revokes the underlying token —
+/// it is a real user token, not a throwaway pairing secret.
+#[derive(Debug, Clone)]
+pub struct QrOverlay {
+    /// Current phase of the overlay state machine.
+    pub phase: QrOverlayPhase,
+    /// Stale-result guard: async results carry the seq they were started with;
+    /// a result whose seq no longer matches the live overlay's seq is ignored.
     pub seq: u64,
-    /// Whether the freshly-minted pairing token should be read-only.
+    /// Attached-client count captured when the QR became ready; a rise above
+    /// this drives connection detection.
+    pub baseline_clients: usize,
+    /// Display-only name of the token (NEVER revoked on close).
+    pub token_name: String,
+    /// Whether the token grants read-only access (display only).
     pub read_only: bool,
-    /// Tick counter used for the ~1 s status poll cadence on this screen.
+    /// Tick counter used for the ~1 s status poll cadence while `Showing`.
     pub tick_counter: u32,
-    /// Name of the currently-pending pairing token (minted but not yet
-    /// superseded/revoked). Carried so a regenerate or screen-leave can revoke
-    /// the prior token before/while minting a new one. `None` when no token is
-    /// outstanding.
-    pub pending_token_name: Option<String>,
 }
 
 /// State for the Server panel screen.
@@ -313,8 +307,12 @@ pub struct AppState {
     pub server: ServerPanelState,
     /// Tokens screen state.
     pub tokens: TokensState,
-    /// Pairing screen state.
-    pub pairing: PairingState,
+    /// The app-level token QR overlay, when one is open (`None` otherwise).
+    pub qr_overlay: Option<QrOverlay>,
+    /// Process-monotonic sequence counter for the QR overlay. Bumped each time a
+    /// new overlay is opened; carried into the async build task so a result whose
+    /// overlay was since closed (or superseded) is discarded.
+    pub qr_seq: u64,
 }
 
 impl Default for AppState {
@@ -326,7 +324,8 @@ impl Default for AppState {
             cert: CertState::default(),
             server: ServerPanelState::default(),
             tokens: TokensState::default(),
-            pairing: PairingState::default(),
+            qr_overlay: None,
+            qr_seq: 0,
         }
     }
 }
@@ -370,13 +369,13 @@ mod tests {
 
     #[test]
     fn next_wraps_around() {
-        assert_eq!(Screen::Pair.next(), Screen::Dashboard);
+        assert_eq!(Screen::Server.next(), Screen::Dashboard);
         assert_eq!(Screen::Dashboard.next(), Screen::Config);
     }
 
     #[test]
     fn prev_wraps_around() {
-        assert_eq!(Screen::Dashboard.prev(), Screen::Pair);
+        assert_eq!(Screen::Dashboard.prev(), Screen::Server);
         assert_eq!(Screen::Config.prev(), Screen::Dashboard);
     }
 

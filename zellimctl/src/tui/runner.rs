@@ -152,7 +152,11 @@ fn apply_actions(state: &mut AppState, actions: Vec<UpdateAction>, tx: mpsc::Sen
                 let tx = tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let msg = match crate::server::tokens::create(name, read_only) {
-                        Ok((token, name)) => Message::TokenCreated { token, name },
+                        Ok((token, name)) => Message::TokenCreated {
+                            token,
+                            name,
+                            read_only,
+                        },
                         Err(e) => Message::ActionFailed(format!("create token failed: {e}")),
                     };
                     let _ = tx.blocking_send(msg);
@@ -178,21 +182,16 @@ fn apply_actions(state: &mut AppState, actions: Vec<UpdateAction>, tx: mpsc::Sen
                 });
             }
 
-            // ── Pairing ───────────────────────────────────────────────────────
-            UpdateAction::StartPairing { read_only, seq } => {
+            // ── Token QR overlay ──────────────────────────────────────────────
+            UpdateAction::ShowTokenQr {
+                token,
+                read_only,
+                seq,
+            } => {
                 let tx = tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let msg = start_pairing_task(read_only, seq);
+                    let msg = build_token_qr_task(token, read_only, seq);
                     let _ = tx.blocking_send(msg);
-                });
-            }
-            UpdateAction::RevokePairingToken(name) => {
-                // Best-effort tidy-up of a superseded / abandoned pairing token.
-                // No result is posted back — this is fire-and-forget.
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = crate::server::tokens::revoke(&name) {
-                        log::warn!("pairing: failed to revoke pending token {name:?}: {e}");
-                    }
                 });
             }
         }
@@ -249,11 +248,16 @@ fn ensure_cert_task(sans: &[crate::app::state::San]) -> Message {
     }
 }
 
-/// Build the pairing QR URI and return the appropriate `Message`.
+/// Build a pairing QR URI for an **existing** plaintext token and return the
+/// appropriate `Message`.
+///
+/// This is the old `start_pairing_task` minus the mint/revoke: the `token` is the
+/// real user token the caller already created (the one whose plaintext we still
+/// hold). It is NEVER minted or revoked here.
 ///
 /// Steps (all in `spawn_blocking`):
 /// 1. Guard: the server must be **running** (we pin the cert it serves) — else
-///    `PairingFailed("Start the server first")`.
+///    `TokenQrFailed("Start the server first")`.
 /// 2. Read host + port from `effective_config().bind_addr`.
 /// 3. Pick the advertise host: prefer the configured bind host when it is a
 ///    concrete (non-loopback, non-unspecified) address; otherwise fall back to
@@ -261,15 +265,14 @@ fn ensure_cert_task(sans: &[crate::app::state::San]) -> Message {
 /// 4. **Read the persisted cert fingerprint without regenerating** (the running
 ///    server serves the cert it loaded at startup — regenerating here would pin
 ///    a fingerprint it never presents). No cert yet → fail with guidance.
-/// 5. Mint a fresh token `pair-<seq>-<unix_millis>` (collision-free across quick
-///    regenerates).
-/// 6. Build `PairingParams{...}.to_uri()`; capture `client_count` as baseline.
-fn start_pairing_task(read_only: bool, seq: u64) -> Message {
+/// 5. Build `PairingParams{ token, .. }.to_uri()` from the passed plaintext token;
+///    capture `client_count` as baseline.
+fn build_token_qr_task(token: String, read_only: bool, seq: u64) -> Message {
     use crate::pairing::payload::PairingParams;
 
     // 1. Guard: the server must be running so the QR pins the cert it serves.
     if !crate::server::is_running() {
-        return Message::PairingFailed {
+        return Message::TokenQrFailed {
             err: "Start the server first.".to_string(),
             seq,
         };
@@ -279,7 +282,7 @@ fn start_pairing_task(read_only: bool, seq: u64) -> Message {
     let cfg = match crate::server::effective_config() {
         Ok(c) => c,
         Err(e) => {
-            return Message::PairingFailed {
+            return Message::TokenQrFailed {
                 err: format!("config: {e}"),
                 seq,
             };
@@ -308,49 +311,32 @@ fn start_pairing_task(read_only: bool, seq: u64) -> Message {
     let fingerprint = match crate::server::current_cert_fingerprint() {
         Ok(Some(fp)) => fp,
         Ok(None) => {
-            return Message::PairingFailed {
+            return Message::TokenQrFailed {
                 err: "No certificate yet — open the Cert screen and generate one first."
                     .to_string(),
                 seq,
             };
         }
         Err(e) => {
-            return Message::PairingFailed {
+            return Message::TokenQrFailed {
                 err: format!("cert fingerprint: {e}"),
                 seq,
             };
         }
     };
 
-    // 6. Mint a fresh pairing token with a collision-free name.
-    let unix_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let token_name = format!("pair-{seq}-{unix_millis}");
-    let (token_plaintext, token_name) =
-        match crate::server::tokens::create(Some(token_name), read_only) {
-            Ok(t) => t,
-            Err(e) => {
-                return Message::PairingFailed {
-                    err: format!("mint token: {e}"),
-                    seq,
-                };
-            }
-        };
-
-    // 7. Build the URI.
+    // 6. Build the URI from the PASSED plaintext token (no mint, no revoke).
     let uri = PairingParams {
         host: advertise_host.clone(),
         port,
         cert_fp_hex: fingerprint.clone(),
-        token: token_plaintext,
+        token,
         read_only,
         label: "zellimserver".to_string(),
     }
     .to_uri();
 
-    // 8. Capture current client count as baseline.
+    // 7. Capture current client count as baseline.
     let baseline_clients = crate::server::client_count().unwrap_or(0);
 
     // Build a short fingerprint for display (first 16 hex chars + "…").
@@ -360,13 +346,12 @@ fn start_pairing_task(read_only: bool, seq: u64) -> Message {
         fingerprint
     };
 
-    Message::PairingReady {
+    Message::TokenQrReady {
         uri,
-        baseline_clients,
         host: advertise_host,
         port,
         fingerprint_short,
-        token_name,
+        baseline_clients,
         seq,
     }
 }
