@@ -45,14 +45,17 @@ pub struct ZelliService {
     /// Per-session count of clients attached through this server (Phase F).
     /// Shared with every relay so `ListSessions` can report `connected_clients`.
     clients: crate::client_count::SessionClients,
-    /// Per-session registry of live relay control channels (W2.0a/b spike):
-    /// lets `GoToTab`/`FocusPane` route through the *rendering* AttachClient
-    /// (`is_cli_client:false`) instead of an ephemeral CLI client.
+    /// Per-connection registry, keyed by connection_id (process-unique, minted
+    /// per AttachTerminal relay): lets `GoToTab`/`FocusPane` route through the
+    /// *rendering* AttachClient (`is_cli_client:false`) instead of an ephemeral
+    /// CLI client. Each concurrent relay on the same session holds its own slot.
     control: crate::relay::ControlRegistry,
-    /// Per-session relay view state (B-FOCUS, BE-LAYOUT): the relay client's
-    /// own active_tab + focused_pane, tracked across SwitchTab/FocusPane/
-    /// ToggleFullscreen. Used by `get_layout` to override the queried
-    /// is_focused/active fields with single-client-correct values.
+    /// Per-connection registry, keyed by connection_id (process-unique, minted
+    /// per AttachTerminal relay): the relay client's own active_tab +
+    /// focused_pane, tracked across SwitchTab/FocusPane/ToggleFullscreen. Used
+    /// by `get_layout` to override the queried is_focused/active fields with
+    /// single-client-correct values — only when the relay that served the query
+    /// is the caller's own relay (exact connection_id match).
     view_state: crate::relay::ViewStateRegistry,
 }
 

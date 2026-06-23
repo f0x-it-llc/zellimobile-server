@@ -40,6 +40,10 @@ pub(crate) async fn inbound_loop(
     mut sender: AttachSender,
     guard: ShutdownGuard,
     session: String,
+    // Process-unique id minted at attach time; used as the registry key for
+    // both `control` and `view_state` so concurrent relays on the same session
+    // each own a distinct slot (fixes the multi-client misroute bug).
+    connection_id: String,
     read_only: bool,
     token: Option<String>,
     // Decrements the session's attached-client count when this task ends
@@ -50,18 +54,13 @@ pub(crate) async fn inbound_loop(
     // deregistration.
     mut control_rx: mpsc::UnboundedReceiver<RelayControl>,
     control: ControlRegistry,
-    // A clone of THIS attach's registered control sender, used only as an
-    // ownership token at teardown: we remove the `control` / `view_state` entries
-    // only if the registered sender is still ours (a newer attach for the same
-    // session may have replaced both — last-attach-wins). Never sent on.
-    my_ctrl_tx: mpsc::UnboundedSender<RelayControl>,
     // Held for potential future sole-client gating; not required by the current
     // toggle logic (floating visibility queried live from zellij; tiled uses parity toggle).
     _clients: crate::client_count::SessionClients,
     // FX-QUERY: channel to the render thread carrying in-flight layout queries.
     // The QueryLayout arm hands the query off and returns — it never awaits.
     query_tx: QueryTx,
-    // B-FOCUS: per-session relay view state registry.
+    // B-FOCUS: per-connection relay view state registry.
     view_state: ViewStateRegistry,
 ) {
     // The guard lives for the body of this task; on any exit path its Drop
@@ -116,9 +115,11 @@ pub(crate) async fn inbound_loop(
                             // Update relay view state: active tab is now tab_id.
                             // focused_pane becomes None (we don't know which pane
                             // is focused in the new tab until a FocusPane follows).
-                            if let Some(mut vs) = view_state.get_mut(&session) {
-                                vs.active_tab = Some(tab_id);
-                                vs.focused_pane = None;
+                            // Key by connection_id (unique per relay) so concurrent
+                            // relays on the same session each update their own slot.
+                            if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                                entry.state.active_tab = Some(tab_id);
+                                entry.state.focused_pane = None;
                             }
                         }
                     }
@@ -134,8 +135,9 @@ pub(crate) async fn inbound_loop(
                         log::warn!("relay inbound [{session}]: FocusPane send failed: {e:#}");
                     } else {
                         // B-FOCUS: track focused pane for this relay client.
-                        if let Some(mut vs) = view_state.get_mut(&session) {
-                            vs.focused_pane = Some(pane);
+                        // Key by connection_id so concurrent relays each update their own slot.
+                        if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                            entry.state.focused_pane = Some(pane);
                         }
                     }
                 }
@@ -212,8 +214,9 @@ pub(crate) async fn inbound_loop(
                                 // get_layout falls back to the queried is_focused
                                 // rather than asserting this now-hidden floating
                                 // pane is still focused.
-                                if let Some(mut vs) = view_state.get_mut(&session) {
-                                    vs.focused_pane = None;
+                                // Key by connection_id so concurrent relays each update their own slot.
+                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                                    entry.state.focused_pane = None;
                                 }
                             } else {
                                 fill_floating_pane(&mut sender, pane, &session);
@@ -221,8 +224,9 @@ pub(crate) async fn inbound_loop(
                                 // sends FocusPaneByPaneId), so this relay client's
                                 // focused pane is now `pane` — track it, same as
                                 // the tiled branch does (folded minor).
-                                if let Some(mut vs) = view_state.get_mut(&session) {
-                                    vs.focused_pane = Some(pane);
+                                // Key by connection_id so concurrent relays each update their own slot.
+                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                                    entry.state.focused_pane = Some(pane);
                                 }
                             }
                         } else {
@@ -238,8 +242,9 @@ pub(crate) async fn inbound_loop(
                                 );
                             } else {
                                 // B-FOCUS: track the pane we just focused.
-                                if let Some(mut vs) = view_state.get_mut(&session) {
-                                    vs.focused_pane = Some(pane);
+                                // Key by connection_id so concurrent relays each update their own slot.
+                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                                    entry.state.focused_pane = Some(pane);
                                 }
                                 toggle_active_fullscreen(&mut sender, &session, "toggle");
                             }
@@ -397,21 +402,28 @@ pub(crate) async fn inbound_loop(
         }
     }
     // Deregister this relay's control channel + view state so stale unary RPCs /
-    // GetLayouts stop routing here. ONLY remove if the registered entry is still
-    // ours: a newer attach for the same session may have replaced both (last
-    // attach wins), and this older task must not clobber the newer one's entries.
+    // GetLayouts stop routing here.
     //
-    // Ownership is keyed on the control sender's channel identity
-    // (`same_channel`). If we still own `control`, we also still own the
-    // `view_state` entry (both are inserted together per attach, control last),
-    // so we remove both; otherwise we leave both for the newer attach.
-    let still_ours = control.remove_if(&session, |_, tx| tx.same_channel(&my_ctrl_tx));
-    if still_ours.is_some() {
-        view_state.remove(&session);
+    // Because entries are keyed by connection_id (process-unique per relay),
+    // removing by connection_id is always safe: we can ONLY ever remove our OWN
+    // entry — a newer attach for the same session has a DIFFERENT connection_id
+    // and therefore a different key. The old `same_channel` guard (which was
+    // needed when keys were session-keyed and last-attach-wins could overwrite) is
+    // no longer necessary for correctness, but we keep a remove_if for the view
+    // state as an extra safety belt: if for any reason the entry was already
+    // removed (e.g. by an explicit deregistration path in the future), the remove
+    // is a harmless no-op.
+    let ctrl_removed = control.remove(&connection_id);
+    let vs_removed = view_state.remove(&connection_id);
+    if ctrl_removed.is_some() || vs_removed.is_some() {
+        log::debug!(
+            "relay inbound [{session}] connection_id={connection_id}: teardown — \
+             removed registry entries"
+        );
     } else {
         log::debug!(
-            "relay inbound [{session}]: teardown — control entry replaced by a newer \
-             attach; leaving control + view_state intact"
+            "relay inbound [{session}] connection_id={connection_id}: teardown — \
+             registry entries already absent (no-op)"
         );
     }
     // _guard drops here → reader thread shutdown.

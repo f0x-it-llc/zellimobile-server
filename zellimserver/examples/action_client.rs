@@ -106,6 +106,7 @@ async fn layout_panes(
     let layout = client
         .get_layout(SessionRef {
             session: session.to_owned(),
+            ..Default::default()
         })
         .await
         .context("GetLayout RPC failed")?
@@ -154,6 +155,7 @@ async fn main() -> Result<()> {
                 session: session.clone(),
                 pane_id: term.1,
                 is_plugin: false,
+                ..Default::default()
             }),
             data: cmd.into_bytes(),
         })
@@ -216,6 +218,7 @@ async fn main() -> Result<()> {
         session: session.clone(),
         pane_id: op_id,
         is_plugin: op_plugin,
+        ..Default::default()
     };
 
     let r = rw
@@ -293,6 +296,7 @@ async fn main() -> Result<()> {
         match ro
             .get_layout(SessionRef {
                 session: session.clone(),
+                ..Default::default()
             })
             .await
         {
@@ -309,6 +313,7 @@ async fn main() -> Result<()> {
                 session: session.clone(),
                 pane_id: term.1,
                 is_plugin: false,
+                ..Default::default()
             })
             .await
         {
@@ -326,6 +331,7 @@ async fn main() -> Result<()> {
                     session: session.clone(),
                     pane_id: term.1,
                     is_plugin: false,
+                    ..Default::default()
                 }),
                 data: b"echo should_not_happen\n".to_vec(),
             })

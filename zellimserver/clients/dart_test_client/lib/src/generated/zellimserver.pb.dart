@@ -953,9 +953,11 @@ class ControlEvent extends $pb.GeneratedMessage {
 class SessionRef extends $pb.GeneratedMessage {
   factory SessionRef({
     $core.String? session,
+    $core.String? connectionId,
   }) {
     final result = create();
     if (session != null) result.session = session;
+    if (connectionId != null) result.connectionId = connectionId;
     return result;
   }
 
@@ -974,6 +976,7 @@ class SessionRef extends $pb.GeneratedMessage {
           const $pb.PackageName(_omitMessageNames ? '' : 'zellimserver.v1'),
       createEmptyInstance: create)
     ..aOS(1, _omitFieldNames ? '' : 'session')
+    ..aOS(2, _omitFieldNames ? '' : 'connectionId')
     ..hasRequiredFields = false;
 
   @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
@@ -1002,6 +1005,16 @@ class SessionRef extends $pb.GeneratedMessage {
   $core.bool hasSession() => $_has(0);
   @$pb.TagNumber(1)
   void clearSession() => $_clearField(1);
+
+  /// optional; echoed from AttachTerminal's minted id to route per-connection (empty = legacy/fallback routing)
+  @$pb.TagNumber(2)
+  $core.String get connectionId => $_getSZ(1);
+  @$pb.TagNumber(2)
+  set connectionId($core.String value) => $_setString(1, value);
+  @$pb.TagNumber(2)
+  $core.bool hasConnectionId() => $_has(1);
+  @$pb.TagNumber(2)
+  void clearConnectionId() => $_clearField(2);
 }
 
 /// List of sessions returned by ListSessions.
@@ -1631,11 +1644,13 @@ class PaneTarget extends $pb.GeneratedMessage {
     $core.String? session,
     $core.int? paneId,
     $core.bool? isPlugin,
+    $core.String? connectionId,
   }) {
     final result = create();
     if (session != null) result.session = session;
     if (paneId != null) result.paneId = paneId;
     if (isPlugin != null) result.isPlugin = isPlugin;
+    if (connectionId != null) result.connectionId = connectionId;
     return result;
   }
 
@@ -1656,6 +1671,7 @@ class PaneTarget extends $pb.GeneratedMessage {
     ..aOS(1, _omitFieldNames ? '' : 'session')
     ..aI(2, _omitFieldNames ? '' : 'paneId', fieldType: $pb.PbFieldType.OU3)
     ..aOB(3, _omitFieldNames ? '' : 'isPlugin')
+    ..aOS(4, _omitFieldNames ? '' : 'connectionId')
     ..hasRequiredFields = false;
 
   @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
@@ -1705,6 +1721,16 @@ class PaneTarget extends $pb.GeneratedMessage {
   $core.bool hasIsPlugin() => $_has(2);
   @$pb.TagNumber(3)
   void clearIsPlugin() => $_clearField(3);
+
+  /// optional; echoed from AttachTerminal's minted id to route per-connection (empty = legacy/fallback routing)
+  @$pb.TagNumber(4)
+  $core.String get connectionId => $_getSZ(3);
+  @$pb.TagNumber(4)
+  set connectionId($core.String value) => $_setString(3, value);
+  @$pb.TagNumber(4)
+  $core.bool hasConnectionId() => $_has(3);
+  @$pb.TagNumber(4)
+  void clearConnectionId() => $_clearField(4);
 }
 
 /// Toggle-fullscreen request with an optional floating-pane hint (Bug 2c).
@@ -1839,10 +1865,12 @@ class TabTarget extends $pb.GeneratedMessage {
   factory TabTarget({
     $core.String? session,
     $fixnum.Int64? tabId,
+    $core.String? connectionId,
   }) {
     final result = create();
     if (session != null) result.session = session;
     if (tabId != null) result.tabId = tabId;
+    if (connectionId != null) result.connectionId = connectionId;
     return result;
   }
 
@@ -1863,6 +1891,7 @@ class TabTarget extends $pb.GeneratedMessage {
     ..aOS(1, _omitFieldNames ? '' : 'session')
     ..a<$fixnum.Int64>(2, _omitFieldNames ? '' : 'tabId', $pb.PbFieldType.OU6,
         defaultOrMaker: $fixnum.Int64.ZERO)
+    ..aOS(3, _omitFieldNames ? '' : 'connectionId')
     ..hasRequiredFields = false;
 
   @$core.Deprecated('See https://github.com/google/protobuf.dart/issues/998.')
@@ -1900,6 +1929,16 @@ class TabTarget extends $pb.GeneratedMessage {
   $core.bool hasTabId() => $_has(1);
   @$pb.TagNumber(2)
   void clearTabId() => $_clearField(2);
+
+  /// optional; echoed from AttachTerminal's minted id to route per-connection (empty = legacy/fallback routing)
+  @$pb.TagNumber(3)
+  $core.String get connectionId => $_getSZ(2);
+  @$pb.TagNumber(3)
+  set connectionId($core.String value) => $_setString(2, value);
+  @$pb.TagNumber(3)
+  $core.bool hasConnectionId() => $_has(2);
+  @$pb.TagNumber(3)
+  void clearConnectionId() => $_clearField(3);
 }
 
 /// Generic acknowledgement returned by action RPCs.

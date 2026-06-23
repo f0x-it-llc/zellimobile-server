@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
     let layout_resp = authed_client
         .get_layout(SessionRef {
             session: target.clone(),
+            ..Default::default()
         })
         .await
         .context("GetLayout RPC failed")?;

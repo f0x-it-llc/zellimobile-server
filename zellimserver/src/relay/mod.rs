@@ -107,7 +107,7 @@
 //! single in-flight query the first Log is tabs and the second is panes.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use futures::StreamExt;
@@ -125,9 +125,16 @@ mod types;
 
 // Re-export public surface (used by grpc.rs as `crate::relay::<Name>`).
 pub use types::{
-    ControlRegistry, FloatingHint, RelayControl, RelayViewState, ServerFrameStream,
-    ViewStateRegistry,
+    ControlEntry, ControlRegistry, FloatingHint, RelayControl, RelayViewState, ServerFrameStream,
+    ViewStateEntry, ViewStateRegistry,
 };
+
+// ─── Process-unique connection id counter ─────────────────────────────────────
+
+/// Monotonic counter used to mint a process-unique `connection_id` per
+/// `AttachTerminal` relay. Cheaper than a UUID and sufficient for our needs:
+/// we only need uniqueness within one server process lifetime.
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 use reader::{ShutdownGuard, render_loop};
 use types::{InFlightQuery, RENDER_CHANNEL_BOUND, RO_FALLBACK_COLS, RO_FALLBACK_ROWS};
@@ -234,9 +241,49 @@ pub async fn attach_relay(
     // and were never counted.
     let client_guard = clients.attach(&session_name);
 
+    // ── 3b. Mint a process-unique connection_id for this relay. ─────────────
+    // Monotonic AtomicU64 is cheaper than UUID and sufficient: we only need
+    // uniqueness within one server process lifetime. Format as a decimal string
+    // for easy proto transport.
+    let connection_id = NEXT_CONNECTION_ID
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string();
+    log::info!(
+        "relay [{session_name}]: minted connection_id={connection_id} \
+         (read_only={read_only})"
+    );
+
     // ── 3. Outbound: bounded channel + std reader thread ────────────────────
     let (tx, rx) = mpsc::channel::<Result<ServerFrame, Status>>(RENDER_CHANNEL_BOUND);
     let stop = Arc::new(AtomicBool::new(false));
+
+    // ── 3d. Advertise connection_id to the client via a ControlEvent frame. ─
+    // Emit it as the FIRST frame, before any render bytes, so the client can
+    // echo it in subsequent unary RPCs (GoToTab / FocusPane / GetLayout) to
+    // ensure those are routed to THIS relay rather than another relay on the
+    // same session. We do this before handing `tx` to the reader thread so we
+    // don't need a clone.
+    {
+        use crate::proto::{ControlEvent, server_frame};
+        let conn_event = ServerFrame {
+            kind: Some(server_frame::Kind::Control(ControlEvent {
+                kind: "connection_id".to_owned(),
+                payload: connection_id.clone(),
+            })),
+        };
+        // The channel is empty and the receiver hasn't been given to the stream
+        // yet, so this cannot block. If somehow it fails (channel full from a
+        // very small RENDER_CHANNEL_BOUND — not the case with 64) the client
+        // never receives its connection_id and falls back to session-scoped
+        // routing for all subsequent RPCs.
+        if let Err(e) = tx.try_send(Ok(conn_event)) {
+            log::warn!(
+                "relay [{session_name}]: failed to send connection_id frame to client \
+                 (connection_id={connection_id}): {e} — client will fall back to \
+                 session-scoped routing"
+            );
+        }
+    }
 
     // FX-QUERY: channel from inbound task → render thread carrying in-flight
     // layout queries. The std mpsc is non-blocking for the producer: the inbound
@@ -285,10 +332,12 @@ pub async fn attach_relay(
     {
         let init_session = session_name.clone();
         let view_state_init = view_state.clone();
+        let conn_id = connection_id.clone();
+        let session_for_entry = session_name.clone();
         let init_result =
             tokio::task::spawn_blocking(move || helpers::init_relay_view_state(&init_session))
                 .await;
-        match init_result {
+        let relay_vs = match init_result {
             Ok(Ok(state)) => {
                 log::info!(
                     "relay [{session_name}]: initialized view state: \
@@ -296,29 +345,43 @@ pub async fn attach_relay(
                     state.active_tab,
                     state.focused_pane
                 );
-                view_state_init.insert(session_name.clone(), state);
+                state
             }
             Ok(Err(e)) => {
                 log::warn!(
                     "relay [{session_name}]: view-state init failed (will use queried \
                      values until first action): {e:#}"
                 );
-                view_state_init.insert(session_name.clone(), RelayViewState::default());
+                RelayViewState::default()
             }
             Err(e) => {
                 log::warn!("relay [{session_name}]: view-state init task panicked: {e}");
-                view_state_init.insert(session_name.clone(), RelayViewState::default());
+                RelayViewState::default()
             }
-        }
+        };
+        view_state_init.insert(
+            conn_id,
+            crate::relay::ViewStateEntry {
+                session: session_for_entry,
+                state: relay_vs,
+            },
+        );
     }
 
     // ── 3c (cont.): NOW register the control sender (FX-QUERY part C). ────────
     // View-state is initialized and the render thread + query plumbing are live,
-    // so a GetLayout that finds this entry can safely route a QueryLayout. Keep a
-    // clone as a teardown ownership token (so this attach removes its own entry,
-    // not a newer attach's).
-    let my_ctrl_tx = ctrl_tx.clone();
-    control.insert(session_name.clone(), ctrl_tx);
+    // so a GetLayout that finds this entry can safely route a QueryLayout.
+    // Register by connection_id — not session name — so multiple concurrent
+    // relays on the same session each get their own slot (fixes the multi-client
+    // misroute bug where the old session-keyed insert overwrote prior entries).
+    control.insert(
+        connection_id.clone(),
+        ControlEntry {
+            session: session_name.clone(),
+            sender: ctrl_tx.clone(),
+            read_only,
+        },
+    );
 
     // ── 4. Inbound: tokio task pumping ClientFrames → IPC sender ────────────
     tokio::spawn(inbound::inbound_loop(
@@ -326,12 +389,12 @@ pub async fn attach_relay(
         sender,
         guard,
         session_name,
+        connection_id,
         read_only,
         token,
         client_guard,
         ctrl_rx,
         control,
-        my_ctrl_tx,
         clients,
         query_tx,
         view_state,

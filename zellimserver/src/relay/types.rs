@@ -91,16 +91,63 @@ pub struct RelayViewState {
     pub focused_pane: Option<PaneId>,
 }
 
-/// Per-session registry of relay view state (B-FOCUS). Keyed by session name.
-/// Populated on relay attach (queried from live zellij state); updated on each
-/// routed SwitchTab/FocusPane/ToggleFullscreen; removed on teardown.
-pub type ViewStateRegistry = Arc<dashmap::DashMap<String, RelayViewState>>;
+/// A registry entry pairing a relay's owning session name with its control sender.
+///
+/// Keyed by `connection_id` (a process-unique monotonic string minted per
+/// `AttachTerminal` relay). Storing `session` alongside allows routing code to
+/// validate that a request's session matches the registered relay's session
+/// before sending commands to it.
+#[derive(Clone, Debug)]
+pub struct ControlEntry {
+    /// The zellij session name this relay is attached to.
+    pub session: String,
+    /// The channel used to send [`RelayControl`] commands to the relay's inbound task.
+    pub sender: mpsc::UnboundedSender<RelayControl>,
+    /// Whether the relay was opened with a read-only token.
+    ///
+    /// The inbound task drops all mutating commands (`SwitchTab`, `FocusPane`,
+    /// `ToggleFullscreen`) for read-only relays at its own guard. This flag is
+    /// stored here so the session-scoped fallback path in `try_route_control` can
+    /// skip read-only entries when routing a mutating command — preventing a silent
+    /// false-success where the channel send returns `ok:true` but the command is
+    /// then dropped by the inbound guard (Issue B).
+    pub read_only: bool,
+}
 
-/// Per-session registry of live relay control senders (W2.0a/b spike). The gRPC
-/// service holds one; each relay registers its sender on attach and removes it
-/// on teardown. Last attach for a session wins (fine for the single-client
-/// spike).
-pub type ControlRegistry = Arc<dashmap::DashMap<String, mpsc::UnboundedSender<RelayControl>>>;
+/// A registry entry pairing a relay's owning session name with its view state.
+///
+/// Keyed by `connection_id`. Storing `session` alongside allows `get_layout` to
+/// locate the view state for the exact relay that served the query.
+#[derive(Clone, Debug)]
+pub struct ViewStateEntry {
+    /// The zellij session name this relay is attached to.
+    pub session: String,
+    /// Per-relay-client view state (active tab + focused pane).
+    pub state: RelayViewState,
+}
+
+/// Per-connection registry of relay view state (B-FOCUS).
+///
+/// Keyed by `connection_id` (process-unique, minted per `AttachTerminal`).
+/// Each entry stores the owning session name alongside the view state so that
+/// routing can validate session match and the session-scoped fallback can scan
+/// all entries for "any relay attached to session S".
+///
+/// Old invariant was "last attach for a session wins"; this registry instead
+/// retains ALL concurrently-attached relays for a session — fixing the
+/// multi-client misroute bug.
+pub type ViewStateRegistry = Arc<dashmap::DashMap<String, ViewStateEntry>>;
+
+/// Per-connection registry of live relay control senders.
+///
+/// Keyed by `connection_id` (process-unique, minted per `AttachTerminal`).
+/// Each entry stores the owning session name alongside the sender so that
+/// routing can validate session match and the session-scoped fallback can scan
+/// all entries for "any relay attached to session S".
+///
+/// Replaces the old session-keyed registry (which caused the multi-client
+/// misroute bug: last attach for a session overwrote all previous entries).
+pub type ControlRegistry = Arc<dashmap::DashMap<String, ControlEntry>>;
 
 // ─── Internal types ───────────────────────────────────────────────────────────
 

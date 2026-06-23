@@ -24,64 +24,96 @@ impl ZelliService {
         &self,
         request: Request<SessionRef>,
     ) -> Result<Response<Layout>, Status> {
-        let session = request.into_inner().session;
+        let req = request.into_inner();
+        let session = req.session;
+        let connection_id = req.connection_id;
         validate_session(&session)?;
-        log::info!("GetLayout: session='{session}'");
+        log::info!("GetLayout: session='{session}' connection_id='{connection_id}'");
 
         // ── B-QUERY: route through relay if one is attached ─────────────────
-        // Look up the relay control sender for this session. If found, send a
-        // QueryLayout command and await the (tabs_json, panes_json) result via
-        // a oneshot, bounded by RELAY_QUERY_TIMEOUT. Fall back to the ephemeral
-        // path on timeout or relay absence.
-        let (tabs_json, panes_json, via_relay) = {
-            // Try to get the relay sender. Clone the UnboundedSender (cheap:
-            // it's just a channel handle) so the DashMap Ref guard is dropped
-            // immediately — we must not hold it across awaits.
-            let relay_sender = self.control.get(&session).map(|r| r.value().clone());
+        // Routing priority:
+        //   1. If connection_id non-empty AND entry exists AND session matches →
+        //      route to that exact relay (per-connection routing — fixes the
+        //      multi-client misroute bug).
+        //   2. Otherwise → find any relay registered for the session (session-
+        //      scoped fallback; preserves solo-client and legacy-client behavior).
+        //   3. No relay → ephemeral AttachClient path (unchanged).
+        //
+        // Clone the UnboundedSender (cheap: just a channel handle) so the
+        // DashMap Ref guard is dropped immediately — never hold a shard guard
+        // across an .await.
+        let (tabs_json, panes_json, via_relay, relay_conn_id) = {
+            // Try per-connection lookup first, then session-scoped fallback.
+            let relay_entry: Option<(
+                String,
+                tokio::sync::mpsc::UnboundedSender<crate::relay::RelayControl>,
+            )> = if !connection_id.is_empty() {
+                // Per-connection: validate session match before cloning sender.
+                self.control
+                    .get(&connection_id)
+                    .filter(|entry| entry.session == session)
+                    .map(|entry| (connection_id.clone(), entry.sender.clone()))
+            } else {
+                None
+            };
+
+            // If per-connection failed, try session-scoped fallback.
+            let relay_entry = relay_entry.or_else(|| {
+                self.control
+                    .iter()
+                    .find(|entry| entry.session == session)
+                    .map(|entry| (entry.key().clone(), entry.sender.clone()))
+            });
+
+            // Destructure: (conn_id_used, sender_opt)
+            let (matched_conn_id, relay_sender) = match relay_entry {
+                Some((cid, sender)) => (cid, Some(sender)),
+                None => (String::new(), None),
+            };
 
             if let Some(sender) = relay_sender {
                 let (reply_tx, reply_rx) =
                     tokio::sync::oneshot::channel::<anyhow::Result<(String, String)>>();
                 let queued =
                     sender.send(crate::relay::RelayControl::QueryLayout { reply: reply_tx });
-                // `sender` is an owned clone of the UnboundedSender (the DashMap
-                // Ref was already released by `.map(|r| r.value().clone())`
-                // above), so this drop is just tidiness — releasing our handle to
-                // the relay's control channel now that the query is queued. It is
-                // NOT releasing a DashMap guard.
+                // `sender` is an owned clone of the UnboundedSender; the DashMap
+                // Ref guard was already released above. Drop is just tidiness.
                 drop(sender);
 
                 if queued.is_ok() {
                     match tokio::time::timeout(RELAY_QUERY_TIMEOUT, reply_rx).await {
                         Ok(Ok(Ok((t, p)))) => {
                             log::debug!(
-                                "GetLayout: session='{session}' query routed via relay \
-                                 (tabs={}B panes={}B)",
+                                "GetLayout: session='{session}' connection_id='{matched_conn_id}' \
+                                 query routed via relay (tabs={}B panes={}B)",
                                 t.len(),
                                 p.len()
                             );
-                            (t, p, true)
+                            (t, p, true, matched_conn_id)
                         }
                         Ok(Ok(Err(e))) => {
                             log::warn!(
                                 "GetLayout: relay query failed for '{session}', \
                                  falling back to ephemeral: {e:#}"
                             );
-                            ephemeral_query(&session).await?
+                            let (t, p, r) = ephemeral_query(&session).await?;
+                            (t, p, r, String::new())
                         }
                         Ok(Err(_cancelled)) => {
                             log::warn!(
                                 "GetLayout: relay query oneshot cancelled for '{session}', \
                                  falling back to ephemeral"
                             );
-                            ephemeral_query(&session).await?
+                            let (t, p, r) = ephemeral_query(&session).await?;
+                            (t, p, r, String::new())
                         }
                         Err(_elapsed) => {
                             log::warn!(
                                 "GetLayout: relay query timed out for '{session}' \
                                  after {RELAY_QUERY_TIMEOUT:?}, falling back to ephemeral"
                             );
-                            ephemeral_query(&session).await?
+                            let (t, p, r) = ephemeral_query(&session).await?;
+                            (t, p, r, String::new())
                         }
                     }
                 } else {
@@ -90,17 +122,20 @@ impl ZelliService {
                         "GetLayout: relay sender closed for '{session}', \
                          falling back to ephemeral"
                     );
-                    ephemeral_query(&session).await?
+                    let (t, p, r) = ephemeral_query(&session).await?;
+                    (t, p, r, String::new())
                 }
             } else {
                 // No relay attached for this session — use the original ephemeral path.
                 log::debug!("GetLayout: no relay for '{session}', using ephemeral query");
-                ephemeral_query(&session).await?
+                let (t, p, r) = ephemeral_query(&session).await?;
+                (t, p, r, String::new())
             }
         };
 
         log::debug!(
-            "GetLayout: tabs JSON ({} bytes), panes JSON ({} bytes), via_relay={via_relay}",
+            "GetLayout: tabs JSON ({} bytes), panes JSON ({} bytes), via_relay={via_relay} \
+             relay_conn_id='{relay_conn_id}'",
             tabs_json.len(),
             panes_json.len()
         );
@@ -128,18 +163,46 @@ impl ZelliService {
         })?;
 
         // ── B-FOCUS: read relay view state for active_tab / focused_pane ────
-        // Only meaningful when a relay is attached. We snapshot it once and use
-        // it for the override pass below so we hold the DashMap guard briefly.
-        let relay_vs: Option<crate::relay::RelayViewState> = if via_relay {
-            self.view_state.get(&session).map(|vs| vs.value().clone())
-        } else {
-            None
-        };
+        // Only meaningful when a relay is attached AND the relay that served the
+        // query is the CALLER'S OWN relay. We snapshot it once and use it for
+        // the override pass below so we hold the DashMap guard briefly (never
+        // across an .await).
+        //
+        // Override condition (Issue A fix):
+        //   - `connection_id` must be non-empty (caller has a known relay id),
+        //   - `relay_conn_id` must equal `connection_id` (the exact-connection
+        //     path was taken — the query was served by the caller's own relay).
+        //
+        // When the fallback path was taken (request connection_id is empty, OR
+        // the query fell back to an arbitrary sibling relay whose conn_id differs
+        // from the request's), relay_vs is set to None so the override pass is
+        // skipped entirely. Raw zellij tab/pane values are returned unchanged,
+        // which is always correct because we have no reliable per-caller view
+        // state in that case — applying a sibling relay's active_tab/focused_pane
+        // would produce an actively wrong indicator (worse than the raw union).
+        let relay_vs: Option<crate::relay::RelayViewState> =
+            if should_apply_view_state_override(via_relay, &connection_id, &relay_conn_id) {
+                // Exact-connection match: the query was served by the caller's own
+                // relay. Apply the per-connection view-state override.
+                self.view_state
+                    .get(&relay_conn_id)
+                    .map(|entry| entry.state.clone())
+            } else {
+                // Fallback path or no relay: skip the override.
+                None
+            };
         if let Some(ref vs) = relay_vs {
             log::debug!(
-                "GetLayout: relay view state: active_tab={:?} focused_pane={:?}",
+                "GetLayout: relay view state override applied (conn={relay_conn_id}): \
+                 active_tab={:?} focused_pane={:?}",
                 vs.active_tab,
                 vs.focused_pane
+            );
+        } else if via_relay {
+            log::debug!(
+                "GetLayout: relay view state override SUPPRESSED (request \
+                 connection_id='{connection_id}', relay_conn_id='{relay_conn_id}') — \
+                 returning raw zellij values"
             );
         }
 
@@ -236,12 +299,90 @@ impl ZelliService {
             .collect();
 
         log::info!(
-            "GetLayout: session='{}' → {} tab(s), {} total pane group(s), via_relay={via_relay}",
+            "GetLayout: session='{}' relay_conn='{relay_conn_id}' → {} tab(s), \
+             {} total pane group(s), via_relay={via_relay}",
             session,
             tab_msgs.len(),
             tab_msgs.iter().map(|t| t.panes.len()).sum::<usize>()
         );
 
         Ok(Response::new(Layout { tabs: tab_msgs }))
+    }
+}
+
+// ─── Pure helper (also used by tests) ────────────────────────────────────────
+
+/// Decide whether the B-FOCUS view-state override should be applied.
+///
+/// The override is only correct when the relay that served the query is the
+/// CALLER'S OWN relay (exact `connection_id` match). When the fallback path was
+/// taken (request `connection_id` is empty, or the resolved `relay_conn_id`
+/// differs from the request's `connection_id`), applying a sibling relay's
+/// `active_tab`/`focused_pane` would give the caller an actively wrong indicator
+/// — worse than returning raw zellij values (Issue A fix).
+///
+/// Returns `true` only when all three conditions hold:
+/// 1. the query was served via a relay (`via_relay`),
+/// 2. the request carried a non-empty `connection_id` (caller has a known relay),
+/// 3. the relay that served the query is the caller's own relay
+///    (`relay_conn_id == request_connection_id`).
+pub(crate) fn should_apply_view_state_override(
+    via_relay: bool,
+    request_connection_id: &str,
+    relay_conn_id: &str,
+) -> bool {
+    via_relay && !request_connection_id.is_empty() && relay_conn_id == request_connection_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── Issue A: view-state override suppression ─────────────────────────────
+
+    #[test]
+    fn override_applied_on_exact_connection_id_match() {
+        // Exact match: via_relay + non-empty id + relay_conn_id == request id.
+        assert!(
+            should_apply_view_state_override(true, "conn-1", "conn-1"),
+            "override must be applied when relay_conn_id == request connection_id"
+        );
+    }
+
+    #[test]
+    fn override_suppressed_when_request_connection_id_is_empty() {
+        // Empty request connection_id → fallback path; no reliable caller identity.
+        assert!(
+            !should_apply_view_state_override(true, "", "conn-2"),
+            "override must be suppressed when request connection_id is empty"
+        );
+    }
+
+    #[test]
+    fn override_suppressed_when_relay_conn_id_differs() {
+        // relay_conn_id is a sibling relay's id — applying its view-state would
+        // give the caller an actively wrong active_tab / focused_pane.
+        assert!(
+            !should_apply_view_state_override(true, "conn-A", "conn-B"),
+            "override must be suppressed when relay_conn_id != request connection_id"
+        );
+    }
+
+    #[test]
+    fn override_suppressed_when_not_via_relay() {
+        // Ephemeral query path: no relay view state at all.
+        assert!(
+            !should_apply_view_state_override(false, "conn-1", "conn-1"),
+            "override must be suppressed when query was not served via relay"
+        );
+    }
+
+    #[test]
+    fn override_suppressed_when_all_empty() {
+        // No connection_id and no relay: definitely no override.
+        assert!(
+            !should_apply_view_state_override(false, "", ""),
+            "override must be suppressed with no relay and no connection_id"
+        );
     }
 }
