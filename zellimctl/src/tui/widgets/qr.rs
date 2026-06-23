@@ -244,9 +244,9 @@ mod tests {
         // `layout_80x24_phase_body_fits_qr` for the full breakdown.
         //
         // MIN_WIDTH  >= 33 (33-module matrix cols) + 2*QUIET_H = 41.
-        assert!(MIN_WIDTH >= 33 + QUIET_H * 2);
+        const { assert!(MIN_WIDTH >= 33 + QUIET_H * 2) };
         // MIN_HEIGHT >= 17 (⌈33/2⌉ terminal rows) + 2*QUIET_V = 19.
-        assert!(MIN_HEIGHT >= 17 + QUIET_V * 2);
+        const { assert!(MIN_HEIGHT >= 17 + QUIET_V * 2) };
     }
 
     #[test]
@@ -254,7 +254,7 @@ mod tests {
         // QUIET_H ≈ 4 horizontal cells of white space on each side.
         assert_eq!(QUIET_H, 4);
         // QUIET_V ≥ 1 row of white space on each side.
-        assert!(QUIET_V >= 1);
+        const { assert!(QUIET_V >= 1) };
     }
 
     /// QR is encoded exactly once in `new`; block_width and render both reuse it.
@@ -371,7 +371,7 @@ mod tests {
         );
         // Verify ≥1 row margin.
         assert!(
-            qr_col_height >= block_h + 1,
+            qr_col_height > block_h,
             "phase_body ({qr_col_height}) must be >= block_h ({block_h}) + 1 margin"
         );
     }
