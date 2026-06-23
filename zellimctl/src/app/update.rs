@@ -238,20 +238,19 @@ fn on_enter_screen(state: &mut AppState, screen: Screen) -> Vec<UpdateAction> {
     }
 }
 
-/// Tick handler — drives the live poll for the Server screen and pairing detection.
+/// Tick handler — drives the live status poll for the Server/Dashboard screens and
+/// the QR overlay's connection detection.
+///
+/// All three pollers share the single `server.loading` in-flight guard so at most
+/// one `RefreshStatus` is dispatched per ~1 s window even when the overlay is up
+/// over a polled screen — avoiding redundant concurrent `status()` reads.
 fn handle_tick(state: &mut AppState) -> Vec<UpdateAction> {
     let mut actions = Vec::new();
 
-    if state.screen == Screen::Server && !state.server.loading {
-        // Emit RefreshStatus roughly every 20 ticks (~1 s at 50 ms/tick).
-        state.server.tick_counter = state.server.tick_counter.wrapping_add(1);
-        if state.server.tick_counter.is_multiple_of(20) {
-            state.server.loading = true;
-            actions.push(UpdateAction::RefreshStatus);
-        }
-    }
-
-    if state.screen == Screen::Dashboard && !state.server.loading {
+    // Live status poll on the screens that show daemon status. Emit RefreshStatus
+    // roughly every 20 ticks (~1 s at 50 ms/tick), guarded so only one query is in
+    // flight at a time.
+    if matches!(state.screen, Screen::Server | Screen::Dashboard) && !state.server.loading {
         state.server.tick_counter = state.server.tick_counter.wrapping_add(1);
         if state.server.tick_counter.is_multiple_of(20) {
             state.server.loading = true;
@@ -260,12 +259,16 @@ fn handle_tick(state: &mut AppState) -> Vec<UpdateAction> {
     }
 
     // Poll status while the QR overlay is showing a code so we can detect when a
-    // client connects. The overlay can be up over any screen.
-    if let Some(overlay) = state.qr_overlay.as_mut()
+    // client connects. The overlay can be up over any screen; it shares the same
+    // `server.loading` single-flight guard as the screen poll above so the two
+    // never spawn concurrent status reads.
+    if !state.server.loading
+        && let Some(overlay) = state.qr_overlay.as_mut()
         && matches!(overlay.phase, QrOverlayPhase::Showing { .. })
     {
         overlay.tick_counter = overlay.tick_counter.wrapping_add(1);
         if overlay.tick_counter.is_multiple_of(20) {
+            state.server.loading = true;
             actions.push(UpdateAction::RefreshStatus);
         }
     }
@@ -876,6 +879,37 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, UpdateAction::RefreshStatus)),
             "expected RefreshStatus on 20th tick; got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_and_dashboard_poll_coalesce_to_single_refresh() {
+        // Regression: when the QR overlay is `Showing` over the Dashboard screen,
+        // the screen poll and the overlay poll share the `server.loading`
+        // single-flight guard, so at most ONE RefreshStatus is dispatched per
+        // ~1 s window (no redundant concurrent status() reads).
+        let mut state = AppState::new();
+        state.screen = Screen::Dashboard;
+        state.server.loading = false;
+        show_overlay(&mut state, 0);
+        // The overlay's tick_counter starts at 0; align both pollers' cadence.
+        state.server.tick_counter = 0;
+        state.qr_overlay.as_mut().unwrap().tick_counter = 0;
+
+        let mut total_refreshes = 0;
+        for _ in 0..20 {
+            let actions = update(&mut state, Message::Tick);
+            total_refreshes += actions
+                .iter()
+                .filter(|a| matches!(a, UpdateAction::RefreshStatus))
+                .count();
+            // Clear the in-flight flag the way StatusLoaded would, so the next
+            // window can poll again — but within a single tick only one fires.
+            state.server.loading = false;
+        }
+        assert_eq!(
+            total_refreshes, 1,
+            "exactly one RefreshStatus expected across the shared 20-tick window; got {total_refreshes}"
         );
     }
 

@@ -3,8 +3,8 @@
 //! ## Phase machine
 //!
 //! ```text
-//! Generating ──(QrOverlayReady)──► Showing ──(client count rises)──► Connected
-//!             └──(QrOverlayFailed)──► Failed
+//! Generating ──(TokenQrReady)──► Showing ──(client count rises)──► Connected
+//!             └──(TokenQrFailed)──► Failed
 //! ```
 //!
 //! This module only knows about [`QrOverlay`] — it never reads `AppState`
@@ -79,7 +79,7 @@ fn render_generating(frame: &mut Frame, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  Ensuring TLS cert, building QR…",
+            "  Reading cert fingerprint, building QR…",
             styles::muted(),
         )),
     ];
