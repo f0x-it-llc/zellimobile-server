@@ -54,26 +54,22 @@ pub enum UpdateAction {
     /// Posts `Message::TokensChanged` on completion.
     RevokeToken(String),
 
-    // ── Pairing actions ───────────────────────────────────────────────────────
-    /// Begin the pairing QR flow: gather config, ensure cert, mint token, build URI.
+    // ── Token QR overlay ──────────────────────────────────────────────────────
+    /// Build a pairing QR URI from an **existing** plaintext token (no mint, no
+    /// revoke).
     ///
-    /// Posts `Message::PairingReady { uri, baseline_clients }` on success or
-    /// `Message::PairingFailed(err)` on error. Carries the current `seq` so
-    /// stale responses are discarded.
-    StartPairing {
-        /// Read-only toggle for the freshly minted pairing token.
+    /// Posts `Message::TokenQrReady { uri, .. }` on success or
+    /// `Message::TokenQrFailed { err, .. }` on error. Carries the current overlay
+    /// `seq` so stale responses (overlay since closed) are discarded. The token
+    /// is the real user token the QR encodes — it is NEVER revoked here.
+    ShowTokenQr {
+        /// The plaintext token to encode into the pairing URI.
+        token: String,
+        /// Whether the token grants read-only access (embedded as `ro` in the URI).
         read_only: bool,
-        /// The sequence number of this attempt (seq-guard against stale results).
+        /// The sequence number of this overlay (seq-guard against stale results).
         seq: u64,
     },
-
-    /// Silently revoke a previously-minted pairing token (best-effort).
-    ///
-    /// Emitted when a pairing QR is superseded (regenerate) or the Pair screen
-    /// is left with an unused token outstanding. Unlike [`Self::RevokeToken`],
-    /// it does not refresh the Tokens list or surface status — it just tidies up
-    /// the bearer secret. The result is ignored.
-    RevokePairingToken(String),
 
     // ── Dashboard ─────────────────────────────────────────────────────────────
     /// Read the persisted cert fingerprint + SAN sidecar **without** generating

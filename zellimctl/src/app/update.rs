@@ -9,7 +9,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::action::UpdateAction;
 use super::message::Message;
-use super::state::{AppState, ConfigField, PairingPhase, San, Screen, TokensFormPhase};
+use super::state::{
+    AppState, ConfigField, QrOverlay, QrOverlayPhase, San, Screen, TokensFormPhase,
+};
 
 /// Apply a [`Message`] to the [`AppState`], returning any side effects.
 pub fn update(state: &mut AppState, message: Message) -> Vec<UpdateAction> {
@@ -35,11 +37,11 @@ pub fn update(state: &mut AppState, message: Message) -> Vec<UpdateAction> {
                 }
             }
             state.server.loading = false;
-            // Drive pairing connection detection — only on the Pair screen.
-            if state.screen == Screen::Pair
-                && let Some(n) = client_count
-            {
-                check_pairing_connection(state, n);
+            // Drive QR overlay connection detection — only while the overlay is
+            // showing a QR. A rise in the attached-client count above the baseline
+            // captured when the QR was generated promotes the overlay to Connected.
+            if let Some(n) = client_count {
+                check_overlay_connection(state, n);
             }
             Vec::new()
         }
@@ -114,8 +116,12 @@ pub fn update(state: &mut AppState, message: Message) -> Vec<UpdateAction> {
             state.tokens.status = "Tokens loaded.".to_string();
             Vec::new()
         }
-        Message::TokenCreated { token, name } => {
-            state.tokens.last_minted_secret = Some((name, token));
+        Message::TokenCreated {
+            token,
+            name,
+            read_only,
+        } => {
+            state.tokens.last_minted_secret = Some((name, token, read_only));
             state.tokens.loading = false;
             state.tokens.form_phase = TokensFormPhase::Browsing;
             state.tokens.form_name = String::new();
@@ -128,84 +134,50 @@ pub fn update(state: &mut AppState, message: Message) -> Vec<UpdateAction> {
             vec![UpdateAction::LoadTokens]
         }
 
-        // ── Pairing screen messages ───────────────────────────────────────────
-        Message::PairingReady {
+        // ── Token QR overlay messages ─────────────────────────────────────────
+        Message::TokenQrReady {
             uri,
-            baseline_clients,
             host,
             port,
             fingerprint_short,
-            token_name,
+            baseline_clients,
             seq,
         } => {
-            // Accept only a current-attempt result that arrives while the Pair
-            // screen is still active. A seq mismatch (superseded attempt, or one
-            // invalidated by leaving the screen) OR a result arriving off-screen
-            // means the minted token is orphaned — revoke it rather than
-            // resurrecting pairing state with an un-revoked bearer secret.
-            if seq == state.pairing.seq && state.screen == Screen::Pair {
-                state.pairing.pending_token_name = Some(token_name.clone());
-                state.pairing.phase = PairingPhase::Showing {
+            // Accept only a current result whose seq matches the live overlay's
+            // seq AND an overlay still exists. A stale result (overlay since
+            // closed or superseded) is simply ignored — NOTHING was minted, so
+            // there is no token to revoke.
+            if let Some(overlay) = state.qr_overlay.as_mut()
+                && overlay.seq == seq
+            {
+                overlay.baseline_clients = baseline_clients;
+                overlay.phase = QrOverlayPhase::Showing {
                     uri,
-                    baseline_clients,
                     host,
                     port,
                     fingerprint_short,
-                    token_name,
                 };
-            } else {
-                return vec![UpdateAction::RevokePairingToken(token_name)];
             }
             Vec::new()
         }
-        Message::PairingFailed { err, seq } => {
-            if seq == state.pairing.seq {
-                state.pairing.phase = PairingPhase::Failed { err };
+        Message::TokenQrFailed { err, seq } => {
+            if let Some(overlay) = state.qr_overlay.as_mut()
+                && overlay.seq == seq
+            {
+                overlay.phase = QrOverlayPhase::Failed { err };
             }
             Vec::new()
         }
     }
 }
 
-/// Transition `state.screen` to `next`, running any leave + enter side effects.
+/// Transition `state.screen` to `next`, running any enter side effects.
 ///
 /// Used by every navigation path (NavTo, Tab/BackTab, arrow nav) so the
-/// leave-side cleanup (e.g. revoking an unused pairing token) is centralised and
-/// can never be skipped by one path.
+/// enter-side data loads are centralised and can never be skipped by one path.
 fn transition_to(state: &mut AppState, next: Screen) -> Vec<UpdateAction> {
-    let mut actions = on_leave_screen(state, next);
-    actions.extend(on_enter_screen(state, next));
+    let actions = on_enter_screen(state, next);
     state.screen = next;
-    actions
-}
-
-/// Side effects to run when leaving the current screen for `next`.
-///
-/// Leaving the Pair screen with an unused pairing token outstanding revokes it
-/// (a bearer secret must not linger after the user navigates away) and resets
-/// the pairing phase to `Idle`.
-fn on_leave_screen(state: &mut AppState, next: Screen) -> Vec<UpdateAction> {
-    let mut actions = Vec::new();
-    if state.screen == Screen::Pair && next != Screen::Pair {
-        // Revoke the pending pairing token if one is outstanding. The token name
-        // lives both in `pending_token_name` (set as soon as the QR is ready)
-        // and in the `Showing` phase; prefer the phase value when present so the
-        // two can never drift, falling back to `pending_token_name`.
-        let from_phase = match &state.pairing.phase {
-            PairingPhase::Showing { token_name, .. } => Some(token_name.clone()),
-            _ => None,
-        };
-        if let Some(name) = from_phase.or_else(|| state.pairing.pending_token_name.clone()) {
-            actions.push(UpdateAction::RevokePairingToken(name));
-        }
-        state.pairing.pending_token_name = None;
-        state.pairing.phase = PairingPhase::Idle;
-        // Invalidate any in-flight pairing attempt (phase was `Generating`, no
-        // token minted yet) so its `PairingReady` is treated as stale and the
-        // token it mints is revoked — never resurrected off-screen. Closes the
-        // leave-during-Generating race.
-        state.pairing.seq = state.pairing.seq.wrapping_add(1);
-    }
     actions
 }
 
@@ -247,13 +219,6 @@ fn on_enter_screen(state: &mut AppState, screen: Screen) -> Vec<UpdateAction> {
             state.config.loading = true;
             vec![UpdateAction::LoadConfig]
         }
-        Screen::Pair => {
-            // Reset pairing state when entering the screen.
-            state.pairing.phase = PairingPhase::Idle;
-            state.pairing.tick_counter = 0;
-            state.pairing.pending_token_name = None;
-            Vec::new()
-        }
         Screen::Dashboard => {
             // Load a fresh at-a-glance snapshot of all sub-systems.
             // Flags are set so individual sub-states show their loading indicators
@@ -273,12 +238,19 @@ fn on_enter_screen(state: &mut AppState, screen: Screen) -> Vec<UpdateAction> {
     }
 }
 
-/// Tick handler — drives the live poll for the Server screen and pairing detection.
+/// Tick handler — drives the live status poll for the Server/Dashboard screens and
+/// the QR overlay's connection detection.
+///
+/// All three pollers share the single `server.loading` in-flight guard so at most
+/// one `RefreshStatus` is dispatched per ~1 s window even when the overlay is up
+/// over a polled screen — avoiding redundant concurrent `status()` reads.
 fn handle_tick(state: &mut AppState) -> Vec<UpdateAction> {
     let mut actions = Vec::new();
 
-    if state.screen == Screen::Server && !state.server.loading {
-        // Emit RefreshStatus roughly every 20 ticks (~1 s at 50 ms/tick).
+    // Live status poll on the screens that show daemon status. Emit RefreshStatus
+    // roughly every 20 ticks (~1 s at 50 ms/tick), guarded so only one query is in
+    // flight at a time.
+    if matches!(state.screen, Screen::Server | Screen::Dashboard) && !state.server.loading {
         state.server.tick_counter = state.server.tick_counter.wrapping_add(1);
         if state.server.tick_counter.is_multiple_of(20) {
             state.server.loading = true;
@@ -286,31 +258,35 @@ fn handle_tick(state: &mut AppState) -> Vec<UpdateAction> {
         }
     }
 
-    if state.screen == Screen::Pair {
-        // Poll status while showing a QR so we can detect when a client connects.
-        if let PairingPhase::Showing { .. } = &state.pairing.phase {
-            state.pairing.tick_counter = state.pairing.tick_counter.wrapping_add(1);
-            if state.pairing.tick_counter.is_multiple_of(20) {
-                actions.push(UpdateAction::RefreshStatus);
-            }
+    // Poll status while the QR overlay is showing a code so we can detect when a
+    // client connects. The overlay can be up over any screen; it shares the same
+    // `server.loading` single-flight guard as the screen poll above so the two
+    // never spawn concurrent status reads.
+    if !state.server.loading
+        && let Some(overlay) = state.qr_overlay.as_mut()
+        && matches!(overlay.phase, QrOverlayPhase::Showing { .. })
+    {
+        overlay.tick_counter = overlay.tick_counter.wrapping_add(1);
+        if overlay.tick_counter.is_multiple_of(20) {
+            state.server.loading = true;
+            actions.push(UpdateAction::RefreshStatus);
         }
     }
 
     actions
 }
 
-/// Promote the pairing phase to `Connected` if a new client appeared.
+/// Promote the QR overlay to `Connected` if a new client appeared.
 ///
-/// Called from the `StatusLoaded` handler — only while we are on the Pair screen
-/// and the phase is `Showing`. The rise is a heuristic (the attached-client
-/// count went up), not verified per-token auth.
-pub(crate) fn check_pairing_connection(state: &mut AppState, current_clients: usize) {
-    if let PairingPhase::Showing {
-        baseline_clients, ..
-    } = &state.pairing.phase
-        && current_clients > *baseline_clients
+/// Called from the `StatusLoaded` handler — only while the overlay exists and its
+/// phase is `Showing`. The rise is a heuristic (the attached-client count went
+/// up), not verified per-token auth.
+pub(crate) fn check_overlay_connection(state: &mut AppState, current_clients: usize) {
+    if let Some(overlay) = state.qr_overlay.as_mut()
+        && let QrOverlayPhase::Showing { .. } = &overlay.phase
+        && current_clients > overlay.baseline_clients
     {
-        state.pairing.phase = PairingPhase::Connected;
+        overlay.phase = QrOverlayPhase::Connected;
     }
 }
 
@@ -320,6 +296,18 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         state.should_quit = true;
         return vec![UpdateAction::Quit];
+    }
+
+    // Overlay key interception: while the token QR overlay is up it captures all
+    // input. `Esc` / `q` close it (NO revoke — the token is a real user token);
+    // `Tab` / `BackTab` are swallowed (no screen nav behind the overlay);
+    // everything else is a no-op. Returns early so no per-screen handler runs.
+    // (`Ctrl-C` is handled above and remains the always-available quit.)
+    if state.qr_overlay.is_some() {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            state.qr_overlay = None;
+        }
+        return Vec::new();
     }
 
     // `q` quits from any screen — UNLESS a text field is being edited (Config
@@ -349,7 +337,6 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
         Screen::Cert => handle_cert_key(state, key),
         Screen::Server => handle_server_key(state, key),
         Screen::Tokens => handle_tokens_key(state, key),
-        Screen::Pair => handle_pair_key(state, key),
         Screen::Dashboard => handle_nav_keys(state, key),
     }
 }
@@ -579,6 +566,7 @@ fn handle_server_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
 /// - `c`: open the create form.
 /// - `d`/`x`: revoke the selected token.
 /// - `r`: reload list.
+/// - `Enter`: open the QR overlay for the just-minted token (if one is held).
 /// - `Esc`: clear the minted secret.
 ///
 /// Creating mode (a text-editing field — see [`AppState::is_text_editing`]):
@@ -629,6 +617,33 @@ fn handle_tokens_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
                     Vec::new()
                 }
             }
+            KeyCode::Enter => {
+                // Open the QR overlay for the freshly-minted token — the only one
+                // whose plaintext we still hold. The shown token is a real user
+                // token; it is NEVER revoked when the overlay closes. If nothing
+                // was just minted, this is a no-op (with a status hint).
+                if let Some((name, secret, read_only)) = state.tokens.last_minted_secret.clone() {
+                    state.qr_seq = state.qr_seq.wrapping_add(1);
+                    let seq = state.qr_seq;
+                    state.qr_overlay = Some(QrOverlay {
+                        phase: QrOverlayPhase::Generating,
+                        seq,
+                        baseline_clients: 0,
+                        token_name: name,
+                        read_only,
+                        tick_counter: 0,
+                    });
+                    vec![UpdateAction::ShowTokenQr {
+                        token: secret,
+                        read_only,
+                        seq,
+                    }]
+                } else {
+                    state.tokens.status =
+                        "Create a token first, then press Enter to show its QR.".to_string();
+                    Vec::new()
+                }
+            }
             KeyCode::Esc => {
                 state.tokens.last_minted_secret = None;
                 Vec::new()
@@ -674,37 +689,6 @@ fn handle_tokens_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
             }
             _ => Vec::new(),
         },
-    }
-}
-
-/// Key handler for the Pair screen.
-///
-/// - `p`/`Enter`/`g`: start / regenerate pairing (bumps seq, dispatches `StartPairing`).
-/// - `Space`: toggle read-only for the next generated token.
-/// - `r`: same as `p` (regenerate).
-fn handle_pair_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
-    match key.code {
-        KeyCode::Char('p') | KeyCode::Enter | KeyCode::Char('g') | KeyCode::Char('r') => {
-            let mut actions = Vec::new();
-            // Revoke the previously-minted pending pairing token before minting a
-            // new one, so superseded bearer secrets don't accumulate.
-            if let Some(prev) = state.pairing.pending_token_name.take() {
-                actions.push(UpdateAction::RevokePairingToken(prev));
-            }
-            // Bump seq to invalidate any in-flight result.
-            state.pairing.seq = state.pairing.seq.wrapping_add(1);
-            state.pairing.phase = PairingPhase::Generating;
-            state.pairing.tick_counter = 0;
-            let seq = state.pairing.seq;
-            let read_only = state.pairing.read_only;
-            actions.push(UpdateAction::StartPairing { read_only, seq });
-            actions
-        }
-        KeyCode::Char(' ') => {
-            state.pairing.read_only = !state.pairing.read_only;
-            Vec::new()
-        }
-        _ => Vec::new(),
     }
 }
 
@@ -837,7 +821,7 @@ mod tests {
     fn backtab_goes_back() {
         let mut state = AppState::new();
         update(&mut state, Message::Key(key(KeyCode::BackTab)));
-        assert_eq!(state.screen, Screen::Pair);
+        assert_eq!(state.screen, Screen::Server);
     }
 
     #[test]
@@ -870,6 +854,62 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, UpdateAction::RefreshStatus))
+        );
+    }
+
+    #[test]
+    fn tick_triggers_refresh_on_dashboard_screen_after_20() {
+        // Mirror of tick_triggers_refresh_on_server_screen_after_20 but for
+        // Screen::Dashboard — confirms daemon-status live polling on the overview.
+        let mut state = AppState::new();
+        state.screen = Screen::Dashboard;
+        state.server.loading = false;
+        // Drive 19 ticks — no refresh yet.
+        for _ in 0..19 {
+            let actions = update(&mut state, Message::Tick);
+            assert!(
+                actions.is_empty(),
+                "expected no action before tick 20; got: {actions:?}"
+            );
+        }
+        // 20th tick → RefreshStatus.
+        let actions = update(&mut state, Message::Tick);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::RefreshStatus)),
+            "expected RefreshStatus on 20th tick; got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_and_dashboard_poll_coalesce_to_single_refresh() {
+        // Regression: when the QR overlay is `Showing` over the Dashboard screen,
+        // the screen poll and the overlay poll share the `server.loading`
+        // single-flight guard, so at most ONE RefreshStatus is dispatched per
+        // ~1 s window (no redundant concurrent status() reads).
+        let mut state = AppState::new();
+        state.screen = Screen::Dashboard;
+        state.server.loading = false;
+        show_overlay(&mut state, 0);
+        // The overlay's tick_counter starts at 0; align both pollers' cadence.
+        state.server.tick_counter = 0;
+        state.qr_overlay.as_mut().unwrap().tick_counter = 0;
+
+        let mut total_refreshes = 0;
+        for _ in 0..20 {
+            let actions = update(&mut state, Message::Tick);
+            total_refreshes += actions
+                .iter()
+                .filter(|a| matches!(a, UpdateAction::RefreshStatus))
+                .count();
+            // Clear the in-flight flag the way StatusLoaded would, so the next
+            // window can poll again — but within a single tick only one fires.
+            state.server.loading = false;
+        }
+        assert_eq!(
+            total_refreshes, 1,
+            "exactly one RefreshStatus expected across the shared 20-tick window; got {total_refreshes}"
         );
     }
 
@@ -1202,11 +1242,12 @@ mod tests {
             Message::TokenCreated {
                 token: "plaintext-secret".to_string(),
                 name: "new-tok".to_string(),
+                read_only: false,
             },
         );
         assert_eq!(
             state.tokens.last_minted_secret,
-            Some(("new-tok".to_string(), "plaintext-secret".to_string()))
+            Some(("new-tok".to_string(), "plaintext-secret".to_string(), false))
         );
         assert!(
             actions
@@ -1215,181 +1256,183 @@ mod tests {
         );
     }
 
-    // ── Pairing screen tests ──────────────────────────────────────────────────
+    // ── Token QR overlay tests ────────────────────────────────────────────────
 
-    #[test]
-    fn pair_p_key_bumps_seq_and_dispatches_start() {
-        let mut state = AppState::new();
-        state.screen = Screen::Pair;
-        let initial_seq = state.pairing.seq;
-        let actions = update(&mut state, Message::Key(key(KeyCode::Char('p'))));
-        assert_eq!(state.pairing.seq, initial_seq + 1);
-        assert!(actions.iter().any(
-            |a| matches!(a, UpdateAction::StartPairing { seq, .. } if *seq == state.pairing.seq)
-        ));
+    /// Seed `last_minted_secret` so the Tokens-screen `Enter` can open an overlay.
+    fn with_minted_secret(state: &mut AppState) {
+        state.screen = Screen::Tokens;
+        state.tokens.last_minted_secret =
+            Some(("my-tok".to_string(), "plaintext-secret".to_string(), false));
     }
 
     #[test]
-    fn pairing_ready_with_matching_seq_transitions_to_showing() {
+    fn tokens_enter_with_minted_secret_opens_overlay_and_dispatches_show() {
         let mut state = AppState::new();
-        state.screen = Screen::Pair;
-        state.pairing.seq = 7;
+        with_minted_secret(&mut state);
+        let before_seq = state.qr_seq;
+        let actions = update(&mut state, Message::Key(key(KeyCode::Enter)));
+        // The overlay is opened in the Generating phase.
+        let overlay = state.qr_overlay.as_ref().expect("overlay should be set");
+        assert!(matches!(overlay.phase, QrOverlayPhase::Generating));
+        assert_eq!(overlay.token_name, "my-tok");
+        assert_eq!(overlay.seq, before_seq + 1);
+        assert_eq!(state.qr_seq, before_seq + 1);
+        // A ShowTokenQr action with the matching seq + plaintext token is emitted.
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            UpdateAction::ShowTokenQr { token, seq, .. }
+                if token == "plaintext-secret" && *seq == overlay.seq
+        )));
+    }
+
+    #[test]
+    fn tokens_enter_without_minted_secret_is_noop() {
+        let mut state = AppState::new();
+        state.screen = Screen::Tokens;
+        state.tokens.last_minted_secret = None;
+        let actions = update(&mut state, Message::Key(key(KeyCode::Enter)));
+        assert!(state.qr_overlay.is_none());
+        assert!(!actions.iter().any(|a| matches!(a, UpdateAction::ShowTokenQr { .. })));
+    }
+
+    /// Open an overlay in the `Generating` phase with the given seq.
+    fn open_overlay(state: &mut AppState, seq: u64) {
+        state.qr_seq = seq;
+        state.qr_overlay = Some(QrOverlay {
+            phase: QrOverlayPhase::Generating,
+            seq,
+            baseline_clients: 0,
+            token_name: "my-tok".to_string(),
+            read_only: false,
+            tick_counter: 0,
+        });
+    }
+
+    #[test]
+    fn token_qr_ready_with_matching_seq_transitions_to_showing() {
+        let mut state = AppState::new();
+        open_overlay(&mut state, 7);
         update(
             &mut state,
-            Message::PairingReady {
+            Message::TokenQrReady {
                 uri: "zellimobile://pair?v=1".to_string(),
-                baseline_clients: 0,
                 host: "192.168.1.1".to_string(),
                 port: 50051,
                 fingerprint_short: "abcd1234…".to_string(),
-                token_name: "pair-7-1".to_string(),
+                baseline_clients: 2,
                 seq: 7,
             },
         );
-        assert!(matches!(state.pairing.phase, PairingPhase::Showing { .. }));
-        assert_eq!(
-            state.pairing.pending_token_name.as_deref(),
-            Some("pair-7-1")
-        );
+        let overlay = state.qr_overlay.as_ref().expect("overlay should remain");
+        assert!(matches!(overlay.phase, QrOverlayPhase::Showing { .. }));
+        assert_eq!(overlay.baseline_clients, 2);
     }
 
     #[test]
-    fn pairing_ready_with_stale_seq_is_ignored() {
+    fn token_qr_ready_with_stale_seq_is_ignored() {
         let mut state = AppState::new();
-        state.screen = Screen::Pair;
-        state.pairing.seq = 7; // current seq is 7
+        open_overlay(&mut state, 7); // current overlay seq is 7
         let actions = update(
             &mut state,
-            Message::PairingReady {
+            Message::TokenQrReady {
                 uri: "zellimobile://pair?v=1".to_string(),
-                baseline_clients: 0,
                 host: "192.168.1.1".to_string(),
                 port: 50051,
                 fingerprint_short: "abcd…".to_string(),
-                token_name: "pair-5-1".to_string(),
+                baseline_clients: 9,
                 seq: 5, // stale
             },
         );
-        // Phase should remain Idle (was not changed).
-        assert!(matches!(state.pairing.phase, PairingPhase::Idle));
-        // The orphaned token from the stale attempt is revoked.
-        assert!(matches!(
-            actions.as_slice(),
-            [UpdateAction::RevokePairingToken(name)] if name == "pair-5-1"
-        ));
+        // Phase unchanged (still Generating); NO action emitted, NO revoke — the
+        // shown token is a real user token and nothing was minted.
+        let overlay = state.qr_overlay.as_ref().expect("overlay should remain");
+        assert!(matches!(overlay.phase, QrOverlayPhase::Generating));
+        assert_eq!(overlay.baseline_clients, 0);
+        assert!(actions.is_empty());
     }
 
     #[test]
-    fn leave_during_generating_revokes_inflight_token_and_does_not_resurrect() {
-        // Regression (round-1 re-review Major): leaving the Pair screen while a
-        // StartPairing task is still in flight (phase Generating, no token yet)
-        // must invalidate that attempt so the late PairingReady revokes its
-        // minted token instead of resurrecting `Showing` off-screen.
+    fn token_qr_failed_with_matching_seq_sets_failed_phase() {
         let mut state = AppState::new();
-        state.screen = Screen::Pair;
-        state.pairing.phase = PairingPhase::Generating;
-        state.pairing.pending_token_name = None;
-        let seq_at_dispatch = state.pairing.seq;
-
-        // User tabs away mid-generation.
-        update(&mut state, Message::NavTo(Screen::Server));
-        assert_eq!(state.screen, Screen::Server);
-        assert!(matches!(state.pairing.phase, PairingPhase::Idle));
-        // seq was bumped, so the in-flight result is now stale.
-        assert_ne!(state.pairing.seq, seq_at_dispatch);
-
-        // The in-flight task completes and posts its result with the old seq.
-        let actions = update(
+        open_overlay(&mut state, 3);
+        update(
             &mut state,
-            Message::PairingReady {
-                uri: "zellimobile://pair?v=1".to_string(),
-                baseline_clients: 0,
-                host: "192.168.1.1".to_string(),
-                port: 50051,
-                fingerprint_short: "abcd…".to_string(),
-                token_name: "pair-leak".to_string(),
-                seq: seq_at_dispatch,
+            Message::TokenQrFailed {
+                err: "boom".to_string(),
+                seq: 3,
             },
         );
-        // No off-screen resurrection; the orphan token is revoked.
-        assert!(matches!(state.pairing.phase, PairingPhase::Idle));
-        assert!(state.pairing.pending_token_name.is_none());
-        assert!(matches!(
-            actions.as_slice(),
-            [UpdateAction::RevokePairingToken(name)] if name == "pair-leak"
-        ));
+        let overlay = state.qr_overlay.as_ref().expect("overlay should remain");
+        assert!(matches!(&overlay.phase, QrOverlayPhase::Failed { err } if err == "boom"));
     }
 
-    /// Build a `Showing` pairing phase for tests.
-    fn showing_phase(baseline: usize) -> PairingPhase {
-        PairingPhase::Showing {
+    /// Put the overlay into the `Showing` phase with the given baseline.
+    fn show_overlay(state: &mut AppState, baseline: usize) {
+        open_overlay(state, 1);
+        let overlay = state.qr_overlay.as_mut().unwrap();
+        overlay.baseline_clients = baseline;
+        overlay.phase = QrOverlayPhase::Showing {
             uri: "zellimobile://pair?v=1".to_string(),
-            baseline_clients: baseline,
             host: "192.168.1.1".to_string(),
             port: 50051,
             fingerprint_short: "abcd…".to_string(),
-            token_name: "pair-1-1".to_string(),
-        }
+        };
     }
 
     #[test]
-    fn pairing_connection_detected_when_client_count_rises() {
+    fn overlay_connection_detected_when_client_count_rises() {
         let mut state = AppState::new();
-        state.screen = Screen::Pair;
-        state.pairing.phase = showing_phase(2);
-        // one more than baseline
+        // Overlay can be up over any screen — connection detection is not gated by
+        // the active screen, only by the overlay being `Showing`.
+        state.screen = Screen::Tokens;
+        show_overlay(&mut state, 2);
         update(&mut state, Message::StatusLoaded(Some(server_info(3))));
-        assert!(matches!(state.pairing.phase, PairingPhase::Connected));
+        let overlay = state.qr_overlay.as_ref().expect("overlay should remain");
+        assert!(matches!(overlay.phase, QrOverlayPhase::Connected));
     }
 
     #[test]
-    fn pair_regenerate_revokes_prior_pending_token() {
-        // Review Major #4: regenerating must revoke the previously-minted token.
+    fn overlay_connection_not_detected_without_client_rise() {
         let mut state = AppState::new();
-        state.screen = Screen::Pair;
-        state.pairing.pending_token_name = Some("pair-1-1".to_string());
-        let actions = update(&mut state, Message::Key(key(KeyCode::Char('r'))));
-        // Both a revoke (of the old token) and a fresh StartPairing are emitted.
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, UpdateAction::RevokePairingToken(name) if name == "pair-1-1"))
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, UpdateAction::StartPairing { .. }))
-        );
-        // The pending name is cleared (it will be re-set by PairingReady).
-        assert!(state.pairing.pending_token_name.is_none());
-    }
-
-    #[test]
-    fn leaving_pair_screen_revokes_pending_token() {
-        // Review Major #8: an unused pairing token must be revoked on leave.
-        let mut state = AppState::new();
-        state.screen = Screen::Pair;
-        state.pairing.pending_token_name = Some("pair-3-9".to_string());
-        let actions = update(&mut state, Message::NavTo(Screen::Server));
-        assert_eq!(state.screen, Screen::Server);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, UpdateAction::RevokePairingToken(name) if name == "pair-3-9"))
-        );
-        assert!(state.pairing.pending_token_name.is_none());
-        assert!(matches!(state.pairing.phase, PairingPhase::Idle));
-    }
-
-    #[test]
-    fn pairing_connection_not_detected_off_pair_screen() {
-        // Same client-count rise, but we are NOT on the Pair screen — the
-        // heuristic must not fire (review Major #9: gate to Pair screen).
-        let mut state = AppState::new();
-        state.screen = Screen::Server;
-        state.pairing.phase = showing_phase(2);
+        show_overlay(&mut state, 3);
+        // Same count as baseline — no rise, no promotion.
         update(&mut state, Message::StatusLoaded(Some(server_info(3))));
-        assert!(matches!(state.pairing.phase, PairingPhase::Showing { .. }));
+        let overlay = state.qr_overlay.as_ref().expect("overlay should remain");
+        assert!(matches!(overlay.phase, QrOverlayPhase::Showing { .. }));
+    }
+
+    #[test]
+    fn esc_closes_overlay_with_no_revoke_action() {
+        let mut state = AppState::new();
+        show_overlay(&mut state, 0);
+        let actions = update(&mut state, Message::Key(key(KeyCode::Esc)));
+        // Overlay is gone, and NO action (no revoke, no ShowTokenQr) is emitted —
+        // the shown token is a real user token that must never be revoked on close.
+        assert!(state.qr_overlay.is_none());
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn q_closes_overlay_without_quitting() {
+        let mut state = AppState::new();
+        show_overlay(&mut state, 0);
+        let actions = update(&mut state, Message::Key(key(KeyCode::Char('q'))));
+        // `q` is intercepted by the overlay → closes it rather than quitting.
+        assert!(state.qr_overlay.is_none());
+        assert!(!state.should_quit);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn tab_is_swallowed_while_overlay_open() {
+        let mut state = AppState::new();
+        state.screen = Screen::Tokens;
+        show_overlay(&mut state, 0);
+        let actions = update(&mut state, Message::Key(key(KeyCode::Tab)));
+        // No screen navigation behind the overlay; the overlay stays up.
+        assert_eq!(state.screen, Screen::Tokens);
+        assert!(state.qr_overlay.is_some());
+        assert!(actions.is_empty());
     }
 
     #[test]

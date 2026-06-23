@@ -73,38 +73,37 @@ pub enum Message {
         token: String,
         /// The display name assigned to the new token.
         name: String,
+        /// Whether the new token grants read-only access.
+        read_only: bool,
     },
 
     /// A token operation (create/revoke) completed; the list needs a refresh.
     TokensChanged,
 
-    // ── Pairing screen messages ───────────────────────────────────────────────
-    /// Pairing QR is ready: URI to encode + client baseline to detect connection.
+    // ── Token QR overlay messages ─────────────────────────────────────────────
+    /// The token QR overlay URI is ready: URI to encode + client baseline.
     ///
-    /// Only accepted if the carried `seq` matches the current pairing seq.
-    PairingReady {
+    /// Only accepted if the carried `seq` matches the current overlay's seq.
+    TokenQrReady {
         /// The `zellimobile://pair?...` URI to encode into a QR.
         uri: String,
-        /// Number of mobile clients attached when the QR was generated.
-        baseline_clients: usize,
         /// The advertise host that was embedded in the URI.
         host: String,
         /// The port embedded in the URI.
         port: u16,
         /// Short fingerprint excerpt for display below the QR.
         fingerprint_short: String,
-        /// Name of the pairing token minted for this QR (carried so a later
-        /// regenerate / screen-leave can revoke it).
-        token_name: String,
-        /// Sequence number (must match current pairing seq to be accepted).
+        /// Number of mobile clients attached when the QR was generated.
+        baseline_clients: usize,
+        /// Sequence number (must match current overlay seq to be accepted).
         seq: u64,
     },
 
-    /// Pairing generation failed; carries human-readable error + seq.
-    PairingFailed {
+    /// Token QR generation failed; carries human-readable error + seq.
+    TokenQrFailed {
         /// Error message to display.
         err: String,
-        /// Sequence number (must match current pairing seq to be accepted).
+        /// Sequence number (must match current overlay seq to be accepted).
         seq: u64,
     },
 

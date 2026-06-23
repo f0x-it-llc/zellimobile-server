@@ -1,7 +1,9 @@
 //! Screen rendering. Dispatches on [`crate::app::state::Screen`].
 //!
 //! The dashboard module owns the shared chrome (title bar, tab list, footer).
-//! Config, Cert, Server, Tokens, and Pair screens render their own body panels.
+//! Config, Cert, Server, and Tokens screens render their own body panels.
+//! The QR overlay is a fullscreen layer that paints over the active screen
+//! when `state.qr_overlay` is `Some`.
 
 use ratatui::Frame;
 
@@ -11,7 +13,7 @@ use crate::app::state::Screen;
 pub mod cert;
 pub mod config;
 pub mod dashboard;
-pub mod pairing;
+pub mod qr_overlay;
 pub mod server;
 pub mod tokens;
 
@@ -19,8 +21,13 @@ pub mod tokens;
 ///
 /// The shared chrome (title bar + tab list + footer) always comes from the
 /// dashboard module. Each screen then renders its own body into the body area.
+/// After the base chrome is drawn, if a QR overlay is open it is painted
+/// fullscreen over the entire frame.
 pub fn render(frame: &mut Frame, state: &AppState) {
     dashboard::render(frame, state, frame.area());
+    if let Some(ref ov) = state.qr_overlay {
+        qr_overlay::render(frame, ov, frame.area());
+    }
 }
 
 /// Render the body panel for the active screen.
@@ -33,7 +40,6 @@ pub fn render_screen_body(frame: &mut Frame, state: &AppState, area: ratatui::la
         Screen::Cert => cert::render(frame, state, area),
         Screen::Server => server::render(frame, state, area),
         Screen::Tokens => tokens::render(frame, state, area),
-        Screen::Pair => pairing::render(frame, state, area),
         Screen::Dashboard => dashboard::render_overview(frame, state, area),
     }
 }

@@ -135,14 +135,13 @@ impl ZelliService {
         validate_session(&req.session)?;
         let session = req.session;
         log::info!("KillSession: session='{session}'");
-        let ack = tokio::task::spawn_blocking(move || actions::kill_session(&session))
+        tokio::task::spawn_blocking(move || actions::kill_session(&session))
             .await
             .map_err(|e| Status::internal(format!("KillSession task panicked: {e}")))?
             .map_err(|e| {
                 log::warn!("KillSession: failed: {e:#}");
                 Status::internal(format!("KillSession: {e:#}"))
             })?;
-        let _ = ack;
         Ok(Response::new(ProtoAck {
             ok: true,
             error: String::new(),

@@ -17,8 +17,8 @@
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! When the Pair screen is active the tab column is suppressed (full-width for
-//! the QR code); the Pair screen's own combined strip carries the screen label.
+//! The QR overlay (when open) is painted fullscreen over this chrome by
+//! [`super::render`] after `dashboard::render` returns.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -32,11 +32,9 @@ use crate::tui::theme::{palette, styles};
 
 /// Render the dashboard chrome and the active-screen body.
 ///
-/// On the Pair screen the global footer row is suppressed: the Pair screen's
-/// combined strip already carries the key-binding hints, so the footer is
-/// redundant.  Suppressing it reclaims 1 row for the QR body, giving
-/// `phase_body.height = total − 1(title) − 1(strip)` instead of
-/// `total − 1(title) − 1(footer) − 1(strip)`.
+/// Always uses the standard title / body / footer layout.  The QR overlay
+/// (when open) is painted over this chrome by [`super::render`] after this
+/// function returns — it does not need to suppress the footer.
 pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
     // Paint the base background across the whole area first.
     frame.render_widget(
@@ -44,32 +42,18 @@ pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
         area,
     );
 
-    if state.screen == Screen::Pair {
-        // Pair screen: suppress the global footer to reclaim 1 row for the QR.
-        // The Pair combined strip carries its own key-binding hints.
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // title bar
-                Constraint::Min(3),    // body (no footer)
-            ])
-            .split(area);
-        render_title(frame, rows[0]);
-        render_body(frame, state, rows[1]);
-    } else {
-        // All other screens: standard title / body / footer layout.
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        render_title(frame, rows[0]);
-        render_body(frame, state, rows[1]);
-        render_footer(frame, rows[2]);
-    }
+    // Standard title / body / footer layout for all screens.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    render_title(frame, rows[0]);
+    render_body(frame, state, rows[1]);
+    render_footer(frame, rows[2]);
 }
 
 /// Top title bar.
@@ -86,36 +70,17 @@ fn render_title(frame: &mut Frame, area: Rect) {
 
 /// Body: a left tab column + the active-screen body panel.
 ///
-/// When the Pair screen is active the tab column is suppressed so the QR +
-/// info layout has the full terminal width.  No breadcrumb row is used here —
-/// the Pair screen's combined strip carries the "Pair" label in its single
-/// strip row, reclaiming that row for the QR body.
-///
-/// Row budget for the Pair screen (footer suppressed in `render`):
-/// ```text
-///   title(1) + body(total−1) → pair_area = body
-///   pairing::render: phase_body(Min 3) + strip(1) → phase_body = body − 1
-/// ```
-/// The real production pairing URI (~185 bytes) encodes to QR version 8
-/// (49 modules, block ≈ 57 cols × 27 rows including quiet zone).  At terminal
-/// width ≥ 85 cols the Showing phase uses a side-by-side split; the QR renders
-/// when `phase_body.height ≥ 27` (total ≥ 29 rows).  At 80×24 the block
-/// (27 rows) exceeds the phase_body (22 rows), so the fallback text renders.
+/// The tab column (18 cols) is always shown; the QR overlay paints over the
+/// whole frame from [`super::render`] when needed.
 fn render_body(frame: &mut Frame, state: &AppState, area: Rect) {
-    if state.screen == Screen::Pair {
-        // Full-width body for the Pair screen: pass the entire body area
-        // directly to the pairing renderer (no breadcrumb row consumed).
-        crate::tui::screens::render_screen_body(frame, state, area);
-    } else {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(18), Constraint::Min(20)])
-            .split(area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(18), Constraint::Min(20)])
+        .split(area);
 
-        render_tabs(frame, state, cols[0]);
-        // Delegate to the screens module which dispatches per-screen renders.
-        crate::tui::screens::render_screen_body(frame, state, cols[1]);
-    }
+    render_tabs(frame, state, cols[0]);
+    // Delegate to the screens module which dispatches per-screen renders.
+    crate::tui::screens::render_screen_body(frame, state, cols[1]);
 }
 
 /// Left tab list. The active screen is teal+bold; others are muted.
@@ -295,11 +260,9 @@ fn render_overview_hints(frame: &mut Frame, area: Rect) {
         Span::styled("Cert", styles::accent()),
         Span::styled(" gen  ", styles::muted()),
         Span::styled("Tokens", styles::accent()),
-        Span::styled(" manage  ", styles::muted()),
+        Span::styled(" manage + pair  ", styles::muted()),
         Span::styled("Server", styles::accent()),
-        Span::styled(" start/stop  ", styles::muted()),
-        Span::styled("Pair", styles::accent()),
-        Span::styled(" QR", styles::muted()),
+        Span::styled(" start/stop", styles::muted()),
     ]);
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().bg(palette::BG_SURFACE)),
