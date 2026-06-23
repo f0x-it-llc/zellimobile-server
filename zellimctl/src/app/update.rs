@@ -286,6 +286,14 @@ fn handle_tick(state: &mut AppState) -> Vec<UpdateAction> {
         }
     }
 
+    if state.screen == Screen::Dashboard && !state.server.loading {
+        state.server.tick_counter = state.server.tick_counter.wrapping_add(1);
+        if state.server.tick_counter.is_multiple_of(20) {
+            state.server.loading = true;
+            actions.push(UpdateAction::RefreshStatus);
+        }
+    }
+
     if state.screen == Screen::Pair {
         // Poll status while showing a QR so we can detect when a client connects.
         if let PairingPhase::Showing { .. } = &state.pairing.phase {
@@ -870,6 +878,31 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, UpdateAction::RefreshStatus))
+        );
+    }
+
+    #[test]
+    fn tick_triggers_refresh_on_dashboard_screen_after_20() {
+        // Mirror of tick_triggers_refresh_on_server_screen_after_20 but for
+        // Screen::Dashboard — confirms daemon-status live polling on the overview.
+        let mut state = AppState::new();
+        state.screen = Screen::Dashboard;
+        state.server.loading = false;
+        // Drive 19 ticks — no refresh yet.
+        for _ in 0..19 {
+            let actions = update(&mut state, Message::Tick);
+            assert!(
+                actions.is_empty(),
+                "expected no action before tick 20; got: {actions:?}"
+            );
+        }
+        // 20th tick → RefreshStatus.
+        let actions = update(&mut state, Message::Tick);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::RefreshStatus)),
+            "expected RefreshStatus on 20th tick; got: {actions:?}"
         );
     }
 

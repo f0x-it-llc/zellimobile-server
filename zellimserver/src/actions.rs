@@ -13,7 +13,7 @@
 //!   - `Log { lines }`       carrying any `stdout_message`, then
 //!   - `Log { lines }`       carrying the affected **tab id** (tab ops), then
 //!   - `Log { lines }`       carrying the affected **pane id** (e.g. a new pane,
-//!                           format `terminal_<n>` / `plugin_<n>`).
+//!     format `terminal_<n>` / `plugin_<n>`).
 //!
 //! Then, *after every* routed client message, the route loop unconditionally
 //! sends `ServerToClientMsg::UnblockInputThread` (route.rs:2661).  That message
@@ -449,10 +449,10 @@ pub fn create_session(name: &str, layout: Option<String>) -> Result<ActionAck> {
     cmd.arg("attach");
     cmd.arg("--create");
     cmd.arg(name);
-    if let Some(ref layout_path) = layout {
-        if !layout_path.is_empty() {
-            cmd.args(["--layout", layout_path]);
-        }
+    if let Some(ref layout_path) = layout
+        && !layout_path.is_empty()
+    {
+        cmd.args(["--layout", layout_path]);
     }
     // Detach stdin/stdout/stderr so the process doesn't inherit ours.
     cmd.stdin(Stdio::null())
@@ -473,7 +473,7 @@ pub fn create_session(name: &str, layout: Option<String>) -> Result<ActionAck> {
         cmd.pre_exec(|| {
             // First fork: detach zellij from the intermediate child.
             match libc::fork() {
-                -1 => return Err(std::io::Error::last_os_error()),
+                -1 => Err(std::io::Error::last_os_error()),
                 0 => {
                     // Grandchild: become a session leader, then fall through to
                     // exec(zellij).  Check setsid()'s return (minor fix).

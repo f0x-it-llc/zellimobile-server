@@ -23,6 +23,7 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 
 use crate::app::{AppState, Message, UpdateAction, update};
+use crate::app::state::Screen;
 
 /// Poll cadence / tick interval.
 const TICK: Duration = Duration::from_millis(50);
@@ -36,6 +37,11 @@ const CHANNEL_CAPACITY: usize = 256;
 /// into each async [`UpdateAction`] task so results post back into the loop.
 pub fn run(terminal: &mut DefaultTerminal, state: &mut AppState) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Message>(CHANNEL_CAPACITY);
+
+    // Seed the initial dashboard load: lands on Dashboard via AppState::new but the
+    // loop starts with an empty channel, so on_enter_screen(Dashboard) (which emits
+    // RefreshStatus/LoadConfig/LoadTokens/LoadCertInfo) must be triggered explicitly.
+    let _ = tx.try_send(Message::NavTo(Screen::Dashboard));
 
     while !state.should_quit {
         // (1) Drain all pending messages and run the update cycle.
