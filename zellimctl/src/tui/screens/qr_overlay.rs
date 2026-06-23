@@ -19,14 +19,11 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::state::{QrOverlay, QrOverlayPhase};
 use crate::tui::theme::{palette, styles};
 use crate::tui::widgets::qr::QrWidget;
-
-/// Minimum width of the info panel (right-hand side in side-by-side layout).
-const INFO_MIN_WIDTH: u16 = 28;
 
 /// Render the QR overlay fullscreen over `area`.
 ///
@@ -41,6 +38,14 @@ const INFO_MIN_WIDTH: u16 = 28;
 /// └────────────────────────────────────────────────────────────────────┘
 /// ```
 pub fn render(frame: &mut Frame, overlay: &QrOverlay, area: Rect) {
+    // Paint a solid opaque background across the whole overlay FIRST so the
+    // screen drawn underneath (dashboard chrome / overview text) never bleeds
+    // through the margins around the QR.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette::BG_BASE)),
+        area,
+    );
+
     // Vertical layout: phase body / bottom strip.
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -89,15 +94,13 @@ fn render_generating(frame: &mut Frame, area: Rect) {
     );
 }
 
-/// Showing phase: render the QR code and connection metadata.
+/// Showing phase: render the QR code centered, with the connection metadata as a
+/// caption below it.
 ///
-/// Layout strategy:
-/// - **Side-by-side** (preferred): QR on the left (sized to its block width),
-///   info panel on the right.  This keeps the info rows from consuming height
-///   budget, so a standard 80×24 terminal fits.
-/// - **Vertical fallback**: when the available width is too narrow for a
-///   side-by-side split (QR block width + `INFO_MIN_WIDTH`), the info is
-///   rendered below the QR as before.
+/// The overlay is fullscreen, so the QR gets a full-width region and
+/// [`QrWidget`] centers the block horizontally (and vertically) within it; the
+/// info caption sits below, center-aligned. On a terminal too small for the
+/// matrix, `QrWidget` falls back to printing the raw URI itself.
 fn render_showing(
     frame: &mut Frame,
     uri: &str,
@@ -108,37 +111,18 @@ fn render_showing(
 ) {
     let qr = QrWidget::new(uri);
 
-    // Determine the QR block width so we can decide on layout.
-    let qr_block_w = qr.block_width().unwrap_or(41);
+    // QR region (centered, full width) on top; a fixed info caption below.
+    let info_rows = 5u16;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(13), Constraint::Length(info_rows)])
+        .split(area);
 
-    let side_by_side = area.width >= qr_block_w.saturating_add(INFO_MIN_WIDTH);
-
-    if side_by_side {
-        // Horizontal split: QR left (fixed cols), info right (remainder).
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(qr_block_w), Constraint::Min(0)])
-            .split(area);
-
-        // Give the QR widget the full available height.
-        qr.render(frame, cols[0]);
-        render_info_panel(frame, host, port, fingerprint_short, cols[1]);
-    } else {
-        // Vertical fallback: QR above, info below.
-        let info_rows = 5u16;
-        let qr_rows = area.height.saturating_sub(info_rows).max(13);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(qr_rows), Constraint::Min(0)])
-            .split(area);
-
-        qr.render(frame, chunks[0]);
-        render_info_panel(frame, host, port, fingerprint_short, chunks[1]);
-    }
+    qr.render(frame, chunks[0]);
+    render_info_panel(frame, host, port, fingerprint_short, chunks[1]);
 }
 
-/// Info panel: host:port, certificate fingerprint, scan prompt.
+/// Info caption (centered, below the QR): host:port, cert fingerprint, scan prompt.
 fn render_info_panel(
     frame: &mut Frame,
     host: &str,
@@ -147,29 +131,22 @@ fn render_info_panel(
     area: Rect,
 ) {
     let info_lines = vec![
-        Line::from(""),
         Line::from(vec![
-            Span::styled("  Server: ", styles::muted()),
+            Span::styled("Server: ", styles::muted()),
             Span::styled(format!("{host}:{port}"), styles::accent()),
-        ]),
-        Line::from(vec![
-            Span::styled("  Cert:   ", styles::muted()),
+            Span::styled("   Cert: ", styles::muted()),
             Span::styled(fingerprint_short, styles::body()),
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Scan with the Zelli app",
-            styles::muted(),
-        )),
-        Line::from(Span::styled(
-            "  to connect…",
+            "Scan with the Zelli app to connect…",
             styles::muted(),
         )),
     ];
     frame.render_widget(
         Paragraph::new(info_lines)
-            .alignment(Alignment::Left)
-            .style(Style::default().bg(palette::BG_SURFACE)),
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(palette::BG_BASE)),
         area,
     );
 }

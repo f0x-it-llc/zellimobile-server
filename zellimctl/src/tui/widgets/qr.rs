@@ -95,6 +95,10 @@ impl QrWidget {
     ///
     /// Reads the single cached [`QrCode`] stored in `self.code`; does not
     /// re-encode the payload.
+    ///
+    /// Retained for measurement and the layout-fit guard test; the fullscreen
+    /// overlay no longer needs it for layout decisions (`QrWidget` self-centers).
+    #[allow(dead_code)]
     pub(crate) fn block_size(&self) -> Option<(u16, u16)> {
         let qr = self.code.as_ref()?;
         let qr_widget = QrCodeWidget::new(qr.clone())
@@ -115,6 +119,7 @@ impl QrWidget {
     /// happen for well-formed `zellimobile://` URIs).
     ///
     /// Implemented via [`block_size`]; reads the single cached `QrCode`.
+    #[allow(dead_code)]
     pub fn block_width(&self) -> Option<u16> {
         self.block_size().map(|(w, _)| w)
     }
