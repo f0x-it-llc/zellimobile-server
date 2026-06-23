@@ -37,7 +37,7 @@ pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
     //  - status line
     //  - hints
     let secret_height: u16 = if state.tokens.last_minted_secret.is_some() {
-        4
+        5
     } else {
         0
     };
@@ -71,7 +71,7 @@ pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
 
 /// Render the one-time minted-secret banner.
 fn render_secret_banner(frame: &mut Frame, state: &AppState, area: Rect) {
-    if let Some((name, secret)) = &state.tokens.last_minted_secret {
+    if let Some((name, secret, _read_only)) = &state.tokens.last_minted_secret {
         let block = styles::panel(false).title(Span::styled(
             " New Token — copy now, shown once! ",
             styles::status_warn(),
@@ -87,6 +87,11 @@ fn render_secret_banner(frame: &mut Frame, state: &AppState, area: Rect) {
             Line::from(vec![
                 Span::styled("  Secret: ", styles::muted()),
                 Span::styled(secret.as_str(), styles::accent_bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", styles::muted()),
+                Span::styled("Enter", styles::accent()),
+                Span::styled(" → Show pairing QR (fullscreen)", styles::muted()),
             ]),
         ];
         frame.render_widget(
@@ -217,6 +222,8 @@ fn render_hints(frame: &mut Frame, phase: TokensFormPhase, area: Rect) {
             Span::styled(" refresh  ", styles::muted()),
             Span::styled("j/k", styles::accent()),
             Span::styled(" move  ", styles::muted()),
+            Span::styled("Enter", styles::accent()),
+            Span::styled(" show QR  ", styles::muted()),
             Span::styled("Esc", styles::accent()),
             Span::styled(" dismiss secret", styles::muted()),
         ]),

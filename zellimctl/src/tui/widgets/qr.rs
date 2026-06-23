@@ -60,6 +60,10 @@ pub(crate) const MIN_HEIGHT: u16 = 19;
 /// double-encode per frame and measurement and rendering always reason about
 /// the same matrix.
 ///
+/// The widget is used by the fullscreen QR overlay
+/// ([`crate::tui::screens::qr_overlay`]) when a token is freshly minted and
+/// the user opens the overlay to pair a mobile client.
+///
 /// The widget stores the payload so it can also render it as plain text in the
 /// fallback path when the terminal is too small.
 pub struct QrWidget {
@@ -266,7 +270,7 @@ mod tests {
     }
 
     /// Guardrail: a real-length pairing payload encodes and its block dimensions
-    /// fit the layout the Pair screen provides.
+    /// fit the layout the fullscreen QR overlay provides.
     ///
     /// ## What "real payload" means
     ///
@@ -281,16 +285,11 @@ mod tests {
     /// (~185/194 bytes); a materially longer label or token could bump the
     /// version to 9 (53 modules, block 61×29) — documented risk, no code change.
     ///
-    /// ## Layout chain (Pair screen, Showing phase)
+    /// ## Layout chain (fullscreen QR overlay, Showing phase)
     ///
-    /// `dashboard::render` with footer suppressed on the Pair screen:
+    /// `qr_overlay::render` receives the full frame area and splits borderless:
     /// ```text
-    ///   title(1) + body(h-1) + footer(0, suppressed for Pair)
-    /// ```
-    /// `render_body(Pair)` passes the full body to `pairing::render` (no breadcrumb).
-    /// `pairing::render` splits:
-    /// ```text
-    ///   phase_body(Min 3) + combined_strip(1)
+    ///   phase_body(Min 3) + bottom_strip(1)
     /// ```
     /// `render_showing` (Showing phase) uses a horizontal side-by-side split when
     /// `area.width >= qr_block_w + INFO_MIN_WIDTH (28)`:
@@ -303,15 +302,11 @@ mod tests {
     /// block width exactly, and the height equals `phase_body.height`.  This test
     /// uses 90×30 to trigger the side-by-side path (80 cols is too narrow).
     ///
-    /// ## Footer suppression and the +1 margin
+    /// ## Margin calculation
     ///
-    /// `dashboard::render` suppresses the global footer row when `Screen::Pair` is
-    /// active, giving `phase_body.height = (total − 1(title) − 1(strip)) = total − 2`
-    /// instead of the non-Pair `total − 3`.  At 90×30:
-    ///   - with footer: phase_body = 30 − 1 − 1 − 1 = 27 → margin 0
-    ///   - without footer (Pair): phase_body = 30 − 1 − 1 = 28 → margin 1
-    ///
-    /// The assertion `block_h ≤ phase_body.height` fails without footer suppression.
+    /// `qr_overlay::render` receives the full frame (no title/footer deduction),
+    /// giving `phase_body.height = frame_height − 1(bottom_strip)`.  At 90×30:
+    ///   phase_body = 30 − 1 = 29 → margin = 29 − 27 = 2 rows.
     #[test]
     fn layout_80x24_phase_body_fits_qr() {
         use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -339,37 +334,25 @@ mod tests {
         //
         // Use a 90×30 terminal: wide enough for the side-by-side split
         // (needs ≥ 85 cols = block_w(57) + INFO_MIN_WIDTH(28)) and tall enough
-        // for the block (≥ block_h(27) + 1 title + 1 strip + 1 margin = 30).
-        // At 80×24 the block (27 rows) exceeds the phase_body (22 rows), so the
+        // for the block (≥ block_h(27) + 1 bottom_strip + 2 margin = 30).
+        // At 80×24 the block (27 rows) exceeds the phase_body (23 rows), so the
         // fallback text renders; 90×30 is the minimum for the QR to render.
         let frame_area = Rect::new(0, 0, 90, 30);
 
-        // Step 1: dashboard::render — title(1) + body(Min 3) + footer suppressed
-        // for Pair screen (0 rows).
-        let dashboard_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // title bar
-                Constraint::Min(3),    // body
-                // footer is suppressed on the Pair screen
-            ])
-            .split(frame_area);
-        let body = dashboard_rows[1]; // 29 rows, 90 cols
+        // Step 1: qr_overlay::render receives the full frame area (fullscreen).
+        let overlay_area = frame_area;
 
-        // Step 2: render_body(Pair) — no breadcrumb, full body → pairing::render.
-        let pair_area = body;
-
-        // Step 3: pairing::render — borderless, phase_body + combined strip.
-        let pair_rows = Layout::default()
+        // Step 2: qr_overlay::render — borderless, phase_body + bottom_strip.
+        let overlay_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),    // phase body
-                Constraint::Length(1), // combined status+hints strip
+                Constraint::Length(1), // bottom strip (Esc + ro)
             ])
-            .split(pair_area);
-        let phase_body = pair_rows[0]; // 28 rows, 90 cols
+            .split(overlay_area);
+        let phase_body = overlay_rows[0]; // 29 rows, 90 cols
 
-        // Step 4: render_showing (side-by-side) — QR gets the left column.
+        // Step 3: render_showing (side-by-side) — QR gets the left column.
         // qr_block_w = block_w (57); INFO_MIN_WIDTH = 28; 90 >= 57+28 → side-by-side.
         let qr_col_share = block_w; // cols[0].width == qr_block_w == block_w
         let qr_col_height = phase_body.height;
@@ -383,7 +366,7 @@ mod tests {
         assert!(
             block_h <= qr_col_height,
             "block_h ({block_h}) must be <= phase_body.height ({qr_col_height}); \
-             footer suppression gives +1 row margin (margin = {})",
+             overlay gives +2 row margin (margin = {})",
             qr_col_height.saturating_sub(block_h),
         );
         // Verify ≥1 row margin.

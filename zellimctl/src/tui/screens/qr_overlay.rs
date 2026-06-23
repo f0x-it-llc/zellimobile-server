@@ -1,18 +1,19 @@
-//! Pairing screen — generates a QR code for scanning from the mobile app.
+//! QR overlay — renders the fullscreen pairing QR for an already-minted token.
 //!
 //! ## Phase machine
 //!
 //! ```text
-//! Idle ──(p/Enter)──► Generating ──(PairingReady)──► Showing ──(client count rises)──► Connected
-//!                                  └──(PairingFailed)──► Failed
-//!
-//! From any phase: r / p / g regenerates (bumps seq, goes back to Generating).
+//! Generating ──(QrOverlayReady)──► Showing ──(client count rises)──► Connected
+//!             └──(QrOverlayFailed)──► Failed
 //! ```
 //!
-//! ## Key bindings
-//! - `p`/`Enter`/`g`: start or regenerate pairing.
-//! - `r`: regenerate (same as `p`).
-//! - `Space`: toggle read-only for the next generated token.
+//! This module only knows about [`QrOverlay`] — it never reads `AppState`
+//! directly and has no knowledge of `Screen`.  It is invoked as a fullscreen
+//! overlay painted over the active screen body by the top-level `render` in
+//! [`super`] after `dashboard::render` has drawn the underlying chrome.
+//!
+//! ## Key bindings (handled by the update layer, shown here for reference)
+//! - `Esc`: close the overlay (token is **not** revoked).
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -20,85 +21,52 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::AppState;
-use crate::app::state::PairingPhase;
+use crate::app::state::{QrOverlay, QrOverlayPhase};
 use crate::tui::theme::{palette, styles};
 use crate::tui::widgets::qr::QrWidget;
 
 /// Minimum width of the info panel (right-hand side in side-by-side layout).
 const INFO_MIN_WIDTH: u16 = 28;
 
-/// Render the Pair screen.
+/// Render the QR overlay fullscreen over `area`.
 ///
 /// Layout (borderless — no `Borders::ALL` cost — so the QR body gets the
 /// full height):
 ///
 /// ```text
 /// ┌── phase body (Min 3) ──────────────────────────────────────────────┐
-/// │  QR / idle / generating / connected / failed                        │
-/// ├── combined strip (1) ──────────────────────────────────────────────┤
-/// │  ro=on|off  phase  │  p/Enter generate  r regen  Space toggle-ro   │
+/// │  QR / generating / connected / failed                               │
+/// ├── bottom strip (1) ─────────────────────────────────────────────────┤
+/// │  Esc close · ro=<on|off>                                            │
 /// └────────────────────────────────────────────────────────────────────┘
 /// ```
-///
-/// At 80×24 the phase body receives 21 rows (≥ `QrWidget::MIN_HEIGHT` 19).
-pub fn render(frame: &mut Frame, state: &AppState, area: Rect) {
-    // Borderless — dropping Borders::ALL saves 2 rows, letting the QR body
-    // fill the full area height at 80×24 (21 rows ≥ MIN_HEIGHT 19).
-    // A header label is rendered inline in the combined strip instead.
-
-    // Vertical layout: phase body / combined status+hints strip.
+pub fn render(frame: &mut Frame, overlay: &QrOverlay, area: Rect) {
+    // Vertical layout: phase body / bottom strip.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),    // phase body
-            Constraint::Length(1), // combined status/toggle + hints
+            Constraint::Length(1), // bottom strip (Esc + ro)
         ])
         .split(area);
 
-    render_phase_body(frame, state, rows[0]);
-    render_combined_strip(frame, state, rows[1]);
+    render_phase_body(frame, overlay, rows[0]);
+    render_bottom_strip(frame, overlay, rows[1]);
 }
 
-/// Render the main body depending on the current phase.
-fn render_phase_body(frame: &mut Frame, state: &AppState, area: Rect) {
-    match &state.pairing.phase {
-        PairingPhase::Idle => render_idle(frame, area),
-        PairingPhase::Generating => render_generating(frame, area),
-        PairingPhase::Showing {
+/// Render the main body depending on the current overlay phase.
+fn render_phase_body(frame: &mut Frame, overlay: &QrOverlay, area: Rect) {
+    match &overlay.phase {
+        QrOverlayPhase::Generating => render_generating(frame, area),
+        QrOverlayPhase::Showing {
             uri,
             host,
             port,
             fingerprint_short,
-            ..
         } => render_showing(frame, uri, host, *port, fingerprint_short, area),
-        PairingPhase::Connected => render_connected(frame, area),
-        PairingPhase::Failed { err } => render_failed(frame, err, area),
+        QrOverlayPhase::Connected => render_connected(frame, area),
+        QrOverlayPhase::Failed { err } => render_failed(frame, err, area),
     }
-}
-
-/// Idle phase: prompt the user to press p.
-fn render_idle(frame: &mut Frame, area: Rect) {
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Press p or Enter to generate a pairing QR code.",
-            styles::muted(),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  The code encodes a one-time token and the server address.",
-            styles::muted(),
-        )),
-        Line::from(Span::styled(
-            "  Scan it from the Zelli mobile app to connect automatically.",
-            styles::muted(),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(palette::BG_SURFACE)),
-        area,
-    );
 }
 
 /// Generating phase: show a spinner/progress message.
@@ -111,7 +79,7 @@ fn render_generating(frame: &mut Frame, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  Ensuring TLS cert, minting token, building QR…",
+            "  Ensuring TLS cert, building QR…",
             styles::muted(),
         )),
     ];
@@ -223,7 +191,7 @@ fn render_connected(frame: &mut Frame, area: Rect) {
             styles::muted(),
         )),
         Line::from(Span::styled(
-            "  Press r to generate a new pairing code.",
+            "  Press Esc to close the overlay.",
             styles::muted(),
         )),
     ];
@@ -239,10 +207,10 @@ fn render_connected(frame: &mut Frame, area: Rect) {
 fn render_failed(frame: &mut Frame, err: &str, area: Rect) {
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled("  Pairing failed:", styles::status_err())),
+        Line::from(Span::styled("  QR generation failed:", styles::status_err())),
         Line::from(Span::styled(format!("  {err}"), styles::body())),
         Line::from(""),
-        Line::from(Span::styled("  Press r to retry.", styles::muted())),
+        Line::from(Span::styled("  Press Esc to close.", styles::muted())),
     ];
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(palette::BG_SURFACE)),
@@ -250,39 +218,20 @@ fn render_failed(frame: &mut Frame, err: &str, area: Rect) {
     );
 }
 
-/// Combined status-strip + key-binding hints (one row).
-///
-/// Merging the former two-row status-strip + hints block into a single line
-/// reclaims 2 rows for the QR body.  The read-only toggle state and the key
-/// hints are all short enough to fit on one 80-column line.
-fn render_combined_strip(frame: &mut Frame, state: &AppState, area: Rect) {
-    let ro_span = if state.pairing.read_only {
-        Span::styled("ro=on", styles::status_warn())
+/// Bottom strip: `Esc close · ro=<on|off> · <token_name>`.
+fn render_bottom_strip(frame: &mut Frame, overlay: &QrOverlay, area: Rect) {
+    let ro_span = if overlay.read_only {
+        Span::styled("on", styles::status_warn())
     } else {
-        Span::styled("ro=off", styles::status_ok())
-    };
-
-    let phase_tag = match &state.pairing.phase {
-        PairingPhase::Idle => "idle",
-        PairingPhase::Generating => "generating",
-        PairingPhase::Showing { .. } => "showing",
-        PairingPhase::Connected => "connected",
-        PairingPhase::Failed { .. } => "failed",
+        Span::styled("off", styles::status_ok())
     };
 
     let line = Line::from(vec![
-        Span::styled(" Pair ", styles::heading()),
-        Span::styled("·  ro=", styles::muted()),
+        Span::styled(" Esc", styles::accent()),
+        Span::styled(" close  ·  ro=", styles::muted()),
         ro_span,
-        Span::styled("  phase:", styles::muted()),
-        Span::styled(phase_tag, styles::accent()),
-        Span::styled("  │  ", styles::muted()),
-        Span::styled("p/Enter", styles::accent()),
-        Span::styled(" gen  ", styles::muted()),
-        Span::styled("r", styles::accent()),
-        Span::styled(" regen  ", styles::muted()),
-        Span::styled("Space", styles::accent()),
-        Span::styled(" toggle ro", styles::muted()),
+        Span::styled("  ·  ", styles::muted()),
+        Span::styled(overlay.token_name.as_str(), styles::accent()),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
