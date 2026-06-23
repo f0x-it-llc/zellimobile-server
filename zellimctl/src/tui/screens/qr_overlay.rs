@@ -19,7 +19,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::state::{QrOverlay, QrOverlayPhase};
 use crate::tui::theme::{palette, styles};
@@ -38,9 +38,12 @@ use crate::tui::widgets::qr::QrWidget;
 /// └────────────────────────────────────────────────────────────────────┘
 /// ```
 pub fn render(frame: &mut Frame, overlay: &QrOverlay, area: Rect) {
-    // Paint a solid opaque background across the whole overlay FIRST so the
-    // screen drawn underneath (dashboard chrome / overview text) never bleeds
-    // through the margins around the QR.
+    // Wipe the screen drawn underneath FIRST. `Clear` resets each cell's symbol
+    // (a plain `Block`/`set_style` only recolors the background and leaves the
+    // dashboard's text glyphs in place — they then bleed through the overlay
+    // margins and read as a "transparent" background). After clearing, paint a
+    // solid opaque base so the whole overlay is one flat colour.
+    frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default().style(Style::default().bg(palette::BG_BASE)),
         area,
