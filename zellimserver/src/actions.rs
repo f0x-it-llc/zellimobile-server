@@ -445,11 +445,33 @@ pub fn create_session(name: &str, layout: Option<String>) -> Result<ActionAck> {
     // Find the zellij binary.
     let zellij_bin = which_zellij()?;
 
+    // Resolve the layout. A client-supplied (already name-validated) layout wins;
+    // otherwise default to the bundled BAR-LESS layout so app-created sessions
+    // hide zellij's tab-bar/status-bar (the mobile client renders those controls
+    // itself). The default is a server-authored file at a fixed, server-controlled
+    // path — not client input — so passing its absolute path to `--layout` is safe
+    // (it is exempt from the client-layout name allowlist in grpc::session_ops).
+    // If materialising it fails, fall back to zellij's own default rather than
+    // failing the whole create.
+    let resolved_layout: Option<String> = match layout {
+        Some(l) if !l.is_empty() => Some(l),
+        _ => match crate::config::ensure_default_session_layout() {
+            Ok(p) => Some(p.to_string_lossy().into_owned()),
+            Err(e) => {
+                log::warn!(
+                    "create_session: bar-less default layout unavailable ({e}); \
+                     using zellij's built-in default (bars will be shown)"
+                );
+                None
+            }
+        },
+    };
+
     let mut cmd = Command::new(&zellij_bin);
     cmd.arg("attach");
     cmd.arg("--create");
     cmd.arg(name);
-    if let Some(ref layout_path) = layout
+    if let Some(ref layout_path) = resolved_layout
         && !layout_path.is_empty()
     {
         cmd.args(["--layout", layout_path]);

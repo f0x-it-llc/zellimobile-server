@@ -1,0 +1,19 @@
+// ZelliMobile default layout for sessions created by the mobile app
+// (CreateSession with no client-supplied layout).
+//
+// The ZelliMobile client renders tab/pane controls itself, so sessions it
+// creates must NOT show zellij's tab-bar (top) or status-bar (bottom). Those
+// bars are plugin panes that only appear when a layout declares them; the
+// built-in `default` layout does. By defining an empty `default_tab_template`
+// (just `children`, no bar plugins), EVERY tab — including ones the app creates
+// at runtime via NewTab — opens with a single bare terminal pane and no bars.
+//
+// This file is bundled into the zellimserver binary (include_str!) and written
+// to <data_dir>/layouts/ at create time; its absolute path is passed to
+// `zellij attach --create --layout`. It is server-authored and trusted, so it
+// is exempt from the client-layout name allowlist (see grpc/session_ops.rs).
+layout {
+    default_tab_template {
+        children
+    }
+}
