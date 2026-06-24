@@ -31,6 +31,17 @@ chmod 0644 /etc/profile.d/zellim-env.sh
 # ── 1. Clear root's password so SSH login needs no credential (dev rig) ──────
 passwd -d root
 
+# ── 1b. Install the managed zellij config ────────────────────────────────────
+# zellij's bundled default config ships `load_plugins { "zellij:link" }`, a
+# background plugin that loads on every new session and showed up as a stray pane
+# in app-created sessions. We pin a minimal config with an empty `load_plugins` so
+# no background plugin loads (zellij fills its built-in defaults for everything the
+# minimal config omits). /root/.config/zellij is a persisted named volume, so we
+# (re)install on every boot rather than relying on the build-time COPY, which only
+# seeds a fresh volume.
+mkdir -p /root/.config/zellij
+cp /usr/local/share/zellimobile/config.kdl /root/.config/zellij/config.kdl
+
 # ── 2. Start a backgrounded zellij session from the layout ───────────────────
 # zellimserver attaches to this live session once you start it from zellimctl.
 echo "[rig] starting zellij session '${SESSION}'…"

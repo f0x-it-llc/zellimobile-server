@@ -151,6 +151,9 @@ RUN ssh-keygen -A \
 WORKDIR /root
 
 COPY docker/layout.kdl /root/.config/zellij/layouts/zellimobile.kdl
+# Managed zellij config (disables the zellij:link background plugin). Staged at an
+# image path; entrypoint.sh installs it into the persisted config volume on boot.
+COPY docker/config.kdl /usr/local/share/zellimobile/config.kdl
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
