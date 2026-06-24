@@ -166,6 +166,13 @@ impl ZelliService {
         // execution.  We therefore accept only a bare layout *name* (the same
         // [A-Za-z0-9_-] allowlist as session names): no absolute path, no `/`,
         // no `..`.  zellij resolves a bare name against its own layout dir.
+        //
+        // When the client supplies NO layout (the normal case — the ZelliMobile
+        // app always sends an empty layout), `actions::create_session` defaults
+        // to the bundled BAR-LESS layout so app-created sessions hide zellij's
+        // tab-bar/status-bar (the app renders those controls). That default is a
+        // server-authored file at a fixed path — not client input — so it is
+        // exempt from this name allowlist.
         let layout = if req.layout.is_empty() {
             None
         } else {

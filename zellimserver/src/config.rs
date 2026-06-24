@@ -108,6 +108,37 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The bundled bar-less default layout used for app-created sessions, baked into
+/// the binary so the server is self-contained (no external file to deploy).
+const DEFAULT_SESSION_LAYOUT_KDL: &str = include_str!("../assets/zellimobile-default.kdl");
+
+/// File name for the materialised default layout under `<data_dir>/layouts/`.
+const DEFAULT_SESSION_LAYOUT_FILE: &str = "zellimobile-default.kdl";
+
+/// Materialise the bundled bar-less default layout to disk and return its
+/// absolute path, for `CreateSession` to pass to `zellij --layout`.
+///
+/// The mobile client renders tab/pane controls itself, so sessions it creates
+/// should not show zellij's tab-bar/status-bar. The built-in zellij default
+/// layout declares those bar plugins; this layout (an empty
+/// `default_tab_template`) does not, so every tab — including ones created at
+/// runtime — opens bar-less.
+///
+/// Idempotent: the file is (over)written every call so a server upgrade always
+/// ships the current layout. The returned path is a fixed, server-controlled
+/// location derived from [`data_dir`] — never client input — so passing it to
+/// `--layout` as an absolute path is safe (it is exempt from the client-layout
+/// name allowlist enforced in `grpc::session_ops`).
+pub fn ensure_default_session_layout() -> Result<PathBuf> {
+    let dir = data_dir()?.join("layouts");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create layouts dir {}", dir.display()))?;
+    let path = dir.join(DEFAULT_SESSION_LAYOUT_FILE);
+    std::fs::write(&path, DEFAULT_SESSION_LAYOUT_KDL)
+        .with_context(|| format!("write default layout {}", path.display()))?;
+    Ok(path)
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -151,7 +182,10 @@ mod tests {
         // the restore guard to ensure cleanup runs even on panic.
         let path = config_file_path().expect("config_file_path");
         let original = std::fs::read_to_string(&path).ok();
-        let _restore = ConfigRestoreGuard { path: path.clone(), original };
+        let _restore = ConfigRestoreGuard {
+            path: path.clone(),
+            original,
+        };
 
         // Act: write a distinctive bind address.
         let test_addr = "0.0.0.0:9999";
@@ -165,6 +199,35 @@ mod tests {
             "resolved bind_addr should match what was written"
         );
         // Restore guard runs automatically when this scope exits.
+    }
+
+    /// The bundled default layout must be materialised on disk, live under the
+    /// data dir's `layouts/`, and be BAR-LESS (no tab-bar/status-bar plugins).
+    #[test]
+    fn default_session_layout_is_written_and_barless() {
+        let path = ensure_default_session_layout().expect("ensure default layout");
+        assert!(path.exists(), "layout file should exist at {path:?}");
+        assert!(
+            path.ends_with("layouts/zellimobile-default.kdl"),
+            "unexpected layout path {path:?}"
+        );
+        let body = std::fs::read_to_string(&path).expect("read layout");
+        assert!(
+            body.contains("default_tab_template"),
+            "layout should define a default_tab_template"
+        );
+        // The bars are `plugin location=...` panes; a bar-less layout declares no
+        // plugin panes at all. Check non-comment lines so the explanatory header
+        // (which mentions tab-bar/status-bar) doesn't trip the assertion.
+        let has_plugin = body
+            .lines()
+            .map(|l| l.trim_start())
+            .filter(|l| !l.starts_with("//"))
+            .any(|l| l.contains("plugin"));
+        assert!(
+            !has_plugin,
+            "bar-less layout must not declare any plugin (tab-bar/status-bar) panes"
+        );
     }
 }
 
@@ -254,11 +317,12 @@ pub fn set_bind_addr(bind_addr: &str) -> Result<()> {
         bind_addr: Some(bind_addr.to_owned()),
         ..file_cfg
     };
-    let toml_str = toml::to_string_pretty(&updated)
-        .context("set_bind_addr: serialize config")?;
+    let toml_str = toml::to_string_pretty(&updated).context("set_bind_addr: serialize config")?;
 
     // Write to a temporary file in the same directory as the target.
-    let parent = path.parent().context("config file has no parent directory")?;
+    let parent = path
+        .parent()
+        .context("config file has no parent directory")?;
     let temp_path = parent.join(".config.toml.tmp");
     std::fs::write(&temp_path, &toml_str)
         .with_context(|| format!("set_bind_addr: write temp file {}", temp_path.display()))?;
@@ -269,15 +333,26 @@ pub fn set_bind_addr(bind_addr: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
         std::fs::set_permissions(&temp_path, perms).with_context(|| {
-            format!("set_bind_addr: chmod 0600 temp file {}", temp_path.display())
+            format!(
+                "set_bind_addr: chmod 0600 temp file {}",
+                temp_path.display()
+            )
         })?;
     }
 
     // Atomically rename temp file over the real config (POSIX-atomic on same filesystem).
-    std::fs::rename(&temp_path, &path)
-        .with_context(|| format!("set_bind_addr: rename {} to {}", temp_path.display(), path.display()))?;
+    std::fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "set_bind_addr: rename {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
 
-    log::info!("config: set bind_addr = {bind_addr:?} in {}", path.display());
+    log::info!(
+        "config: set bind_addr = {bind_addr:?} in {}",
+        path.display()
+    );
     Ok(())
 }
 

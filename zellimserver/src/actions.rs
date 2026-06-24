@@ -418,17 +418,48 @@ pub fn kill_session(session: &str) -> Result<()> {
     Ok(())
 }
 
-/// How long to poll for a freshly-created session before giving up.
-const CREATE_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to poll for a freshly-created session before giving up. Generous
+/// enough to cover a cold first-create just after the server starts.
+const CREATE_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Polling interval while waiting for the new session's socket to appear.
 const CREATE_SESSION_POLL: Duration = Duration::from_millis(50);
 
-/// Spawn a detached zellij session by name using `zellij attach --create <name>`.
+/// Build the zellij argv (everything after the binary path) for creating a
+/// detached session: `zellij [--layout <path>] attach --create-background <name>`.
 ///
-/// The process is spawned in its own session (setsid-equivalent via a
-/// `pre_exec` hook that calls `libc::setsid()`) and its stdio is detached, so
-/// it runs fully in the background.
+/// CRITICAL ordering: `--layout` is a TOP-LEVEL flag and MUST come BEFORE the
+/// `attach` subcommand. zellij's `attach` subcommand does not accept `--layout`
+/// — placing it after fails arg parsing with "Found argument '--layout' which
+/// wasn't expected" (exit 2), the session never starts, and (because stderr is
+/// detached to /dev/null) the caller only sees the socket-poll timeout. This is
+/// exactly how the dev-rig entrypoint invokes it (`zellij --layout … attach …`).
+fn build_create_session_args(name: &str, layout: Option<&str>) -> Vec<String> {
+    let mut args = Vec::with_capacity(5);
+    if let Some(layout) = layout
+        && !layout.is_empty()
+    {
+        args.push("--layout".to_string());
+        args.push(layout.to_string());
+    }
+    args.push("attach".to_string());
+    args.push("--create-background".to_string());
+    args.push(name.to_string());
+    args
+}
+
+/// Spawn a detached zellij session by name using
+/// `zellij [--layout <path>] attach --create-background <name>`.
+///
+/// `--create-background` (not `--create`) is essential: the server runs zellij
+/// fully detached — its own session via a `pre_exec` `libc::setsid()` hook, with
+/// stdin/stdout/stderr redirected to `/dev/null` and NO controlling terminal.
+/// `attach --create` would create the session and then try to ATTACH a client,
+/// which needs a TTY; with no terminal that attach phase fails and the session
+/// never comes up (the socket never appears → caller times out).
+/// `--create-background` creates the detached session without attaching, which
+/// is exactly what a server-spawned background session needs (and what the dev
+/// rig's entrypoint uses).
 ///
 /// Rather than sleeping a fixed interval (the old D2 behaviour: a hard-coded
 /// ~1.2 s), this **polls** for the session's IPC socket to appear (up to
@@ -445,15 +476,30 @@ pub fn create_session(name: &str, layout: Option<String>) -> Result<ActionAck> {
     // Find the zellij binary.
     let zellij_bin = which_zellij()?;
 
+    // Resolve the layout. A client-supplied (already name-validated) layout wins;
+    // otherwise default to the bundled BAR-LESS layout so app-created sessions
+    // hide zellij's tab-bar/status-bar (the mobile client renders those controls
+    // itself). The default is a server-authored file at a fixed, server-controlled
+    // path — not client input — so passing its absolute path to `--layout` is safe
+    // (it is exempt from the client-layout name allowlist in grpc::session_ops).
+    // If materialising it fails, fall back to zellij's own default rather than
+    // failing the whole create.
+    let resolved_layout: Option<String> = match layout {
+        Some(l) if !l.is_empty() => Some(l),
+        _ => match crate::config::ensure_default_session_layout() {
+            Ok(p) => Some(p.to_string_lossy().into_owned()),
+            Err(e) => {
+                log::warn!(
+                    "create_session: bar-less default layout unavailable ({e}); \
+                     using zellij's built-in default (bars will be shown)"
+                );
+                None
+            }
+        },
+    };
+
     let mut cmd = Command::new(&zellij_bin);
-    cmd.arg("attach");
-    cmd.arg("--create");
-    cmd.arg(name);
-    if let Some(ref layout_path) = layout
-        && !layout_path.is_empty()
-    {
-        cmd.args(["--layout", layout_path]);
-    }
+    cmd.args(build_create_session_args(name, resolved_layout.as_deref()));
     // Detach stdin/stdout/stderr so the process doesn't inherit ours.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -560,4 +606,45 @@ pub fn which_zellij() -> Result<std::path::PathBuf> {
         }
     }
     bail!("could not find zellij binary on PATH or in ~/bin")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: `--layout` MUST precede the `attach` subcommand, else
+    /// zellij rejects it ("unexpected argument") and the session never starts.
+    #[test]
+    fn create_session_args_put_layout_before_attach() {
+        let args = build_create_session_args("sess", Some("/abs/barless.kdl"));
+        assert_eq!(
+            args,
+            vec![
+                "--layout",
+                "/abs/barless.kdl",
+                "attach",
+                "--create-background",
+                "sess"
+            ]
+        );
+        let layout_idx = args.iter().position(|a| a == "--layout").unwrap();
+        let attach_idx = args.iter().position(|a| a == "attach").unwrap();
+        assert!(
+            layout_idx < attach_idx,
+            "--layout must come before the attach subcommand"
+        );
+    }
+
+    /// No layout → no `--layout` flag; just `attach --create-background <name>`.
+    #[test]
+    fn create_session_args_without_layout_omit_flag() {
+        assert_eq!(
+            build_create_session_args("sess", None),
+            vec!["attach", "--create-background", "sess"]
+        );
+        assert_eq!(
+            build_create_session_args("sess", Some("")),
+            vec!["attach", "--create-background", "sess"]
+        );
+    }
 }

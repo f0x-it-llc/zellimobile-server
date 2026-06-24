@@ -944,7 +944,10 @@ mod tests {
         state.server.stopped = true;
         state.server.status = None;
         let actions = update(&mut state, Message::Key(key(KeyCode::Char('s'))));
-        assert!(!state.server.stopped, "stopped should be cleared on StartServer");
+        assert!(
+            !state.server.stopped,
+            "stopped should be cleared on StartServer"
+        );
         assert!(state.server.loading);
         assert!(
             actions
@@ -1292,7 +1295,11 @@ mod tests {
         state.tokens.last_minted_secret = None;
         let actions = update(&mut state, Message::Key(key(KeyCode::Enter)));
         assert!(state.qr_overlay.is_none());
-        assert!(!actions.iter().any(|a| matches!(a, UpdateAction::ShowTokenQr { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, UpdateAction::ShowTokenQr { .. }))
+        );
     }
 
     /// Open an overlay in the `Generating` phase with the given seq.
@@ -1491,7 +1498,10 @@ mod tests {
             !values.contains(&"0.0.0.0"),
             "0.0.0.0 must not appear as a SAN; got: {values:?}"
         );
-        assert!(values.contains(&"100.64.1.2"), "tailnet IP missing: {values:?}");
+        assert!(
+            values.contains(&"100.64.1.2"),
+            "tailnet IP missing: {values:?}"
+        );
         assert!(
             values.contains(&"192.168.1.10"),
             "LAN IP missing: {values:?}"
@@ -1520,8 +1530,7 @@ mod tests {
         let mut state = AppState::new();
         state.config.host = "0.0.0.0".to_string();
         state.config.reachable_ips = vec![Ipv4Addr::new(172, 19, 0, 2)];
-        state.config.advertise_sans =
-            vec!["100.71.31.57".to_string(), "172.19.0.2".to_string()];
+        state.config.advertise_sans = vec!["100.71.31.57".to_string(), "172.19.0.2".to_string()];
         let values: Vec<String> = build_sans_from_config(&state)
             .iter()
             .map(|s| s.value().to_string())
@@ -1575,7 +1584,8 @@ mod tests {
         );
         // Confirm it was captured as a Dns SAN.
         assert!(
-            sans.iter().any(|s| matches!(s, San::Dns(d) if d == "myserver.local")),
+            sans.iter()
+                .any(|s| matches!(s, San::Dns(d) if d == "myserver.local")),
             "DNS bind host should be San::Dns; got: {sans:?}"
         );
     }
