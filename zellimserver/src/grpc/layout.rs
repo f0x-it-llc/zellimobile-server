@@ -210,6 +210,16 @@ impl ZelliService {
         let mut panes_by_tab: std::collections::HashMap<usize, Vec<PaneMsg>> =
             std::collections::HashMap::new();
         for entry in panes {
+            // Plugin panes (background-only plugins like zellij:link, and tab-bar/status-bar)
+            // are never user-facing terminals in the ZelliMobile model — zellij renders the
+            // background ones headlessly and the bar-less app layout forbids the rest. Exclude
+            // them so they don't surface as selectable panes in the client rail/picker.
+            // See workflow/plans/bug/filter-plugin-panes/BUG.md. Single chokepoint: GetLayout
+            // is the only RPC that returns a pane list.
+            if !pane_is_client_visible(entry.pane_info.is_plugin) {
+                continue;
+            }
+
             // B-FOCUS: override is_focused with the per-relay-client value, but
             // ONLY within the relay's ACTIVE tab.
             //
@@ -310,7 +320,13 @@ impl ZelliService {
     }
 }
 
-// ─── Pure helper (also used by tests) ────────────────────────────────────────
+// ─── Pure helpers (also used by tests) ───────────────────────────────────────
+
+/// A pane is client-visible iff it is a real terminal pane. Plugin panes
+/// (background plugins + tab-bar/status-bar) are excluded from GetLayout.
+pub(crate) fn pane_is_client_visible(is_plugin: bool) -> bool {
+    !is_plugin
+}
 
 /// Decide whether the B-FOCUS view-state override should be applied.
 ///
@@ -337,6 +353,24 @@ pub(crate) fn should_apply_view_state_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Plugin-pane visibility filter ───────────────────────────────────────
+
+    #[test]
+    fn terminal_pane_is_client_visible() {
+        assert!(
+            pane_is_client_visible(false),
+            "terminal panes (is_plugin=false) must be visible to the client"
+        );
+    }
+
+    #[test]
+    fn plugin_pane_is_not_client_visible() {
+        assert!(
+            !pane_is_client_visible(true),
+            "plugin panes (is_plugin=true) must be excluded from the client pane list"
+        );
+    }
 
     // ─── Issue A: view-state override suppression ─────────────────────────────
 
