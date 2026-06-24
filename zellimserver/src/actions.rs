@@ -425,8 +425,31 @@ const CREATE_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Polling interval while waiting for the new session's socket to appear.
 const CREATE_SESSION_POLL: Duration = Duration::from_millis(50);
 
+/// Build the zellij argv (everything after the binary path) for creating a
+/// detached session: `zellij [--layout <path>] attach --create-background <name>`.
+///
+/// CRITICAL ordering: `--layout` is a TOP-LEVEL flag and MUST come BEFORE the
+/// `attach` subcommand. zellij's `attach` subcommand does not accept `--layout`
+/// — placing it after fails arg parsing with "Found argument '--layout' which
+/// wasn't expected" (exit 2), the session never starts, and (because stderr is
+/// detached to /dev/null) the caller only sees the socket-poll timeout. This is
+/// exactly how the dev-rig entrypoint invokes it (`zellij --layout … attach …`).
+fn build_create_session_args(name: &str, layout: Option<&str>) -> Vec<String> {
+    let mut args = Vec::with_capacity(5);
+    if let Some(layout) = layout
+        && !layout.is_empty()
+    {
+        args.push("--layout".to_string());
+        args.push(layout.to_string());
+    }
+    args.push("attach".to_string());
+    args.push("--create-background".to_string());
+    args.push(name.to_string());
+    args
+}
+
 /// Spawn a detached zellij session by name using
-/// `zellij attach --create-background <name>`.
+/// `zellij [--layout <path>] attach --create-background <name>`.
 ///
 /// `--create-background` (not `--create`) is essential: the server runs zellij
 /// fully detached — its own session via a `pre_exec` `libc::setsid()` hook, with
@@ -476,14 +499,7 @@ pub fn create_session(name: &str, layout: Option<String>) -> Result<ActionAck> {
     };
 
     let mut cmd = Command::new(&zellij_bin);
-    cmd.arg("attach");
-    cmd.arg("--create-background");
-    cmd.arg(name);
-    if let Some(ref layout_path) = resolved_layout
-        && !layout_path.is_empty()
-    {
-        cmd.args(["--layout", layout_path]);
-    }
+    cmd.args(build_create_session_args(name, resolved_layout.as_deref()));
     // Detach stdin/stdout/stderr so the process doesn't inherit ours.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -590,4 +606,45 @@ pub fn which_zellij() -> Result<std::path::PathBuf> {
         }
     }
     bail!("could not find zellij binary on PATH or in ~/bin")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: `--layout` MUST precede the `attach` subcommand, else
+    /// zellij rejects it ("unexpected argument") and the session never starts.
+    #[test]
+    fn create_session_args_put_layout_before_attach() {
+        let args = build_create_session_args("sess", Some("/abs/barless.kdl"));
+        assert_eq!(
+            args,
+            vec![
+                "--layout",
+                "/abs/barless.kdl",
+                "attach",
+                "--create-background",
+                "sess"
+            ]
+        );
+        let layout_idx = args.iter().position(|a| a == "--layout").unwrap();
+        let attach_idx = args.iter().position(|a| a == "attach").unwrap();
+        assert!(
+            layout_idx < attach_idx,
+            "--layout must come before the attach subcommand"
+        );
+    }
+
+    /// No layout → no `--layout` flag; just `attach --create-background <name>`.
+    #[test]
+    fn create_session_args_without_layout_omit_flag() {
+        assert_eq!(
+            build_create_session_args("sess", None),
+            vec!["attach", "--create-background", "sess"]
+        );
+        assert_eq!(
+            build_create_session_args("sess", Some("")),
+            vec!["attach", "--create-background", "sess"]
+        );
+    }
 }
