@@ -418,17 +418,25 @@ pub fn kill_session(session: &str) -> Result<()> {
     Ok(())
 }
 
-/// How long to poll for a freshly-created session before giving up.
-const CREATE_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to poll for a freshly-created session before giving up. Generous
+/// enough to cover a cold first-create just after the server starts.
+const CREATE_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Polling interval while waiting for the new session's socket to appear.
 const CREATE_SESSION_POLL: Duration = Duration::from_millis(50);
 
-/// Spawn a detached zellij session by name using `zellij attach --create <name>`.
+/// Spawn a detached zellij session by name using
+/// `zellij attach --create-background <name>`.
 ///
-/// The process is spawned in its own session (setsid-equivalent via a
-/// `pre_exec` hook that calls `libc::setsid()`) and its stdio is detached, so
-/// it runs fully in the background.
+/// `--create-background` (not `--create`) is essential: the server runs zellij
+/// fully detached — its own session via a `pre_exec` `libc::setsid()` hook, with
+/// stdin/stdout/stderr redirected to `/dev/null` and NO controlling terminal.
+/// `attach --create` would create the session and then try to ATTACH a client,
+/// which needs a TTY; with no terminal that attach phase fails and the session
+/// never comes up (the socket never appears → caller times out).
+/// `--create-background` creates the detached session without attaching, which
+/// is exactly what a server-spawned background session needs (and what the dev
+/// rig's entrypoint uses).
 ///
 /// Rather than sleeping a fixed interval (the old D2 behaviour: a hard-coded
 /// ~1.2 s), this **polls** for the session's IPC socket to appear (up to
@@ -469,7 +477,7 @@ pub fn create_session(name: &str, layout: Option<String>) -> Result<ActionAck> {
 
     let mut cmd = Command::new(&zellij_bin);
     cmd.arg("attach");
-    cmd.arg("--create");
+    cmd.arg("--create-background");
     cmd.arg(name);
     if let Some(ref layout_path) = resolved_layout
         && !layout_path.is_empty()
