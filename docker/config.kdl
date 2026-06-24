@@ -1,0 +1,17 @@
+// ZelliMobile dev-rig zellij config.
+//
+// Intentionally minimal: zellij fills in its built-in defaults for every section
+// we omit (keybinds, plugin aliases, themes, web client, …). The one thing we pin
+// is an empty `load_plugins` block.
+//
+// zellij 0.44.3's bundled default config ships `load_plugins { "zellij:link" }` —
+// a background plugin (makes terminal file-paths clickable) that loads on every
+// new session and surfaced as a stray pane in app-created sessions. An explicit
+// empty block keeps it — and any other background plugin — from loading.
+//
+// Installed by entrypoint.sh on every boot. The config dir (/root/.config/zellij)
+// is a persisted named volume in compose.yaml, so a build-time COPY alone would
+// only seed a fresh volume and miss pre-existing ones — hence the entrypoint
+// (re)install.
+load_plugins {
+}
