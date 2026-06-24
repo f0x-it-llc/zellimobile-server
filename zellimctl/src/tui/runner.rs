@@ -22,8 +22,8 @@ use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 
-use crate::app::{AppState, Message, UpdateAction, update};
 use crate::app::state::Screen;
+use crate::app::{AppState, Message, UpdateAction, update};
 
 /// Poll cadence / tick interval.
 const TICK: Duration = Duration::from_millis(50);

@@ -187,7 +187,10 @@ fn render_connected(frame: &mut Frame, area: Rect) {
 fn render_failed(frame: &mut Frame, err: &str, area: Rect) {
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled("  QR generation failed:", styles::status_err())),
+        Line::from(Span::styled(
+            "  QR generation failed:",
+            styles::status_err(),
+        )),
         Line::from(Span::styled(format!("  {err}"), styles::body())),
         Line::from(""),
         Line::from(Span::styled("  Press Esc to close.", styles::muted())),

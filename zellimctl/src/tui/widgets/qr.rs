@@ -82,8 +82,7 @@ impl QrWidget {
     /// [`block_width`] and [`render`] reuse the same `QrCode` instance.
     pub fn new(payload: impl Into<String>) -> Self {
         let payload = payload.into();
-        let code =
-            QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::L).ok();
+        let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::L).ok();
         Self { payload, code }
     }
 
@@ -265,13 +264,21 @@ mod tests {
     /// QR is encoded exactly once in `new`; block_width and render both reuse it.
     #[test]
     fn qr_encoded_once_in_new() {
-        let w = QrWidget::new("zellimobile://pair?v=1&h=127.0.0.1&p=50051&fp=aabbcc&t=dGVzdA&ro=0&n=dev");
+        let w = QrWidget::new(
+            "zellimobile://pair?v=1&h=127.0.0.1&p=50051&fp=aabbcc&t=dGVzdA&ro=0&n=dev",
+        );
         // code must be Some for a valid payload
         assert!(w.code.is_some(), "QrCode should be encoded in new()");
         // block_width reads from the same stored code, not re-encoding
         let bw = w.block_width();
-        assert!(bw.is_some(), "block_width should return Some for a valid payload");
-        assert!(bw.unwrap() >= MIN_WIDTH, "block_width should be >= MIN_WIDTH");
+        assert!(
+            bw.is_some(),
+            "block_width should return Some for a valid payload"
+        );
+        assert!(
+            bw.unwrap() >= MIN_WIDTH,
+            "block_width should be >= MIN_WIDTH"
+        );
     }
 
     /// Guardrail: a real-length pairing payload encodes and its block dimensions
@@ -323,7 +330,11 @@ mod tests {
             "a".repeat(64),
             "B".repeat(48),
         );
-        assert_eq!(payload.len(), 185, "representative payload must be ~185 bytes");
+        assert_eq!(
+            payload.len(),
+            185,
+            "representative payload must be ~185 bytes"
+        );
 
         let qr = QrWidget::new(&payload);
 
@@ -332,8 +343,14 @@ mod tests {
             .block_size()
             .expect("real payload must encode to a valid QrCode");
         // Real payload → QR version 8 (49 modules) → block 57×27.
-        assert_eq!(block_w, 57, "block_width for 185-byte payload must be 57 cols");
-        assert_eq!(block_h, 27, "block_height for 185-byte payload must be 27 rows");
+        assert_eq!(
+            block_w, 57,
+            "block_width for 185-byte payload must be 57 cols"
+        );
+        assert_eq!(
+            block_h, 27,
+            "block_height for 185-byte payload must be 27 rows"
+        );
 
         // ── Derive the phase-body Rect mirroring the REAL layout chain. ────────
         //

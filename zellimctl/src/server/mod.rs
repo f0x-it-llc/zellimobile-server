@@ -126,7 +126,11 @@ pub fn persisted_extra_sans() -> Vec<String> {
 ///
 /// Always starts with `["start", "--daemonize"]`.
 #[allow(dead_code)]
-pub fn build_daemon_args(bind_addr: &str, extra_sans: &[String], default_bind: &str) -> Vec<String> {
+pub fn build_daemon_args(
+    bind_addr: &str,
+    extra_sans: &[String],
+    default_bind: &str,
+) -> Vec<String> {
     let mut args = vec!["start".to_string(), "--daemonize".to_string()];
 
     if bind_addr != default_bind {

@@ -300,7 +300,8 @@ mod tests {
         // Must be exactly 64 lowercase hex characters.
         assert_eq!(fp1.len(), 64, "fingerprint length should be 64 chars");
         assert!(
-            fp1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            fp1.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
             "fingerprint should be lowercase hex: {fp1}"
         );
 
