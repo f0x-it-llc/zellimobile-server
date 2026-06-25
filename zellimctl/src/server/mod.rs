@@ -5,6 +5,7 @@
 //! [`start_daemon`] (spawn, not library call), while all pure read/write ops
 //! (config, cert, status) go through the library directly.
 
+pub mod ctl_state;
 pub mod tokens;
 
 use anyhow::{Context, Result};
@@ -246,6 +247,26 @@ pub fn env_extra_sans() -> Vec<String> {
             SanEntry::Dns(d) => d.clone(),
         })
         .collect()
+}
+
+// ── ctl-local state persistence ───────────────────────────────────────────────
+
+/// Load the persisted `advertise_trust` setting from the ctl state file.
+///
+/// Returns one of `"auto"`, `"ca"`, or `"pin"`.  Defaults to `"auto"` on any
+/// read error so a missing file on first run is harmless.
+#[allow(dead_code)]
+pub fn load_advertise_trust() -> &'static str {
+    ctl_state::load_advertise_trust()
+}
+
+/// Persist the `advertise_trust` setting to the ctl state file.
+///
+/// Errors are logged at warn level and silently swallowed — a persistence
+/// failure must never crash the TUI.
+#[allow(dead_code)]
+pub fn save_advertise_trust(value: &str) {
+    ctl_state::save_advertise_trust(value);
 }
 
 /// Persist a new bind address to the config file.

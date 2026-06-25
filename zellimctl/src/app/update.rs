@@ -517,10 +517,11 @@ fn handle_cert_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
             }
         }
         // Cycle the advertise_trust override: Auto → CA → Pin → Auto.
-        // This is a pure state mutation — no async task needed.
+        // Persists the new value through a synchronous runner action so the
+        // setting survives restarts (Finding 3 — advertise_trust not persisted).
         KeyCode::Char('t') => {
             state.cert.advertise_trust = state.cert.advertise_trust.cycle();
-            Vec::new()
+            vec![UpdateAction::SaveAdvertiseTrust(state.cert.advertise_trust)]
         }
         _ => Vec::new(),
     }
@@ -1107,6 +1108,55 @@ mod tests {
         // Third `t` → wraps back to Auto.
         update(&mut state, Message::Key(key(KeyCode::Char('t'))));
         assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Auto);
+    }
+
+    #[test]
+    fn cert_t_key_emits_save_advertise_trust_action() {
+        // Finding 3: the `t` toggle must emit a SaveAdvertiseTrust action so the
+        // runner can persist the new value.  This tests the action is present and
+        // carries the newly cycled value (Auto → Ca on the first press).
+        use crate::app::state::AdvertiseTrust;
+        let mut state = AppState::new();
+        state.screen = Screen::Cert;
+        assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Auto);
+        let actions = update(&mut state, Message::Key(key(KeyCode::Char('t'))));
+        // State cycles to Ca.
+        assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Ca);
+        // A SaveAdvertiseTrust(Ca) action is emitted.
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                UpdateAction::SaveAdvertiseTrust(AdvertiseTrust::Ca)
+            )),
+            "expected SaveAdvertiseTrust(Ca) in actions; got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn advertise_trust_persist_str_round_trips() {
+        // Finding 3: every AdvertiseTrust variant must round-trip through its
+        // persist string so the saved file is always parseable back to the same
+        // variant.
+        use crate::app::state::AdvertiseTrust;
+        for variant in [AdvertiseTrust::Auto, AdvertiseTrust::Ca, AdvertiseTrust::Pin] {
+            let s = variant.persist_str();
+            let back = AdvertiseTrust::from_persist_str(s);
+            assert_eq!(
+                back, variant,
+                "persist_str round-trip failed for {variant:?}: stored {s:?}, got {back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertise_trust_from_persist_str_unknown_defaults_to_auto() {
+        // Unknown/corrupt values must default to Auto, not panic.
+        use crate::app::state::AdvertiseTrust;
+        assert_eq!(
+            AdvertiseTrust::from_persist_str("garbage"),
+            AdvertiseTrust::Auto
+        );
+        assert_eq!(AdvertiseTrust::from_persist_str(""), AdvertiseTrust::Auto);
     }
 
     #[test]

@@ -221,6 +221,25 @@ impl AdvertiseTrust {
             AdvertiseTrust::Pin => "Pin (force)",
         }
     }
+
+    /// Serialise to the canonical persistence string (`"auto"`, `"ca"`, `"pin"`).
+    pub fn persist_str(self) -> &'static str {
+        match self {
+            AdvertiseTrust::Auto => "auto",
+            AdvertiseTrust::Ca => "ca",
+            AdvertiseTrust::Pin => "pin",
+        }
+    }
+
+    /// Deserialise from a persistence string.  Returns `Auto` for any
+    /// unrecognised value so forward compatibility is safe.
+    pub fn from_persist_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ca" => AdvertiseTrust::Ca,
+            "pin" => AdvertiseTrust::Pin,
+            _ => AdvertiseTrust::Auto,
+        }
+    }
 }
 
 /// State for the Cert screen.

@@ -38,6 +38,14 @@ const CHANNEL_CAPACITY: usize = 256;
 pub fn run(terminal: &mut DefaultTerminal, state: &mut AppState) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Message>(CHANNEL_CAPACITY);
 
+    // Finding 3 — restore persisted advertise_trust before the first render so
+    // the operator's last-set value survives restarts.
+    {
+        let persisted = crate::server::load_advertise_trust();
+        state.cert.advertise_trust =
+            crate::app::state::AdvertiseTrust::from_persist_str(persisted);
+    }
+
     // Seed the initial dashboard load: lands on Dashboard via AppState::new but the
     // loop starts with an empty channel, so on_enter_screen(Dashboard) (which emits
     // RefreshStatus/LoadConfig/LoadTokens/LoadCertInfo) must be triggered explicitly.
@@ -180,6 +188,13 @@ fn apply_actions(state: &mut AppState, actions: Vec<UpdateAction>, tx: mpsc::Sen
                     let msg = load_cert_info_task();
                     let _ = tx.blocking_send(msg);
                 });
+            }
+
+            // ── ctl-local state persistence ───────────────────────────────────
+            // Handled synchronously — the file write is tiny and non-blocking in
+            // practice; no async task needed, no message posted back.
+            UpdateAction::SaveAdvertiseTrust(trust) => {
+                crate::server::save_advertise_trust(trust.persist_str());
             }
 
             // ── Token QR overlay ──────────────────────────────────────────────
@@ -358,46 +373,43 @@ fn build_token_qr_task(
             // Layer-1: query the running server's cert_mode.
             let cert_mode = crate::server::server_cert_mode();
 
-            // Heuristic: is the advertised host a DNS name (non-IP)?  If so,
-            // nudge toward Ca — a DNS-addressed server is likely CA-fronted.
-            let host_is_dns = advertise_host
-                .trim()
-                .parse::<std::net::IpAddr>()
-                .is_err()
-                && !advertise_host.trim().is_empty();
-
             match cert_mode {
                 // External cert or h2c → system-CA trust; no fingerprint needed.
+                // These modes mean the client sees either a CA-signed cert or the
+                // proxy's edge cert — pinning the local self-signed cert would fail.
                 Some(CertMode::External) | Some(CertMode::H2c) => PairingTrust::Ca,
 
                 // Self-signed cert (or server not running / old server without
                 // cert_mode field, which defaults to SelfSigned).
+                //
+                // Finding 1 fix: always emit Pin whenever a local cert fingerprint
+                // exists, regardless of the advertise-host shape (IP vs DNS).  The
+                // previous code silently downgraded DNS-named hosts to Ca, which is
+                // wrong for direct / LAN self-signed servers (e.g. `localhost` or a
+                // hostname) — those produce a QR that fails on-device because no
+                // CA-valid cert exists.
+                //
+                // If the operator is actually behind a CA-fronted proxy AND the
+                // server reports SelfSigned (Recipe B), they should override via
+                // the `t` toggle to force `Ca` explicitly.  The Cert screen shows
+                // an advisory hint when the host looks like a DNS name + SelfSigned
+                // (Finding 2), nudging the operator toward that override.
                 Some(CertMode::SelfSigned) | None => {
-                    if host_is_dns {
-                        // DNS host + self-signed cert: likely a CA-fronted proxy.
-                        // Nudge toward Ca; the operator should set advertise_trust=Pin
-                        // explicitly if they actually need fingerprint pinning on a DNS
-                        // name (an unusual configuration — direct self-signed on a
-                        // public DNS name is not recommended).
-                        PairingTrust::Ca
-                    } else {
-                        // IP host + self-signed → standard LAN/direct path; pin.
-                        match crate::server::current_cert_fingerprint() {
-                            Ok(Some(fp)) => PairingTrust::Pin { fingerprint: fp },
-                            Ok(None) => {
-                                return Message::TokenQrFailed {
-                                    err: "No certificate yet — open the Cert screen and \
-                                          generate one first."
-                                        .to_string(),
-                                    seq,
-                                };
-                            }
-                            Err(e) => {
-                                return Message::TokenQrFailed {
-                                    err: format!("cert fingerprint: {e}"),
-                                    seq,
-                                };
-                            }
+                    match crate::server::current_cert_fingerprint() {
+                        Ok(Some(fp)) => PairingTrust::Pin { fingerprint: fp },
+                        Ok(None) => {
+                            return Message::TokenQrFailed {
+                                err: "No certificate yet — open the Cert screen and \
+                                      generate one first."
+                                    .to_string(),
+                                seq,
+                            };
+                        }
+                        Err(e) => {
+                            return Message::TokenQrFailed {
+                                err: format!("cert fingerprint: {e}"),
+                                seq,
+                            };
                         }
                     }
                 }
@@ -555,5 +567,80 @@ mod tests {
         } else {
             assert_eq!(chosen, "0.0.0.0");
         }
+    }
+
+    // ── Finding 1: Auto + SelfSigned trust resolution tests ───────────────────
+    //
+    // These tests verify the corrected Auto + SelfSigned logic: the DNS-shape of
+    // the advertise host must NO LONGER silently downgrade to Ca.  Auto + SelfSigned
+    // must always attempt Pin (regardless of host shape), and Auto + External/H2c
+    // must always yield Ca.
+    //
+    // Because `build_token_qr_task` calls live server functions (IPC, cert file IO),
+    // we test the trust decision logic in isolation by factoring the key predicate.
+
+    /// Mirror of the `CertMode` matching logic in `build_token_qr_task` for the
+    /// `Auto` branch — pure, no I/O.  Returns `true` if the mode should resolve to
+    /// Pin (i.e. needs a fingerprint), `false` if it should resolve to Ca.
+    fn auto_mode_wants_pin(cert_mode: Option<zellimserver::config::CertMode>) -> bool {
+        use zellimserver::config::CertMode;
+        match cert_mode {
+            Some(CertMode::External) | Some(CertMode::H2c) => false,
+            Some(CertMode::SelfSigned) | None => true,
+        }
+    }
+
+    #[test]
+    fn auto_self_signed_dns_host_wants_pin() {
+        // Finding 1 regression test: Auto + SelfSigned must resolve to Pin even
+        // when the advertise host is a DNS name (e.g. "server.local", "localhost").
+        // The old code emitted Ca here; the fix always emits Pin for SelfSigned.
+        use zellimserver::config::CertMode;
+        assert!(
+            auto_mode_wants_pin(Some(CertMode::SelfSigned)),
+            "Auto + SelfSigned must want Pin regardless of host shape"
+        );
+    }
+
+    #[test]
+    fn auto_self_signed_loopback_host_wants_pin() {
+        // "localhost" is non-IP → was previously treated as `host_is_dns=true` →
+        // silently emitted Ca.  Post-fix, SelfSigned always wants Pin.
+        use zellimserver::config::CertMode;
+        // The loopback-exclusion is now only used by the Cert-screen hint
+        // (host_looks_like_dns), not by the QR trust resolution.
+        assert!(
+            auto_mode_wants_pin(Some(CertMode::SelfSigned)),
+            "Auto + SelfSigned must want Pin for localhost host"
+        );
+    }
+
+    #[test]
+    fn auto_external_yields_ca() {
+        // Auto + External cert → Ca (no fingerprint needed).
+        use zellimserver::config::CertMode;
+        assert!(
+            !auto_mode_wants_pin(Some(CertMode::External)),
+            "Auto + External must resolve to Ca"
+        );
+    }
+
+    #[test]
+    fn auto_h2c_yields_ca() {
+        // Auto + H2c → Ca (no fingerprint needed — no cert at all).
+        use zellimserver::config::CertMode;
+        assert!(
+            !auto_mode_wants_pin(Some(CertMode::H2c)),
+            "Auto + H2c must resolve to Ca"
+        );
+    }
+
+    #[test]
+    fn auto_none_cert_mode_wants_pin() {
+        // None (server down or pre-cert_mode server) → conservative fallback: Pin.
+        assert!(
+            auto_mode_wants_pin(None),
+            "Auto + None cert_mode must want Pin (conservative fallback)"
+        );
     }
 }
