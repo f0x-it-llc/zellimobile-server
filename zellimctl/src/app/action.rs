@@ -69,6 +69,10 @@ pub enum UpdateAction {
         read_only: bool,
         /// The sequence number of this overlay (seq-guard against stale results).
         seq: u64,
+        /// The operator-declared advertised trust override at the time the QR was
+        /// requested. Snapshotted so the async task uses the value that was active
+        /// when the user pressed Enter — not a later toggle.
+        advertise_trust: super::state::AdvertiseTrust,
     },
 
     // ── Dashboard ─────────────────────────────────────────────────────────────

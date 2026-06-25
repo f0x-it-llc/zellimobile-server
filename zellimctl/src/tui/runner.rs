@@ -187,10 +187,11 @@ fn apply_actions(state: &mut AppState, actions: Vec<UpdateAction>, tx: mpsc::Sen
                 token,
                 read_only,
                 seq,
+                advertise_trust,
             } => {
                 let tx = tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let msg = build_token_qr_task(token, read_only, seq);
+                    let msg = build_token_qr_task(token, read_only, seq, advertise_trust);
                     let _ = tx.blocking_send(msg);
                 });
             }
@@ -256,21 +257,30 @@ fn ensure_cert_task(sans: &[crate::app::state::San]) -> Message {
 /// hold). It is NEVER minted or revoked here.
 ///
 /// Steps (all in `spawn_blocking`):
-/// 1. Guard: the server must be **running** (we pin the cert it serves) — else
-///    `TokenQrFailed("Start the server first")`.
+/// 1. Guard: the server must be **running** — else `TokenQrFailed`.
 /// 2. Read host + port from `effective_config().bind_addr`.
 /// 3. Pick the advertise host: prefer the configured bind host when it is a
 ///    concrete (non-loopback, non-unspecified) address; otherwise fall back to
 ///    the first reachable non-loopback IPv4.
-/// 4. **Read the persisted cert fingerprint without regenerating** (the running
-///    server serves the cert it loaded at startup — regenerating here would pin
-///    a fingerprint it never presents). No cert yet → fail with guidance.
-/// 5. Build `PairingParams{ token, .. }.to_uri()` from the passed plaintext token;
-///    capture `client_count` as baseline.
-fn build_token_qr_task(token: String, read_only: bool, seq: u64) -> Message {
-    use crate::pairing::payload::PairingParams;
+/// 4. Resolve the pairing trust (Layer-1 + Layer-2 + heuristics):
+///    - Layer-2 override (`advertise_trust != Auto`) takes precedence.
+///    - Layer-1: query the running server's `cert_mode` via the control socket.
+///    - Heuristic: a DNS-name advertise host nudges toward `Ca` in Auto mode.
+///    - For `Pin` paths: read the persisted cert fingerprint without regenerating.
+///    - For `Ca` / h2c paths: no fingerprint required.
+/// 5. Build `PairingParams{ token, trust, .. }.to_uri()` from the passed plaintext
+///    token; capture `client_count` as baseline.
+fn build_token_qr_task(
+    token: String,
+    read_only: bool,
+    seq: u64,
+    advertise_trust: crate::app::state::AdvertiseTrust,
+) -> Message {
+    use crate::app::state::AdvertiseTrust;
+    use crate::pairing::payload::{PairingParams, PairingTrust};
+    use zellimserver::config::CertMode;
 
-    // 1. Guard: the server must be running so the QR pins the cert it serves.
+    // 1. Guard: the server must be running.
     if !crate::server::is_running() {
         return Message::TokenQrFailed {
             err: "Start the server first.".to_string(),
@@ -301,49 +311,127 @@ fn build_token_qr_task(token: String, read_only: bool, seq: u64) -> Message {
         }
     };
 
-    // 4. Pick the advertise host (prefer the configured bind IP, then an explicit
+    // 4a. Pick the advertise host (prefer the configured bind IP, then an explicit
     //    ZELLIMSERVER_SAN advertise address, then a discovered interface IP).
     let advertise_host = choose_advertise_host(&bind_host, &crate::server::env_extra_sans());
 
-    // 5. Pin the fingerprint of the cert the running server actually serves.
-    //    NEVER regenerate here — that would pin a fingerprint the server won't
-    //    present (review Critical #1).
-    let fingerprint = match crate::server::current_cert_fingerprint() {
-        Ok(Some(fp)) => fp,
-        Ok(None) => {
-            return Message::TokenQrFailed {
-                err: "No certificate yet — open the Cert screen and generate one first."
-                    .to_string(),
-                seq,
-            };
+    // 4b. Resolve the pairing trust.
+    //
+    // Priority:
+    //   - Layer-2 explicit override (advertise_trust = Ca | Pin) → use it directly.
+    //   - Layer-2 Auto + Layer-1 cert_mode query:
+    //       - External | H2c → Ca (no fp)
+    //       - SelfSigned     → Pin (fp required)
+    //   - Heuristic (Auto + SelfSigned only): a DNS-name advertise host nudges
+    //     toward Ca — the server is likely behind a CA-fronted proxy even if ctl
+    //     sees a self-signed local cert (e.g. Recipe B: Dokploy + insecureSkipVerify).
+    //     The operator should set advertise_trust=Ca to override cleanly; this is
+    //     documented as a nudge hint, not a security decision.
+    //   - Fallback (server down / socket error in Auto): use Pin if a cert exists,
+    //     Ca if no local cert found (h2c or proxy scenario without a local cert).
+    let trust = match advertise_trust {
+        // Layer-2: operator forced CA → no fingerprint needed.
+        AdvertiseTrust::Ca => PairingTrust::Ca,
+
+        // Layer-2: operator forced Pin → fingerprint required.
+        AdvertiseTrust::Pin => {
+            match crate::server::current_cert_fingerprint() {
+                Ok(Some(fp)) => PairingTrust::Pin { fingerprint: fp },
+                Ok(None) => {
+                    return Message::TokenQrFailed {
+                        err: "No certificate yet — open the Cert screen and generate one first."
+                            .to_string(),
+                        seq,
+                    };
+                }
+                Err(e) => {
+                    return Message::TokenQrFailed {
+                        err: format!("cert fingerprint: {e}"),
+                        seq,
+                    };
+                }
+            }
         }
-        Err(e) => {
-            return Message::TokenQrFailed {
-                err: format!("cert fingerprint: {e}"),
-                seq,
-            };
+
+        // Layer-2 Auto: consult Layer-1 cert_mode + heuristic.
+        AdvertiseTrust::Auto => {
+            // Layer-1: query the running server's cert_mode.
+            let cert_mode = crate::server::server_cert_mode();
+
+            // Heuristic: is the advertised host a DNS name (non-IP)?  If so,
+            // nudge toward Ca — a DNS-addressed server is likely CA-fronted.
+            let host_is_dns = advertise_host
+                .trim()
+                .parse::<std::net::IpAddr>()
+                .is_err()
+                && !advertise_host.trim().is_empty();
+
+            match cert_mode {
+                // External cert or h2c → system-CA trust; no fingerprint needed.
+                Some(CertMode::External) | Some(CertMode::H2c) => PairingTrust::Ca,
+
+                // Self-signed cert (or server not running / old server without
+                // cert_mode field, which defaults to SelfSigned).
+                Some(CertMode::SelfSigned) | None => {
+                    if host_is_dns {
+                        // DNS host + self-signed cert: likely a CA-fronted proxy.
+                        // Nudge toward Ca; the operator should set advertise_trust=Pin
+                        // explicitly if they actually need fingerprint pinning on a DNS
+                        // name (an unusual configuration — direct self-signed on a
+                        // public DNS name is not recommended).
+                        PairingTrust::Ca
+                    } else {
+                        // IP host + self-signed → standard LAN/direct path; pin.
+                        match crate::server::current_cert_fingerprint() {
+                            Ok(Some(fp)) => PairingTrust::Pin { fingerprint: fp },
+                            Ok(None) => {
+                                return Message::TokenQrFailed {
+                                    err: "No certificate yet — open the Cert screen and \
+                                          generate one first."
+                                        .to_string(),
+                                    seq,
+                                };
+                            }
+                            Err(e) => {
+                                return Message::TokenQrFailed {
+                                    err: format!("cert fingerprint: {e}"),
+                                    seq,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
 
-    // 6. Build the URI from the PASSED plaintext token (no mint, no revoke).
+    // 5. Build the URI from the PASSED plaintext token (no mint, no revoke).
+    let trust_is_ca = matches!(trust, PairingTrust::Ca);
+    let fingerprint_display = match &trust {
+        PairingTrust::Pin { fingerprint } => fingerprint.clone(),
+        PairingTrust::Ca => String::new(),
+    };
+
     let uri = PairingParams {
         host: advertise_host.clone(),
         port,
-        cert_fp_hex: fingerprint.clone(),
+        trust,
         token,
         read_only,
         label: "zellimserver".to_string(),
     }
     .to_uri();
 
-    // 7. Capture current client count as baseline.
+    // 6. Capture current client count as baseline.
     let baseline_clients = crate::server::client_count().unwrap_or(0);
 
-    // Build a short fingerprint for display (first 16 hex chars + "…").
-    let fingerprint_short = if fingerprint.len() > 16 {
-        format!("{}…", &fingerprint[..16])
+    // Build a short display string for the info panel below the QR.
+    let fingerprint_short = if trust_is_ca {
+        "CA trust (no pin)".to_string()
+    } else if fingerprint_display.len() > 16 {
+        format!("{}…", &fingerprint_display[..16])
     } else {
-        fingerprint
+        fingerprint_display
     };
 
     Message::TokenQrReady {

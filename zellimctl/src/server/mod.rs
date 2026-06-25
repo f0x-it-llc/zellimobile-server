@@ -59,6 +59,24 @@ pub fn status() -> Option<ServerInfo> {
     }
 }
 
+/// Query the running server for its cert mode.
+///
+/// Sends a `Status` request over the control socket and extracts the
+/// `cert_mode` field from the response.  Returns `None` when the server is
+/// not running or the socket is absent — callers should treat `None` as "use
+/// Auto fallback heuristics".
+///
+/// This is the Layer-1 cert-mode detection from the design spec (see
+/// PLAN.md § "How ctl decides `tm`"): the server reports exactly the TLS /
+/// transport mode it was started with, so ctl never has to guess from flags.
+#[allow(dead_code)]
+pub fn server_cert_mode() -> Option<zellimserver::config::CertMode> {
+    match zellimserver::control::query(&ControlRequest::Status) {
+        Ok(ControlResponse::Status(info)) => Some(info.cert_mode),
+        _ => None,
+    }
+}
+
 /// Ask the running server to shut down gracefully.
 #[allow(dead_code)]
 pub fn stop() -> Result<()> {
