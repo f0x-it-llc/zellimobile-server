@@ -103,6 +103,21 @@ pub struct InitArgs {
     /// var when absent.
     #[arg(long, value_name = "PATH")]
     pub tls_key: Option<std::path::PathBuf>,
+
+    /// Validate the setup for h2c (plaintext HTTP/2) mode — no cert is needed.
+    ///
+    /// **WARNING:** This mode sends all data — including API tokens and terminal
+    /// output — over a PLAINTEXT connection.  It MUST only be used when the
+    /// server is sitting behind a trusted TLS-terminating reverse proxy (e.g.
+    /// Traefik with a Let's Encrypt cert, Cloudflare origin proxy).  NEVER
+    /// expose a server in h2c mode directly to the internet or an untrusted
+    /// network.
+    ///
+    /// Also enabled when ZELLIMSERVER_H2C env var is set to a truthy value
+    /// (non-empty and not "0").  Mutually exclusive with `--tls-cert` /
+    /// `--tls-key`.
+    #[arg(long)]
+    pub insecure_h2c: bool,
 }
 
 // ── start ─────────────────────────────────────────────────────────────────────
@@ -154,6 +169,21 @@ pub struct StartArgs {
     /// `--tls-key`.
     #[arg(long)]
     pub insecure_h2c: bool,
+
+    /// Explicitly acknowledge that `--insecure-h2c` is being used on a
+    /// non-loopback address behind a trusted TLS-terminating reverse proxy.
+    ///
+    /// By default, binding h2c on a non-loopback address (anything other than
+    /// `127.0.0.1` / `[::1]`) is refused as a safety measure — plaintext gRPC
+    /// must NOT be exposed directly to the network.  Set this flag to confirm
+    /// that a TLS-terminating proxy (e.g. Traefik + Let's Encrypt, Cloudflare)
+    /// is in front of this server.
+    ///
+    /// Has no effect unless `--insecure-h2c` is also set.  Also enabled when
+    /// `ZELLIMSERVER_H2C_ALLOW_PUBLIC` env var is set to a truthy value
+    /// (non-empty and not "0").
+    #[arg(long = "i-know-this-is-behind-a-proxy")]
+    pub h2c_allow_public: bool,
 }
 
 // ── create-token ────────────────────────────────────────────────────────────

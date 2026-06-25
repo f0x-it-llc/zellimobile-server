@@ -268,6 +268,55 @@ pub fn resolve_cert_source(
     }
 }
 
+// ─── H2c bind-safety guard ───────────────────────────────────────────────────
+
+/// Enforce that h2c (plaintext HTTP/2) is not bound on a publicly-reachable
+/// address without an explicit operator acknowledgement.
+///
+/// # Rules
+/// - Non-h2c modes: always allowed (returns `Ok(())`).
+/// - H2c on a **loopback** address (`127.0.0.1` / `[::1]`): always allowed.
+/// - H2c on a **non-loopback** address:
+///   - `allow_public = true` (set via `--i-know-this-is-behind-a-proxy` or
+///     `ZELLIMSERVER_H2C_ALLOW_PUBLIC`): allowed (emits a `warn!`).
+///   - `allow_public = false`: **hard-fail** with a clear error.
+///
+/// This is a pure function with no I/O side-effects, extracted for unit testability.
+pub fn check_h2c_bind_safety(
+    cert_source: &CertSource,
+    addr: std::net::SocketAddr,
+    allow_public: bool,
+) -> anyhow::Result<()> {
+    if *cert_source != CertSource::H2c {
+        return Ok(());
+    }
+    if addr.ip().is_loopback() {
+        // Loopback h2c is always safe — nothing on the network can reach it.
+        return Ok(());
+    }
+    // Non-loopback h2c.
+    if allow_public {
+        // Operator has explicitly acknowledged the risk.
+        log::warn!(
+            "h2c: non-loopback bind on {} acknowledged via \
+             --i-know-this-is-behind-a-proxy / ZELLIMSERVER_H2C_ALLOW_PUBLIC — \
+             ensure a TLS-terminating proxy is in front of this port",
+            addr
+        );
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "refusing to bind h2c (plaintext gRPC) on non-loopback address {addr}. \
+             Plaintext gRPC on a public/LAN address exposes API tokens and terminal \
+             output in the clear. If you are running behind a TLS-terminating reverse \
+             proxy (e.g. Traefik + Let's Encrypt, Cloudflare), re-run with \
+             --i-know-this-is-behind-a-proxy (or set \
+             ZELLIMSERVER_H2C_ALLOW_PUBLIC=1) to acknowledge the risk. \
+             To serve TLS directly, omit --insecure-h2c."
+        )
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -610,6 +659,87 @@ mod tests {
             }),
             CertMode::External
         );
+    }
+
+    // ── check_h2c_bind_safety tests ───────────────────────────────────────────
+
+    /// Non-h2c cert sources are always allowed regardless of address or ack.
+    #[test]
+    fn h2c_safety_non_h2c_always_ok() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:50051".parse().unwrap();
+        let public: std::net::SocketAddr = "0.0.0.0:50051".parse().unwrap();
+        let lan: std::net::SocketAddr = "192.168.1.100:50051".parse().unwrap();
+
+        for addr in [loopback, public, lan] {
+            assert!(
+                check_h2c_bind_safety(&CertSource::SelfSigned, addr, false).is_ok(),
+                "SelfSigned on {addr} should always be ok"
+            );
+            assert!(
+                check_h2c_bind_safety(
+                    &CertSource::External { cert: "/c.pem".into(), key: "/k.pem".into() },
+                    addr,
+                    false
+                )
+                .is_ok(),
+                "External on {addr} should always be ok"
+            );
+        }
+    }
+
+    /// H2c on loopback is always allowed, even without the ack flag.
+    #[test]
+    fn h2c_safety_loopback_always_allowed() {
+        let lo4: std::net::SocketAddr = "127.0.0.1:50051".parse().unwrap();
+        let lo6: std::net::SocketAddr = "[::1]:50051".parse().unwrap();
+
+        assert!(
+            check_h2c_bind_safety(&CertSource::H2c, lo4, false).is_ok(),
+            "h2c on 127.0.0.1 should be allowed without ack"
+        );
+        assert!(
+            check_h2c_bind_safety(&CertSource::H2c, lo4, true).is_ok(),
+            "h2c on 127.0.0.1 should be allowed with ack"
+        );
+        assert!(
+            check_h2c_bind_safety(&CertSource::H2c, lo6, false).is_ok(),
+            "h2c on [::1] should be allowed without ack"
+        );
+    }
+
+    /// H2c on a non-loopback address is denied when the ack flag is not set.
+    #[test]
+    fn h2c_safety_non_loopback_denied_without_ack() {
+        let addrs: Vec<std::net::SocketAddr> = vec![
+            "0.0.0.0:50051".parse().unwrap(),
+            "192.168.1.5:50051".parse().unwrap(),
+            "10.0.0.1:50051".parse().unwrap(),
+            "[::]:50051".parse().unwrap(),
+        ];
+        for addr in addrs {
+            let err = check_h2c_bind_safety(&CertSource::H2c, addr, false)
+                .expect_err(&format!("h2c on {addr} without ack should fail"));
+            assert!(
+                err.to_string().contains("--i-know-this-is-behind-a-proxy"),
+                "error message should mention the ack flag, got: {err}"
+            );
+        }
+    }
+
+    /// H2c on a non-loopback address is allowed when the ack flag is set.
+    #[test]
+    fn h2c_safety_non_loopback_allowed_with_ack() {
+        let addrs: Vec<std::net::SocketAddr> = vec![
+            "0.0.0.0:50051".parse().unwrap(),
+            "192.168.1.5:50051".parse().unwrap(),
+            "[::]:50051".parse().unwrap(),
+        ];
+        for addr in addrs {
+            assert!(
+                check_h2c_bind_safety(&CertSource::H2c, addr, true).is_ok(),
+                "h2c on {addr} with ack should be allowed"
+            );
+        }
     }
 }
 

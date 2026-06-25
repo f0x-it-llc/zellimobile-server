@@ -30,7 +30,7 @@ use clap::Parser;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use zellimserver::auth::BearerAuthLayer;
 use zellimserver::cli::{Cli, Command, InitArgs, StartArgs};
-use zellimserver::config::{self, CertSource};
+use zellimserver::config::{self, CertSource, check_h2c_bind_safety};
 use zellimserver::control::{self, ControlRequest, ControlResponse};
 use zellimserver::grpc::ZelliService;
 use zellimserver::proto::zelli_server::ZelliServer;
@@ -264,23 +264,48 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
     // Collect SANs from CLI + env + bind IP.
     let extra_sans = collect_sans(&args.san, &cfg.bind_addr);
 
-    // If both --tls-cert and --tls-key are provided, validate the external cert
-    // without generating a self-signed one. Otherwise load/generate self-signed.
-    match (args.tls_cert.as_deref(), args.tls_key.as_deref()) {
-        (Some(cert_path), Some(key_path)) => {
-            // Validate external cert/key pair.
-            zellimserver::tls::load_external_identity(cert_path, key_path)
-                .with_context(|| {
-                    format!(
-                        "failed to validate external TLS cert '{}' and key '{}'",
-                        cert_path.display(),
-                        key_path.display()
-                    )
-                })?;
-            println!("Cert     : {} (external — valid)", cert_path.display());
-            println!("Key      : {} (external — valid)", key_path.display());
+    // Use the same cert-source resolution as `cmd_start` (env fallbacks +
+    // precedence + mutual-exclusion validation — no hand-rolled match here).
+    let cert_source =
+        config::resolve_cert_source(args.tls_cert.clone(), args.tls_key.clone(), args.insecure_h2c)
+            .context("invalid TLS cert configuration")?;
+
+    match &cert_source {
+        CertSource::External { cert, key } => {
+            // Validate that the cert+key can actually be loaded now (gives the
+            // operator early feedback at `init` time rather than at `start`).
+            zellimserver::tls::load_external_identity(cert, key).with_context(|| {
+                format!(
+                    "failed to validate external TLS cert '{}' and key '{}'",
+                    cert.display(),
+                    key.display()
+                )
+            })?;
+            println!("Cert     : {} (external — valid)", cert.display());
+            println!("Key      : {} (external — valid)", key.display());
+
+            // Print the SANs covered by the cert (informational; ext cert SANs are
+            // whatever the CA issued — we just validate the files are loadable).
+            let builtin = vec!["127.0.0.1", "localhost"];
+            let extra_desc: Vec<String> = extra_sans
+                .iter()
+                .map(|s| match s {
+                    SanEntry::Ip(ip) => ip.to_string(),
+                    SanEntry::Dns(d) => d.clone(),
+                })
+                .collect();
+            let all_sans: Vec<&str> = builtin
+                .iter()
+                .copied()
+                .chain(extra_desc.iter().map(String::as_str))
+                .collect();
+            println!("Cert SANs: {} (note: external cert SANs are fixed by the issuer)", all_sans.join(", "));
         }
-        (None, None) => {
+        CertSource::H2c => {
+            // No cert needed — plaintext h2c delegates TLS to the proxy.
+            println!("Cert     : none (h2c — TLS is handled by the reverse proxy)");
+        }
+        CertSource::SelfSigned => {
             // Load or generate the self-signed cert+key (idempotent w.r.t. SANs).
             let (_identity, _cert_pem) =
                 zellimserver::tls::load_or_generate_identity(&extra_sans)
@@ -290,30 +315,24 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
             let cert_path = data_dir.join("server.crt");
             println!("Cert     : {}", cert_path.display());
             println!("Key      : {}", data_dir.join("server.key").display());
-        }
-        (Some(_), None) => {
-            anyhow::bail!("--tls-cert requires --tls-key; both paths must be provided together");
-        }
-        (None, Some(_)) => {
-            anyhow::bail!("--tls-key requires --tls-cert; both paths must be provided together");
+
+            // Print the SANs covered by the cert.
+            let builtin = vec!["127.0.0.1", "localhost"];
+            let extra_desc: Vec<String> = extra_sans
+                .iter()
+                .map(|s| match s {
+                    SanEntry::Ip(ip) => ip.to_string(),
+                    SanEntry::Dns(d) => d.clone(),
+                })
+                .collect();
+            let all_sans: Vec<&str> = builtin
+                .iter()
+                .copied()
+                .chain(extra_desc.iter().map(String::as_str))
+                .collect();
+            println!("Cert SANs: {}", all_sans.join(", "));
         }
     }
-
-    // Print the SANs covered by the cert.
-    let builtin = vec!["127.0.0.1", "localhost"];
-    let extra_desc: Vec<String> = extra_sans
-        .iter()
-        .map(|s| match s {
-            SanEntry::Ip(ip) => ip.to_string(),
-            SanEntry::Dns(d) => d.clone(),
-        })
-        .collect();
-    let all_sans: Vec<&str> = builtin
-        .iter()
-        .copied()
-        .chain(extra_desc.iter().map(String::as_str))
-        .collect();
-    println!("Cert SANs: {}", all_sans.join(", "));
 
     // Print the effective bind address.
     let is_default = bind_override.is_none()
@@ -463,6 +482,17 @@ fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
     let cert_source =
         config::resolve_cert_source(args.tls_cert.clone(), args.tls_key.clone(), args.insecure_h2c)
             .context("invalid TLS cert configuration")?;
+
+    // Resolve the h2c non-loopback acknowledgement (CLI flag OR env var).
+    let h2c_allow_public = args.h2c_allow_public || {
+        std::env::var("ZELLIMSERVER_H2C_ALLOW_PUBLIC")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0")
+    };
+
+    // Security guard: refuse non-loopback h2c without explicit operator ack.
+    check_h2c_bind_safety(&cert_source, addr, h2c_allow_public)
+        .context("h2c bind-safety check failed")?;
 
     // Collect extra SANs for the TLS cert (only relevant for self-signed, but harmless to collect).
     let extra_sans = collect_sans(&args.san, &cfg.bind_addr);
@@ -615,16 +645,19 @@ async fn serve(
         }
         None => {
             // H2c — no TLS.
-            log::warn!(
-                "╔══════════════════════════════════════════════════════════════════╗\n\
-                 ║  WARNING: zellimserver is serving UNENCRYPTED h2c (plaintext)   ║\n\
-                 ║  All data — including API tokens and terminal output — travels   ║\n\
-                 ║  in the clear.  This mode MUST sit behind a TLS-terminating      ║\n\
-                 ║  reverse proxy (e.g. Traefik + Let's Encrypt, Cloudflare).       ║\n\
-                 ║  NEVER expose this port directly to the internet or an           ║\n\
-                 ║  untrusted network.                                               ║\n\
-                 ╚══════════════════════════════════════════════════════════════════╝"
-            );
+            let h2c_warning = "\
+╔══════════════════════════════════════════════════════════════════╗\n\
+║  WARNING: zellimserver is serving UNENCRYPTED h2c (plaintext)   ║\n\
+║  All data — including API tokens and terminal output — travels   ║\n\
+║  in the clear.  This mode MUST sit behind a TLS-terminating      ║\n\
+║  reverse proxy (e.g. Traefik + Let's Encrypt, Cloudflare).       ║\n\
+║  NEVER expose this port directly to the internet or an           ║\n\
+║  untrusted network.                                               ║\n\
+╚══════════════════════════════════════════════════════════════════╝";
+            // Emit to stderr so the warning is visible in the foreground path
+            // (log output may be redirected / suppressed in daemon mode).
+            eprintln!("{h2c_warning}");
+            log::warn!("{h2c_warning}");
             None
         }
     };
