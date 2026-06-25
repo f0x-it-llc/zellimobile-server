@@ -249,6 +249,81 @@ pub fn generate_self_signed_pem(extra_sans: &[SanEntry]) -> Result<(String, Stri
     Ok((cert.pem(), signing_key.serialize_pem()))
 }
 
+/// Load a TLS identity from user-provided PEM files.
+///
+/// Reads `cert_path` and `key_path` from disk, validates that the cert file
+/// contains at least one `CERTIFICATE` PEM block and that the key file is
+/// non-empty, then builds a [`tonic::transport::Identity`].
+///
+/// Returns `(Identity, cert_pem_string)` — the same shape as
+/// [`load_or_generate_identity`] so callers can compute a fingerprint or log
+/// the cert.
+///
+/// ## Constraints
+///
+/// - Does **not** write, chmod, rename, or otherwise mutate the user's files —
+///   they are operator-managed.
+/// - Both files must be readable; returns a clear `anyhow` error naming the
+///   missing/unreadable path if either cannot be read.
+/// - Returns an error if the cert file contains no `CERTIFICATE` block.
+/// - Returns an error if the key file is empty.
+///
+/// ## Example
+///
+/// ```no_run
+/// use std::path::Path;
+/// use zellimserver::tls::load_external_identity;
+///
+/// let (identity, cert_pem) = load_external_identity(
+///     Path::new("/etc/ssl/certs/server.crt"),
+///     Path::new("/etc/ssl/private/server.key"),
+/// ).unwrap();
+/// ```
+pub fn load_external_identity(cert_path: &Path, key_path: &Path) -> Result<(Identity, String)> {
+    // Read cert PEM.
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .with_context(|| format!("tls: cannot read cert file '{}'", cert_path.display()))?;
+
+    // Read key PEM.
+    let key_pem = std::fs::read_to_string(key_path)
+        .with_context(|| format!("tls: cannot read key file '{}'", key_path.display()))?;
+
+    // Validate: cert must contain at least one CERTIFICATE block.
+    {
+        use std::io::BufReader;
+        let mut reader = BufReader::new(cert_pem.as_bytes());
+        let first = rustls_pemfile::certs(&mut reader).next();
+        match first {
+            None => {
+                anyhow::bail!(
+                    "tls: cert file '{}' contains no CERTIFICATE PEM block",
+                    cert_path.display()
+                );
+            }
+            Some(Err(e)) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "tls: failed to decode CERTIFICATE block in '{}'",
+                        cert_path.display()
+                    )
+                });
+            }
+            Some(Ok(_)) => {} // at least one valid DER block present
+        }
+    }
+
+    // Validate: key file must be non-empty.
+    if key_pem.trim().is_empty() {
+        anyhow::bail!(
+            "tls: key file '{}' is empty",
+            key_path.display()
+        );
+    }
+
+    let identity = Identity::from_pem(cert_pem.as_bytes(), key_pem.as_bytes());
+    Ok((identity, cert_pem))
+}
+
 /// Write `content` to `path` and restrict its permissions to `0600` on Unix.
 fn write_restricted(path: &std::path::Path, content: &str) -> Result<()> {
     std::fs::write(path, content)?;
@@ -307,5 +382,122 @@ mod tests {
 
         // Must be deterministic for the same input.
         assert_eq!(fp1, fp2, "fingerprint should be deterministic");
+    }
+
+    #[test]
+    fn load_external_identity_roundtrip() {
+        // Generate a self-signed pair to use as "user-provided" PEM files.
+        let (cert_pem, key_pem) = generate_self_signed_pem(&[]).expect("generate cert");
+
+        // Write to temp dir with unique names.
+        let tmp = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let cert_path = tmp.join(format!("zellimserver_test_cert_{unique}.pem"));
+        let key_path = tmp.join(format!("zellimserver_test_key_{unique}.pem"));
+
+        std::fs::write(&cert_path, &cert_pem).expect("write temp cert");
+        std::fs::write(&key_path, &key_pem).expect("write temp key");
+
+        // load_external_identity must succeed.
+        let result = load_external_identity(&cert_path, &key_path);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+
+        let (_identity, returned_cert_pem) = result.unwrap();
+
+        // Returned cert PEM must equal what was written.
+        assert_eq!(
+            returned_cert_pem, cert_pem,
+            "returned cert_pem must match written cert PEM"
+        );
+
+        // cert_sha256_fingerprint of the returned pem must be 64 hex chars.
+        let fp = cert_sha256_fingerprint(&returned_cert_pem).expect("fingerprint");
+        assert_eq!(fp.len(), 64, "fingerprint must be 64 chars");
+        assert!(
+            fp.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "fingerprint must be lowercase hex: {fp}"
+        );
+
+        // Clean up temp files.
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn load_external_identity_missing_cert_returns_err() {
+        let tmp = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let cert_path = tmp.join(format!("zellimserver_test_missing_cert_{unique}.pem"));
+        let key_path = tmp.join(format!("zellimserver_test_missing_key_{unique}.pem"));
+
+        // Neither file exists — should fail with a clear error naming the cert path.
+        let err = load_external_identity(&cert_path, &key_path)
+            .expect_err("expected Err for missing cert");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&cert_path.display().to_string()),
+            "error should name the missing cert path; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_external_identity_missing_key_returns_err() {
+        let (cert_pem, _key_pem) = generate_self_signed_pem(&[]).expect("generate cert");
+
+        let tmp = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let cert_path = tmp.join(format!("zellimserver_test_cert2_{unique}.pem"));
+        let key_path = tmp.join(format!("zellimserver_test_missing_key2_{unique}.pem"));
+
+        std::fs::write(&cert_path, &cert_pem).expect("write temp cert");
+        // key_path intentionally not written — must be missing.
+
+        let err = load_external_identity(&cert_path, &key_path)
+            .expect_err("expected Err for missing key");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&key_path.display().to_string()),
+            "error should name the missing key path; got: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+    }
+
+    #[test]
+    fn load_external_identity_invalid_cert_pem_returns_err() {
+        let (_cert_pem, key_pem) = generate_self_signed_pem(&[]).expect("generate cert");
+
+        let tmp = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let cert_path = tmp.join(format!("zellimserver_test_invalid_cert_{unique}.pem"));
+        let key_path = tmp.join(format!("zellimserver_test_valid_key_{unique}.pem"));
+
+        // Write garbage instead of a valid CERTIFICATE block.
+        std::fs::write(&cert_path, "this is not a certificate\n").expect("write invalid cert");
+        std::fs::write(&key_path, &key_pem).expect("write temp key");
+
+        let err = load_external_identity(&cert_path, &key_path)
+            .expect_err("expected Err for invalid cert PEM");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no CERTIFICATE PEM block") || msg.contains("CERTIFICATE"),
+            "error should mention missing CERTIFICATE block; got: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
     }
 }
