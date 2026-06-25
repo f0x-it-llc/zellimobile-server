@@ -304,6 +304,20 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
         CertSource::H2c => {
             // No cert needed — plaintext h2c delegates TLS to the proxy.
             println!("Cert     : none (h2c — TLS is handled by the reverse proxy)");
+
+            // Advisory: cmd_start hard-blocks non-loopback h2c without the ack
+            // flag.  cmd_init doesn't bind, so there is no security gap here,
+            // but surfacing the same note helps the operator anticipate what
+            // `start` will require.
+            if let Ok(addr) = cfg.bind_addr.parse::<std::net::SocketAddr>() {
+                if !addr.ip().is_loopback() {
+                    println!(
+                        "Note     : h2c + non-loopback bind ({}) — \
+                         `start` will require --i-know-this-is-behind-a-proxy",
+                        cfg.bind_addr
+                    );
+                }
+            }
         }
         CertSource::SelfSigned => {
             // Load or generate the self-signed cert+key (idempotent w.r.t. SANs).

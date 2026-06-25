@@ -28,8 +28,7 @@ const CTL_STATE_FILE: &str = "zellimctl_state";
 
 /// The serialised string for each `AdvertiseTrust` variant.
 ///
-/// Using lower-case values that round-trip through [`parse_advertise_trust`] and
-/// [`format_advertise_trust`].
+/// Using lower-case values that round-trip through [`parse_advertise_trust`].
 const TRUST_AUTO: &str = "auto";
 const TRUST_CA: &str = "ca";
 const TRUST_PIN: &str = "pin";
@@ -42,16 +41,6 @@ const TRUST_PIN: &str = "pin";
 fn ctl_state_path() -> Result<PathBuf> {
     let dir = zellimserver::config::data_dir()?;
     Ok(dir.join(CTL_STATE_FILE))
-}
-
-/// Serialise an `AdvertiseTrust` variant to its canonical string.
-///
-/// Accepts the integer discriminant to avoid an import dependency of
-/// `AdvertiseTrust` into the `server/` layer.  The caller passes the value
-/// produced by [`super::super::app::state::AdvertiseTrust::persist_str`].
-fn format_advertise_trust(s: &str) -> &str {
-    // Just re-export — the caller already produced the right string.
-    s
 }
 
 /// Parse an `advertise_trust` string value back to one of the three canonical
@@ -97,7 +86,6 @@ pub fn load_advertise_trust() -> &'static str {
 /// state file.  Errors are logged at `warn` level and silently swallowed — a
 /// persistence failure must never crash the TUI.
 pub fn save_advertise_trust(value: &str) {
-    let canonical = format_advertise_trust(value);
     let path = match ctl_state_path() {
         Ok(p) => p,
         Err(e) => {
@@ -105,9 +93,9 @@ pub fn save_advertise_trust(value: &str) {
             return;
         }
     };
-    if let Err(e) = std::fs::write(&path, canonical).with_context(|| {
+    if let Err(e) = std::fs::write(&path, value).with_context(|| {
         format!(
-            "ctl_state: write advertise_trust={canonical} to {}",
+            "ctl_state: write advertise_trust={value} to {}",
             path.display()
         )
     }) {

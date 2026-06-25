@@ -293,7 +293,6 @@ fn build_token_qr_task(
 ) -> Message {
     use crate::app::state::AdvertiseTrust;
     use crate::pairing::payload::{PairingParams, PairingTrust};
-    use zellimserver::config::CertMode;
 
     // 1. Guard: the server must be running.
     if !crate::server::is_running() {
@@ -368,17 +367,13 @@ fn build_token_qr_task(
             }
         }
 
-        // Layer-2 Auto: consult Layer-1 cert_mode + heuristic.
+        // Layer-2 Auto: consult Layer-1 cert_mode via the shared pure helper.
         AdvertiseTrust::Auto => {
             // Layer-1: query the running server's cert_mode.
             let cert_mode = crate::server::server_cert_mode();
 
-            match cert_mode {
-                // External cert or h2c → system-CA trust; no fingerprint needed.
-                // These modes mean the client sees either a CA-signed cert or the
-                // proxy's edge cert — pinning the local self-signed cert would fail.
-                Some(CertMode::External) | Some(CertMode::H2c) => PairingTrust::Ca,
-
+            // resolve_auto_trust: true → Pin (SelfSigned/None); false → Ca (External/H2c).
+            if resolve_auto_trust(cert_mode) {
                 // Self-signed cert (or server not running / old server without
                 // cert_mode field, which defaults to SelfSigned).
                 //
@@ -394,25 +389,28 @@ fn build_token_qr_task(
                 // the `t` toggle to force `Ca` explicitly.  The Cert screen shows
                 // an advisory hint when the host looks like a DNS name + SelfSigned
                 // (Finding 2), nudging the operator toward that override.
-                Some(CertMode::SelfSigned) | None => {
-                    match crate::server::current_cert_fingerprint() {
-                        Ok(Some(fp)) => PairingTrust::Pin { fingerprint: fp },
-                        Ok(None) => {
-                            return Message::TokenQrFailed {
-                                err: "No certificate yet — open the Cert screen and \
-                                      generate one first."
-                                    .to_string(),
-                                seq,
-                            };
-                        }
-                        Err(e) => {
-                            return Message::TokenQrFailed {
-                                err: format!("cert fingerprint: {e}"),
-                                seq,
-                            };
-                        }
+                match crate::server::current_cert_fingerprint() {
+                    Ok(Some(fp)) => PairingTrust::Pin { fingerprint: fp },
+                    Ok(None) => {
+                        return Message::TokenQrFailed {
+                            err: "No certificate yet — open the Cert screen and \
+                                  generate one first."
+                                .to_string(),
+                            seq,
+                        };
+                    }
+                    Err(e) => {
+                        return Message::TokenQrFailed {
+                            err: format!("cert fingerprint: {e}"),
+                            seq,
+                        };
                     }
                 }
+            } else {
+                // External cert or h2c → system-CA trust; no fingerprint needed.
+                // These modes mean the client sees either a CA-signed cert or the
+                // proxy's edge cert — pinning the local self-signed cert would fail.
+                PairingTrust::Ca
             }
         }
     };
@@ -453,6 +451,29 @@ fn build_token_qr_task(
         fingerprint_short,
         baseline_clients,
         seq,
+    }
+}
+
+/// Resolve the Auto-mode pairing trust from the server's reported cert mode.
+///
+/// Returns `true` if the mode requires a fingerprint Pin, `false` if Ca trust
+/// (no fingerprint) is appropriate.
+///
+/// Mapping:
+/// - `External` | `H2c` → `false` (Ca): the client sees a CA-signed or
+///   proxy-edge cert; pinning the server's local self-signed cert would fail.
+/// - `SelfSigned` | `None` → `true` (Pin): no CA-valid cert exists, so the
+///   client must pin the fingerprint.  `None` is the conservative fallback for
+///   an old server that predates the `cert_mode` field.
+///
+/// This is a pure function with no I/O.  The `Auto` branch of
+/// `build_token_qr_task` delegates to it so both production code and unit
+/// tests exercise the same mapping.
+pub(crate) fn resolve_auto_trust(cert_mode: Option<zellimserver::config::CertMode>) -> bool {
+    use zellimserver::config::CertMode;
+    match cert_mode {
+        Some(CertMode::External) | Some(CertMode::H2c) => false,
+        Some(CertMode::SelfSigned) | None => true,
     }
 }
 
@@ -576,19 +597,9 @@ mod tests {
     // must always attempt Pin (regardless of host shape), and Auto + External/H2c
     // must always yield Ca.
     //
-    // Because `build_token_qr_task` calls live server functions (IPC, cert file IO),
-    // we test the trust decision logic in isolation by factoring the key predicate.
-
-    /// Mirror of the `CertMode` matching logic in `build_token_qr_task` for the
-    /// `Auto` branch — pure, no I/O.  Returns `true` if the mode should resolve to
-    /// Pin (i.e. needs a fingerprint), `false` if it should resolve to Ca.
-    fn auto_mode_wants_pin(cert_mode: Option<zellimserver::config::CertMode>) -> bool {
-        use zellimserver::config::CertMode;
-        match cert_mode {
-            Some(CertMode::External) | Some(CertMode::H2c) => false,
-            Some(CertMode::SelfSigned) | None => true,
-        }
-    }
+    // Tests call `resolve_auto_trust` — the real pure fn used by
+    // `build_token_qr_task` — so any future divergence between tests and the
+    // production path will be caught at compile time.
 
     #[test]
     fn auto_self_signed_dns_host_wants_pin() {
@@ -597,7 +608,7 @@ mod tests {
         // The old code emitted Ca here; the fix always emits Pin for SelfSigned.
         use zellimserver::config::CertMode;
         assert!(
-            auto_mode_wants_pin(Some(CertMode::SelfSigned)),
+            resolve_auto_trust(Some(CertMode::SelfSigned)),
             "Auto + SelfSigned must want Pin regardless of host shape"
         );
     }
@@ -610,7 +621,7 @@ mod tests {
         // The loopback-exclusion is now only used by the Cert-screen hint
         // (host_looks_like_dns), not by the QR trust resolution.
         assert!(
-            auto_mode_wants_pin(Some(CertMode::SelfSigned)),
+            resolve_auto_trust(Some(CertMode::SelfSigned)),
             "Auto + SelfSigned must want Pin for localhost host"
         );
     }
@@ -620,7 +631,7 @@ mod tests {
         // Auto + External cert → Ca (no fingerprint needed).
         use zellimserver::config::CertMode;
         assert!(
-            !auto_mode_wants_pin(Some(CertMode::External)),
+            !resolve_auto_trust(Some(CertMode::External)),
             "Auto + External must resolve to Ca"
         );
     }
@@ -630,7 +641,7 @@ mod tests {
         // Auto + H2c → Ca (no fingerprint needed — no cert at all).
         use zellimserver::config::CertMode;
         assert!(
-            !auto_mode_wants_pin(Some(CertMode::H2c)),
+            !resolve_auto_trust(Some(CertMode::H2c)),
             "Auto + H2c must resolve to Ca"
         );
     }
@@ -639,7 +650,7 @@ mod tests {
     fn auto_none_cert_mode_wants_pin() {
         // None (server down or pre-cert_mode server) → conservative fallback: Pin.
         assert!(
-            auto_mode_wants_pin(None),
+            resolve_auto_trust(None),
             "Auto + None cert_mode must want Pin (conservative fallback)"
         );
     }
