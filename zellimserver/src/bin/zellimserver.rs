@@ -27,10 +27,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tonic::transport::{Server, ServerTlsConfig};
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use zellimserver::auth::BearerAuthLayer;
 use zellimserver::cli::{Cli, Command, InitArgs, StartArgs};
-use zellimserver::config;
+use zellimserver::config::{self, CertSource};
 use zellimserver::control::{self, ControlRequest, ControlResponse};
 use zellimserver::grpc::ZelliService;
 use zellimserver::proto::zelli_server::ZelliServer;
@@ -264,14 +264,40 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
     // Collect SANs from CLI + env + bind IP.
     let extra_sans = collect_sans(&args.san, &cfg.bind_addr);
 
-    // Load or generate the self-signed cert+key (idempotent w.r.t. SANs).
-    let (_identity, _cert_pem) = zellimserver::tls::load_or_generate_identity(&extra_sans)
-        .context("failed to load/generate TLS certificate")?;
+    // If both --tls-cert and --tls-key are provided, validate the external cert
+    // without generating a self-signed one. Otherwise load/generate self-signed.
+    match (args.tls_cert.as_deref(), args.tls_key.as_deref()) {
+        (Some(cert_path), Some(key_path)) => {
+            // Validate external cert/key pair.
+            zellimserver::tls::load_external_identity(cert_path, key_path)
+                .with_context(|| {
+                    format!(
+                        "failed to validate external TLS cert '{}' and key '{}'",
+                        cert_path.display(),
+                        key_path.display()
+                    )
+                })?;
+            println!("Cert     : {} (external — valid)", cert_path.display());
+            println!("Key      : {} (external — valid)", key_path.display());
+        }
+        (None, None) => {
+            // Load or generate the self-signed cert+key (idempotent w.r.t. SANs).
+            let (_identity, _cert_pem) =
+                zellimserver::tls::load_or_generate_identity(&extra_sans)
+                    .context("failed to load/generate TLS certificate")?;
 
-    // Print the cert file path.
-    let cert_path = data_dir.join("server.crt");
-    println!("Cert     : {}", cert_path.display());
-    println!("Key      : {}", data_dir.join("server.key").display());
+            // Print the cert file path.
+            let cert_path = data_dir.join("server.crt");
+            println!("Cert     : {}", cert_path.display());
+            println!("Key      : {}", data_dir.join("server.key").display());
+        }
+        (Some(_), None) => {
+            anyhow::bail!("--tls-cert requires --tls-key; both paths must be provided together");
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("--tls-key requires --tls-cert; both paths must be provided together");
+        }
+    }
 
     // Print the SANs covered by the cert.
     let builtin = vec!["127.0.0.1", "localhost"];
@@ -433,7 +459,12 @@ fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
         .parse()
         .with_context(|| format!("invalid bind address '{}'", cfg.bind_addr))?;
 
-    // Collect extra SANs for the TLS cert.
+    // Resolve cert source from CLI args (applies precedence: h2c > external > self-signed).
+    let cert_source =
+        config::resolve_cert_source(args.tls_cert.clone(), args.tls_key.clone(), args.insecure_h2c)
+            .context("invalid TLS cert configuration")?;
+
+    // Collect extra SANs for the TLS cert (only relevant for self-signed, but harmless to collect).
     let extra_sans = collect_sans(&args.san, &cfg.bind_addr);
 
     let pidfile = pidfile_path()?;
@@ -503,6 +534,7 @@ fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
         cfg.bind_addr.clone(),
         args.daemonize,
         extra_sans,
+        cert_source,
     ));
 
     // Foreground cleanup (in daemon mode daemonize owns the pidfile).
@@ -514,50 +546,120 @@ fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
     result
 }
 
-/// Build the TLS gRPC server, wire up the control socket + graceful shutdown,
+/// Resolve a TLS identity from the given [`CertSource`].
+///
+/// Returns `Some((Identity, cert_pem_string))` for TLS modes, or `None` for
+/// h2c (plaintext HTTP/2 — no identity needed).
+///
+/// This is a pure(-ish) helper extracted for unit testability.
+fn cert_identity(
+    cert_source: &CertSource,
+    extra_sans: &[SanEntry],
+) -> Result<Option<(Identity, String)>> {
+    match cert_source {
+        CertSource::SelfSigned => {
+            let pair = zellimserver::tls::load_or_generate_identity(extra_sans)
+                .context("failed to load/generate self-signed TLS certificate")?;
+            Ok(Some(pair))
+        }
+        CertSource::External { cert, key } => {
+            let pair = zellimserver::tls::load_external_identity(cert, key)
+                .with_context(|| {
+                    format!(
+                        "failed to load external TLS cert '{}' and key '{}'",
+                        cert.display(),
+                        key.display()
+                    )
+                })?;
+            log::info!(
+                "tls: using external certificate '{}' with key '{}'",
+                cert.display(),
+                key.display()
+            );
+            Ok(Some(pair))
+        }
+        CertSource::H2c => Ok(None),
+    }
+}
+
+/// Build the gRPC server, wire up the control socket + graceful shutdown,
 /// and serve until shutdown is requested.
+///
+/// TLS behaviour is driven by `cert_source`:
+/// - `SelfSigned` → load or generate the self-signed cert; serve over TLS.
+/// - `External`   → load the caller-supplied cert+key; serve over TLS.
+/// - `H2c`        → serve plaintext HTTP/2; **MUST** sit behind a trusted TLS proxy.
 async fn serve(
     addr: std::net::SocketAddr,
     bind_addr: String,
     quiet: bool,
     extra_sans: Vec<SanEntry>,
+    cert_source: CertSource,
 ) -> Result<()> {
     install_crypto_provider();
 
-    // ── TLS: load or generate self-signed cert ───────────────────────────────
-    let (identity, cert_pem) = zellimserver::tls::load_or_generate_identity(&extra_sans)
-        .context("failed to load/generate TLS certificate")?;
+    let cert_mode = cert_source.mode();
 
-    // Print the cert PEM so test clients can capture it (foreground only — in
-    // daemon mode this lands in the logfile, which is fine).
-    if !quiet {
-        println!("=== SERVER CERT PEM ===");
-        print!("{cert_pem}");
-        println!("=== END SERVER CERT PEM ===");
-    }
+    // ── TLS / h2c transport setup ────────────────────────────────────────────
+    let maybe_tls: Option<ServerTlsConfig> = match cert_identity(&cert_source, &extra_sans)? {
+        Some((identity, cert_pem)) => {
+            // Print the cert PEM so test clients can capture it (foreground
+            // only — in daemon mode this lands in the logfile, which is fine).
+            // Skip for h2c (no cert to print — handled by the None arm below).
+            if !quiet {
+                println!("=== SERVER CERT PEM ===");
+                print!("{cert_pem}");
+                println!("=== END SERVER CERT PEM ===");
+            }
+            Some(ServerTlsConfig::new().identity(identity))
+        }
+        None => {
+            // H2c — no TLS.
+            log::warn!(
+                "╔══════════════════════════════════════════════════════════════════╗\n\
+                 ║  WARNING: zellimserver is serving UNENCRYPTED h2c (plaintext)   ║\n\
+                 ║  All data — including API tokens and terminal output — travels   ║\n\
+                 ║  in the clear.  This mode MUST sit behind a TLS-terminating      ║\n\
+                 ║  reverse proxy (e.g. Traefik + Let's Encrypt, Cloudflare).       ║\n\
+                 ║  NEVER expose this port directly to the internet or an           ║\n\
+                 ║  untrusted network.                                               ║\n\
+                 ╚══════════════════════════════════════════════════════════════════╝"
+            );
+            None
+        }
+    };
 
-    let tls_config = ServerTlsConfig::new().identity(identity);
     let service = ZelliService::new();
 
     // ── Control socket + graceful shutdown signal ────────────────────────────
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    // Pass a clone of the client registry so the control listener can report
-    // the live total-client count in `Status` responses (T01 — client_count).
+    // Pass the cert_mode so `status` can report the active transport mode.
     control::spawn_listener(
         bind_addr.clone(),
         Instant::now(),
         shutdown_tx,
         service.clients(),
+        cert_mode,
     )
     .context("failed to start control socket")?;
 
-    log::info!("zellimserver starting on {addr} (TLS + bearer auth)");
+    let transport_desc = match cert_mode {
+        zellimserver::config::CertMode::SelfSigned => "TLS (self-signed)",
+        zellimserver::config::CertMode::External => "TLS (external cert)",
+        zellimserver::config::CertMode::H2c => "h2c (plaintext — proxy-terminated TLS expected)",
+    };
+    log::info!("zellimserver starting on {addr} ({transport_desc} + bearer auth)");
 
+    // ── Build the server builder, applying TLS only when not h2c ────────────
     // BearerAuthLayer wraps the router at the HTTP level so it sees the full
     // URI path — it can distinguish Login/GetVersion from AttachTerminal.
-    Server::builder()
-        .tls_config(tls_config)
-        .context("failed to configure TLS")?
+    let mut builder = Server::builder();
+    if let Some(tls) = maybe_tls {
+        builder = builder
+            .tls_config(tls)
+            .context("failed to configure TLS")?;
+    }
+    builder
         .layer(BearerAuthLayer)
         .add_service(ZelliServer::new(service))
         .serve_with_shutdown(addr, async move {
@@ -569,6 +671,41 @@ async fn serve(
 
     log::info!("zellimserver stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `cert_identity` must return `None` for h2c — no TLS identity to load.
+    #[test]
+    fn cert_identity_h2c_returns_none() {
+        // No crypto provider needed — h2c returns before touching TLS.
+        let result = cert_identity(&CertSource::H2c, &[]);
+        assert!(result.is_ok(), "cert_identity(H2c) should not error: {:?}", result.err());
+        assert!(result.unwrap().is_none(), "cert_identity(H2c) must return None");
+    }
+
+    /// `cert_identity` for SelfSigned must return `Some` with a non-empty cert PEM.
+    #[test]
+    fn cert_identity_self_signed_returns_some() {
+        // Install the ring crypto provider so TLS ops work in the test runtime.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let result = cert_identity(&CertSource::SelfSigned, &[]);
+        assert!(
+            result.is_ok(),
+            "cert_identity(SelfSigned) should succeed: {:?}",
+            result.err()
+        );
+        let pair = result.unwrap();
+        assert!(pair.is_some(), "cert_identity(SelfSigned) must return Some");
+        let (_identity, cert_pem) = pair.unwrap();
+        assert!(
+            cert_pem.contains("CERTIFICATE"),
+            "cert PEM must contain CERTIFICATE block"
+        );
+    }
 }
 
 // ── status ──────────────────────────────────────────────────────────────────
