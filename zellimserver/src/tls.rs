@@ -266,7 +266,7 @@ pub fn generate_self_signed_pem(extra_sans: &[SanEntry]) -> Result<(String, Stri
 /// - Both files must be readable; returns a clear `anyhow` error naming the
 ///   missing/unreadable path if either cannot be read.
 /// - Returns an error if the cert file contains no `CERTIFICATE` block.
-/// - Returns an error if the key file is empty.
+/// - Returns an error if the key file contains no recognisable private key PEM block.
 ///
 /// ## Example
 ///
@@ -312,12 +312,32 @@ pub fn load_external_identity(cert_path: &Path, key_path: &Path) -> Result<(Iden
         }
     }
 
-    // Validate: key file must be non-empty.
-    if key_pem.trim().is_empty() {
-        anyhow::bail!(
-            "tls: key file '{}' is empty",
-            key_path.display()
-        );
+    // Validate: key file must contain at least one parseable private key.
+    //
+    // `Identity::from_pem` defers key parsing to serve-time, so a malformed or
+    // mismatched key would pass here and then crash after daemonization with an
+    // opaque error.  We parse eagerly to surface the problem at `init` time.
+    {
+        use std::io::BufReader;
+        let mut reader = BufReader::new(key_pem.as_bytes());
+        match rustls_pemfile::private_key(&mut reader) {
+            Ok(Some(_)) => {} // found a valid private key — all good
+            Ok(None) => {
+                anyhow::bail!(
+                    "tls: key file '{}' contains no recognisable private key PEM block \
+                     (expected PRIVATE KEY, RSA PRIVATE KEY, or EC PRIVATE KEY)",
+                    key_path.display()
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(e)).with_context(|| {
+                    format!(
+                        "tls: failed to parse private key from '{}'",
+                        key_path.display()
+                    )
+                });
+            }
+        }
     }
 
     let identity = Identity::from_pem(cert_pem.as_bytes(), key_pem.as_bytes());
@@ -495,6 +515,70 @@ mod tests {
         assert!(
             msg.contains("no CERTIFICATE PEM block") || msg.contains("CERTIFICATE"),
             "error should mention missing CERTIFICATE block; got: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// A cert file paired with a completely empty key file must return Err naming
+    /// the key path (covers the `Ok(None)` branch of `private_key`).
+    #[test]
+    fn load_external_identity_empty_key_returns_err() {
+        let (cert_pem, _key_pem) = generate_self_signed_pem(&[]).expect("generate cert");
+
+        let tmp = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let cert_path = tmp.join(format!("zellimserver_test_cert_emptykey_{unique}.pem"));
+        let key_path = tmp.join(format!("zellimserver_test_empty_key_{unique}.pem"));
+
+        std::fs::write(&cert_path, &cert_pem).expect("write temp cert");
+        std::fs::write(&key_path, "").expect("write empty key file");
+
+        let err = load_external_identity(&cert_path, &key_path)
+            .expect_err("expected Err for empty key file");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&key_path.display().to_string()),
+            "error should name the key path; got: {msg}"
+        );
+        assert!(
+            msg.contains("private key") || msg.contains("PRIVATE KEY"),
+            "error should mention private key; got: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// A cert file paired with a garbage (non-PEM) key file must return Err naming
+    /// the key path (covers the `Ok(None)` branch of `private_key` on junk input).
+    #[test]
+    fn load_external_identity_garbage_key_returns_err() {
+        let (cert_pem, _key_pem) = generate_self_signed_pem(&[]).expect("generate cert");
+
+        let tmp = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let cert_path = tmp.join(format!("zellimserver_test_cert_garbagekey_{unique}.pem"));
+        let key_path = tmp.join(format!("zellimserver_test_garbage_key_{unique}.pem"));
+
+        std::fs::write(&cert_path, &cert_pem).expect("write temp cert");
+        // Write content that looks nothing like a PEM key block.
+        std::fs::write(&key_path, "not a key at all\nthis is garbage\n")
+            .expect("write garbage key file");
+
+        let err = load_external_identity(&cert_path, &key_path)
+            .expect_err("expected Err for garbage key file");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&key_path.display().to_string()),
+            "error should name the key path; got: {msg}"
         );
 
         let _ = std::fs::remove_file(&cert_path);
