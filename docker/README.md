@@ -145,6 +145,11 @@ cargo run --example read_client -- \
 
 ## Notes
 
+- **TLS mode:** this rig runs the **self-signed + QR-fingerprint-pinned** path (the direct/LAN
+  case). The server *also* supports serving an external CA cert (`--tls-cert`/`--tls-key`) or
+  running plaintext **h2c** behind a TLS-terminating proxy (`--insecure-h2c`) for domain/proxied
+  deployments — see [TLS modes & deployment](../README.md#tls-modes--deployment) in the main README.
+  Those modes are not exercised by this rig.
 - **Named volumes** persist the token DB, cert, and zellij config across
   restarts. Use `docker compose down -v` to reset everything.
 - **SSH:** passwordless root login (the entrypoint clears root's password —
