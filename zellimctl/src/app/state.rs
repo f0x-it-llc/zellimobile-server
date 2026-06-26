@@ -176,6 +176,72 @@ impl ConfigState {
     }
 }
 
+/// Operator-declared advertised trust mode.
+///
+/// Controls how the pairing QR encodes the trust model — overrides the automatic
+/// detection from the server's `cert_mode` when set to `Ca` or `Pin`.
+///
+/// Cycled on the Cert screen with the `t` key.  Default is `Auto`.
+///
+/// ## Resolution (see PLAN.md § "How ctl decides `tm`")
+///
+/// | `AdvertiseTrust` | `cert_mode`             | Resolved `PairingTrust`  |
+/// |------------------|-------------------------|--------------------------|
+/// | `Auto`           | `External` / `H2c`      | `Ca` (no fp)             |
+/// | `Auto`           | `SelfSigned` / unknown  | `Pin` (fp required)      |
+/// | `Auto`           | any, DNS advertise host | nudge toward `Ca`        |
+/// | `Ca`             | (any)                   | `Ca` (no fp)             |
+/// | `Pin`            | (any)                   | `Pin` (fp required)      |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdvertiseTrust {
+    /// Automatically determine trust from the running server's cert_mode.
+    #[default]
+    Auto,
+    /// Force system-CA trust (no fingerprint in the QR).
+    Ca,
+    /// Force fingerprint-pin trust (requires an on-disk self-signed cert).
+    Pin,
+}
+
+impl AdvertiseTrust {
+    /// Cycle to the next variant (for the `t` key toggle).
+    pub fn cycle(self) -> Self {
+        match self {
+            AdvertiseTrust::Auto => AdvertiseTrust::Ca,
+            AdvertiseTrust::Ca => AdvertiseTrust::Pin,
+            AdvertiseTrust::Pin => AdvertiseTrust::Auto,
+        }
+    }
+
+    /// Human-readable label for the Cert screen display.
+    pub fn label(self) -> &'static str {
+        match self {
+            AdvertiseTrust::Auto => "Auto",
+            AdvertiseTrust::Ca => "CA (force)",
+            AdvertiseTrust::Pin => "Pin (force)",
+        }
+    }
+
+    /// Serialise to the canonical persistence string (`"auto"`, `"ca"`, `"pin"`).
+    pub fn persist_str(self) -> &'static str {
+        match self {
+            AdvertiseTrust::Auto => "auto",
+            AdvertiseTrust::Ca => "ca",
+            AdvertiseTrust::Pin => "pin",
+        }
+    }
+
+    /// Deserialise from a persistence string.  Returns `Auto` for any
+    /// unrecognised value so forward compatibility is safe.
+    pub fn from_persist_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ca" => AdvertiseTrust::Ca,
+            "pin" => AdvertiseTrust::Pin,
+            _ => AdvertiseTrust::Auto,
+        }
+    }
+}
+
 /// State for the Cert screen.
 #[derive(Debug, Clone, Default)]
 pub struct CertState {
@@ -187,6 +253,12 @@ pub struct CertState {
     pub status: String,
     /// True while EnsureCert is in flight.
     pub loading: bool,
+    /// Operator-declared advertised trust override for the pairing QR.
+    ///
+    /// `Auto` resolves the trust from the server's reported `cert_mode`; `Ca`
+    /// and `Pin` force the respective mode regardless of what the server reports.
+    /// Cycled with the `t` key on the Cert screen.
+    pub advertise_trust: AdvertiseTrust,
 }
 
 // ── Tokens screen state ───────────────────────────────────────────────────────

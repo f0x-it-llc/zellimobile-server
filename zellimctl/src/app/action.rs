@@ -69,6 +69,10 @@ pub enum UpdateAction {
         read_only: bool,
         /// The sequence number of this overlay (seq-guard against stale results).
         seq: u64,
+        /// The operator-declared advertised trust override at the time the QR was
+        /// requested. Snapshotted so the async task uses the value that was active
+        /// when the user pressed Enter — not a later toggle.
+        advertise_trust: super::state::AdvertiseTrust,
     },
 
     // ── Dashboard ─────────────────────────────────────────────────────────────
@@ -78,4 +82,12 @@ pub enum UpdateAction {
     /// Never calls `ensure_cert` / `load_or_generate_identity`.  The Dashboard
     /// overview uses this for a read-only cert summary.
     LoadCertInfo,
+
+    // ── ctl-local state persistence ───────────────────────────────────────────
+    /// Persist the `advertise_trust` setting to the ctl state file.
+    ///
+    /// Handled synchronously in the runner (no async task needed for a tiny
+    /// file write).  Errors are logged and swallowed — a persistence failure
+    /// must never crash the TUI.
+    SaveAdvertiseTrust(super::state::AdvertiseTrust),
 }

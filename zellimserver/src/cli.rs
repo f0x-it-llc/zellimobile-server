@@ -86,6 +86,38 @@ pub struct InitArgs {
     /// If the on-disk cert does not cover all requested SANs it is regenerated.
     #[arg(long, value_name = "HOST_OR_IP", action = clap::ArgAction::Append)]
     pub san: Vec<String>,
+
+    /// Path to an external TLS certificate PEM file to use instead of the
+    /// auto-generated self-signed cert.
+    ///
+    /// Must be paired with `--tls-key`.  The file is validated to exist and be
+    /// readable.  Also reads ZELLIMSERVER_TLS_CERT env var when absent.
+    ///
+    /// When provided, the self-signed cert is neither generated nor overwritten.
+    #[arg(long, value_name = "PATH")]
+    pub tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to the private key PEM file that corresponds to `--tls-cert`.
+    ///
+    /// Must be paired with `--tls-cert`.  Also reads ZELLIMSERVER_TLS_KEY env
+    /// var when absent.
+    #[arg(long, value_name = "PATH")]
+    pub tls_key: Option<std::path::PathBuf>,
+
+    /// Validate the setup for h2c (plaintext HTTP/2) mode — no cert is needed.
+    ///
+    /// **WARNING:** This mode sends all data — including API tokens and terminal
+    /// output — over a PLAINTEXT connection.  It MUST only be used when the
+    /// server is sitting behind a trusted TLS-terminating reverse proxy (e.g.
+    /// Traefik with a Let's Encrypt cert, Cloudflare origin proxy).  NEVER
+    /// expose a server in h2c mode directly to the internet or an untrusted
+    /// network.
+    ///
+    /// Also enabled when ZELLIMSERVER_H2C env var is set to a truthy value
+    /// (non-empty and not "0").  Mutually exclusive with `--tls-cert` /
+    /// `--tls-key`.
+    #[arg(long)]
+    pub insecure_h2c: bool,
 }
 
 // ── start ─────────────────────────────────────────────────────────────────────
@@ -104,6 +136,54 @@ pub struct StartArgs {
     /// Also reads ZELLIMSERVER_SAN (comma-separated env var).
     #[arg(long, value_name = "HOST_OR_IP", action = clap::ArgAction::Append)]
     pub san: Vec<String>,
+
+    /// Path to an external TLS certificate PEM file to serve instead of the
+    /// auto-generated self-signed cert.
+    ///
+    /// Must be paired with `--tls-key`.  Mutually exclusive with
+    /// `--insecure-h2c`.  Also reads ZELLIMSERVER_TLS_CERT env var when absent.
+    ///
+    /// Use this when terminating TLS at the server itself with a cert from
+    /// Let's Encrypt, a corporate CA, or a Cloudflare Origin CA.
+    #[arg(long, value_name = "PATH")]
+    pub tls_cert: Option<std::path::PathBuf>,
+
+    /// Path to the private key PEM file that corresponds to `--tls-cert`.
+    ///
+    /// Must be paired with `--tls-cert`.  Mutually exclusive with
+    /// `--insecure-h2c`.  Also reads ZELLIMSERVER_TLS_KEY env var when absent.
+    #[arg(long, value_name = "PATH")]
+    pub tls_key: Option<std::path::PathBuf>,
+
+    /// Serve UNENCRYPTED HTTP/2 (h2c) instead of TLS.
+    ///
+    /// **WARNING:** This mode sends all data — including API tokens and terminal
+    /// output — over a PLAINTEXT connection.  It MUST only be used when the
+    /// server is sitting behind a trusted TLS-terminating reverse proxy (e.g.
+    /// Traefik with a Let's Encrypt cert, Cloudflare origin proxy).  NEVER
+    /// expose a server in h2c mode directly to the internet or an untrusted
+    /// network.
+    ///
+    /// Also enabled when ZELLIMSERVER_H2C env var is set to a truthy value
+    /// (non-empty and not "0").  Mutually exclusive with `--tls-cert` /
+    /// `--tls-key`.
+    #[arg(long)]
+    pub insecure_h2c: bool,
+
+    /// Explicitly acknowledge that `--insecure-h2c` is being used on a
+    /// non-loopback address behind a trusted TLS-terminating reverse proxy.
+    ///
+    /// By default, binding h2c on a non-loopback address (anything other than
+    /// `127.0.0.1` / `[::1]`) is refused as a safety measure — plaintext gRPC
+    /// must NOT be exposed directly to the network.  Set this flag to confirm
+    /// that a TLS-terminating proxy (e.g. Traefik + Let's Encrypt, Cloudflare)
+    /// is in front of this server.
+    ///
+    /// Has no effect unless `--insecure-h2c` is also set.  Also enabled when
+    /// `ZELLIMSERVER_H2C_ALLOW_PUBLIC` env var is set to a truthy value
+    /// (non-empty and not "0").
+    #[arg(long = "i-know-this-is-behind-a-proxy")]
+    pub h2c_allow_public: bool,
 }
 
 // ── create-token ────────────────────────────────────────────────────────────

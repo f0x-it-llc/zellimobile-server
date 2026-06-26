@@ -30,10 +30,16 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config;
+use crate::config::{self, CertMode};
 
 /// Filename of the control socket inside the data dir.
 const SOCKET_NAME: &str = "control.sock";
+
+/// Serde default for [`StatusInfo::cert_mode`]: assume `SelfSigned` when the
+/// field is absent (older server).
+fn default_cert_mode() -> CertMode {
+    CertMode::SelfSigned
+}
 
 /// Upper bound on a single control message body (64 KiB).
 ///
@@ -78,6 +84,13 @@ pub struct StatusInfo {
     /// still deserialize correctly (`#[serde(default)]`).
     #[serde(default)]
     pub client_count: usize,
+    /// The active TLS / transport mode (self_signed, external, h2c).
+    ///
+    /// Defaults to `SelfSigned` when deserialising a response from an older
+    /// server that pre-dates this field, which is the most conservative
+    /// assumption for backward compatibility.
+    #[serde(default = "default_cert_mode")]
+    pub cert_mode: CertMode,
 }
 
 /// Path to the control socket: `data_dir()/control.sock`.
@@ -142,6 +155,7 @@ type ShutdownTrigger = Mutex<Option<tokio::sync::oneshot::Sender<()>>>;
 /// be the trigger side of a `serve_with_shutdown` future.
 /// `clients` is a cloneable handle to the per-session attached-client registry
 /// used to report the total client count in `Status` responses.
+/// `cert_mode` is the active TLS / transport mode reported in `Status` responses.
 ///
 /// The socket is bound up-front (so a `status`/`stop` race right after start
 /// still finds it) and removed by the caller on exit (see [`cleanup`]).
@@ -150,6 +164,7 @@ pub fn spawn_listener(
     started_at: Instant,
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     clients: crate::client_count::SessionClients,
+    cert_mode: CertMode,
 ) -> Result<()> {
     let path = socket_path()?;
 
@@ -191,6 +206,7 @@ pub fn spawn_listener(
                         pid: std::process::id(),
                         uptime_secs: started_at.elapsed().as_secs(),
                         client_count: clients.total_count(),
+                        cert_mode,
                     }),
                     ControlRequest::Shutdown => {
                         log::info!("control: shutdown requested");

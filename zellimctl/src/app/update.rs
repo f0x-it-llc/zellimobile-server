@@ -492,6 +492,7 @@ fn config_reload(state: &mut AppState) -> Vec<UpdateAction> {
 ///
 /// - `g`: ensure / regenerate cert using SANs from the config host.
 /// - `r`: reload fingerprint only.
+/// - `t`: cycle the `advertise_trust` override (Auto → CA → Pin → Auto).
 fn handle_cert_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
     match key.code {
         KeyCode::Char('g') => {
@@ -514,6 +515,13 @@ fn handle_cert_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
             } else {
                 Vec::new()
             }
+        }
+        // Cycle the advertise_trust override: Auto → CA → Pin → Auto.
+        // Persists the new value through a synchronous runner action so the
+        // setting survives restarts (Finding 3 — advertise_trust not persisted).
+        KeyCode::Char('t') => {
+            state.cert.advertise_trust = state.cert.advertise_trust.cycle();
+            vec![UpdateAction::SaveAdvertiseTrust(state.cert.advertise_trust)]
         }
         _ => Vec::new(),
     }
@@ -625,6 +633,9 @@ fn handle_tokens_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
                 if let Some((name, secret, read_only)) = state.tokens.last_minted_secret.clone() {
                     state.qr_seq = state.qr_seq.wrapping_add(1);
                     let seq = state.qr_seq;
+                    // Snapshot the advertise_trust at the time of QR request so the
+                    // async build task uses the value active when Enter was pressed.
+                    let advertise_trust = state.cert.advertise_trust;
                     state.qr_overlay = Some(QrOverlay {
                         phase: QrOverlayPhase::Generating,
                         seq,
@@ -637,6 +648,7 @@ fn handle_tokens_key(state: &mut AppState, key: KeyEvent) -> Vec<UpdateAction> {
                         token: secret,
                         read_only,
                         seq,
+                        advertise_trust,
                     }]
                 } else {
                     state.tokens.status =
@@ -1081,6 +1093,73 @@ mod tests {
     }
 
     #[test]
+    fn cert_t_key_cycles_advertise_trust() {
+        use crate::app::state::AdvertiseTrust;
+        let mut state = AppState::new();
+        state.screen = Screen::Cert;
+        // Default is Auto.
+        assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Auto);
+        // First `t` → Ca.
+        update(&mut state, Message::Key(key(KeyCode::Char('t'))));
+        assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Ca);
+        // Second `t` → Pin.
+        update(&mut state, Message::Key(key(KeyCode::Char('t'))));
+        assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Pin);
+        // Third `t` → wraps back to Auto.
+        update(&mut state, Message::Key(key(KeyCode::Char('t'))));
+        assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Auto);
+    }
+
+    #[test]
+    fn cert_t_key_emits_save_advertise_trust_action() {
+        // Finding 3: the `t` toggle must emit a SaveAdvertiseTrust action so the
+        // runner can persist the new value.  This tests the action is present and
+        // carries the newly cycled value (Auto → Ca on the first press).
+        use crate::app::state::AdvertiseTrust;
+        let mut state = AppState::new();
+        state.screen = Screen::Cert;
+        assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Auto);
+        let actions = update(&mut state, Message::Key(key(KeyCode::Char('t'))));
+        // State cycles to Ca.
+        assert_eq!(state.cert.advertise_trust, AdvertiseTrust::Ca);
+        // A SaveAdvertiseTrust(Ca) action is emitted.
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                UpdateAction::SaveAdvertiseTrust(AdvertiseTrust::Ca)
+            )),
+            "expected SaveAdvertiseTrust(Ca) in actions; got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn advertise_trust_persist_str_round_trips() {
+        // Finding 3: every AdvertiseTrust variant must round-trip through its
+        // persist string so the saved file is always parseable back to the same
+        // variant.
+        use crate::app::state::AdvertiseTrust;
+        for variant in [AdvertiseTrust::Auto, AdvertiseTrust::Ca, AdvertiseTrust::Pin] {
+            let s = variant.persist_str();
+            let back = AdvertiseTrust::from_persist_str(s);
+            assert_eq!(
+                back, variant,
+                "persist_str round-trip failed for {variant:?}: stored {s:?}, got {back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertise_trust_from_persist_str_unknown_defaults_to_auto() {
+        // Unknown/corrupt values must default to Auto, not panic.
+        use crate::app::state::AdvertiseTrust;
+        assert_eq!(
+            AdvertiseTrust::from_persist_str("garbage"),
+            AdvertiseTrust::Auto
+        );
+        assert_eq!(AdvertiseTrust::from_persist_str(""), AdvertiseTrust::Auto);
+    }
+
+    #[test]
     fn cert_g_key_dispatches_ensure_cert() {
         let mut state = AppState::new();
         state.screen = Screen::Cert;
@@ -1445,35 +1524,66 @@ mod tests {
     #[test]
     fn pairing_payload_assembly_produces_valid_uri() {
         // Unit test for the pairing payload assembly path.
-        // Exercises PairingParams::to_uri() with realistic values.
-        use crate::pairing::payload::PairingParams;
+        // Exercises PairingParams::to_uri() with realistic values for both
+        // trust modes (Pin and Ca) — updated for the v=2 payload format (C1).
+        use crate::pairing::payload::{PairingParams, PairingTrust};
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
-        let params = PairingParams {
+        // ── Pin trust (self-signed / LAN) ─────────────────────────────────────
+        let pin_params = PairingParams {
             host: "10.0.1.5".to_string(),
             port: 50051,
-            cert_fp_hex: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
-                .to_string(),
+            trust: PairingTrust::Pin {
+                fingerprint: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+                    .to_string(),
+            },
             token: "secret-token-value".to_string(),
             read_only: false,
             label: "My Server".to_string(),
         };
-        let uri = params.to_uri();
+        let pin_uri = pin_params.to_uri();
 
-        assert!(uri.starts_with("zellimobile://pair?v=1"));
-        assert!(uri.contains("h=10.0.1.5"));
-        assert!(uri.contains("p=50051"));
-        assert!(uri.contains("ro=0"));
-        assert!(uri.contains("n=My%20Server"));
+        assert!(
+            pin_uri.starts_with("zellimobile://pair?v=2"),
+            "expected v=2 prefix: {pin_uri}"
+        );
+        assert!(pin_uri.contains("h=10.0.1.5"), "host: {pin_uri}");
+        assert!(pin_uri.contains("p=50051"), "port: {pin_uri}");
+        assert!(pin_uri.contains("ro=0"), "ro: {pin_uri}");
+        assert!(pin_uri.contains("n=My%20Server"), "label: {pin_uri}");
+        assert!(pin_uri.contains("tm=pin"), "tm=pin: {pin_uri}");
+        assert!(
+            pin_uri.contains("fp=a1b2c3d4e5f6"),
+            "fp prefix: {pin_uri}"
+        );
 
         // Verify token round-trips correctly.
-        let t_val = uri
+        let t_val = pin_uri
             .split('&')
             .find(|s| s.starts_with("t="))
             .and_then(|s| s.strip_prefix("t="))
             .expect("t= param missing");
         let decoded = URL_SAFE_NO_PAD.decode(t_val).unwrap();
         assert_eq!(std::str::from_utf8(&decoded).unwrap(), "secret-token-value");
+
+        // ── Ca trust (CA-signed / h2c / proxy) ───────────────────────────────
+        let ca_params = PairingParams {
+            host: "server.example.com".to_string(),
+            port: 443,
+            trust: PairingTrust::Ca,
+            token: "other-token".to_string(),
+            read_only: true,
+            label: "Cloud".to_string(),
+        };
+        let ca_uri = ca_params.to_uri();
+
+        assert!(
+            ca_uri.starts_with("zellimobile://pair?v=2"),
+            "expected v=2 prefix: {ca_uri}"
+        );
+        assert!(ca_uri.contains("tm=ca"), "tm=ca: {ca_uri}");
+        assert!(!ca_uri.contains("fp="), "no fp in CA URI: {ca_uri}");
+        assert!(ca_uri.contains("ro=1"), "ro=1: {ca_uri}");
     }
 
     // ── build_sans_from_config tests ──────────────────────────────────────────
