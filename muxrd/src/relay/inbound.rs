@@ -310,7 +310,7 @@ pub(crate) async fn inbound_loop(
                                  ({} bytes > {MAX_INPUT_FRAME_BYTES} byte limit)",
                                 bytes.len()
                             );
-                        } else if let Err(e) = forward_input(&mut sender, bytes) {
+                        } else if let Err(e) = forward_input(&mut *sender, bytes) {
                             log::warn!("relay inbound [{session}]: input send failed: {e:#}");
                         }
                     }
@@ -409,7 +409,7 @@ async fn revalidate_token(token: Option<&str>, session: &str) -> bool {
 ///
 /// UTF-8 text goes via `send_input_chars` (the A2-proven `WriteChars` path);
 /// non-UTF-8 byte sequences (e.g. raw ESC) go via `send_input_bytes` (`Write`).
-fn forward_input(sender: &mut Box<dyn MuxSender>, bytes: Vec<u8>) -> anyhow::Result<()> {
+fn forward_input(sender: &mut dyn MuxSender, bytes: Vec<u8>) -> anyhow::Result<()> {
     match String::from_utf8(bytes) {
         Ok(text) => sender.send_input_chars(&text),
         Err(e) => sender.send_input_bytes(e.into_bytes()),

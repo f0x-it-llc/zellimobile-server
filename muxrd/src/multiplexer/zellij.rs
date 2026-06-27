@@ -8,9 +8,9 @@
 //! - [`PaneRef`] ↔ `zellij_utils::data::PaneId` via
 //!   [`crate::actions::pane_id_from_target`] and the reverse helper here.
 //! - [`ResizeKind`]/[`ResizeDir`] → `zellij_utils::data::{Resize, Direction}`.
-//! - the `ListTabs`/`ListPanes` JSON → a neutral [`LayoutSnapshot`] (the same
-//!   deserialization `grpc/layout.rs` performs today; temporarily duplicated —
-//!   P1.02 switches the handler to consume the backend and drops its copy).
+//! - the `ListTabs`/`ListPanes` JSON → a neutral [`LayoutSnapshot`] via
+//!   [`parse_zellij_layout`], which both the ephemeral query and the relay-routed
+//!   `grpc/layout.rs` path reuse (single deserialization point).
 //! - `ServerToClientMsg` → [`MuxServerMsg`] in [`ZellijMuxReceiver::recv`].
 
 use std::time::Duration;
@@ -307,10 +307,9 @@ impl MuxSender for ZellijMuxSender {
     }
 
     fn toggle_fullscreen(&mut self, pane: PaneRef, hint: FullscreenHint) -> Result<()> {
-        // Mirrors the relay inbound `ToggleFullscreen` action sequence (the
-        // floating-pane helpers `fill_floating_pane`/`hide_floating_panes` +
-        // the tiled focus-then-toggle cadence). Temporarily duplicated here;
-        // P1.03 routes the relay through this and retires the inline copies.
+        // The fill-vs-hide-vs-tiled action sequence owned by this backend.
+        // The relay drives this via `MuxSender::toggle_fullscreen`; the former
+        // inline copies in `relay/helpers.rs`/`relay/inbound.rs` are retired.
         use zellij_utils::data::FloatingPaneCoordinates;
         use zellij_utils::input::layout::PercentOrFixed;
 

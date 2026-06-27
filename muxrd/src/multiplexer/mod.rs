@@ -79,21 +79,27 @@ pub trait MuxBackend: Send + Sync + std::fmt::Debug {
 
     // ── Ephemeral control actions ───────────────────────────────────────────
 
+    /// Send raw bytes to the focused pane.
     fn write_to_pane(
         &self,
         session: &str,
         pane: PaneRef,
         bytes: Vec<u8>,
     ) -> anyhow::Result<ActionAck>;
+    /// Move keyboard focus to the specified pane.
     fn focus_pane(&self, session: &str, pane: PaneRef) -> anyhow::Result<ActionAck>;
+    /// Close the specified pane.
     fn close_pane(&self, session: &str, pane: PaneRef) -> anyhow::Result<ActionAck>;
+    /// Create a new pane in the active tab, optionally floating.
     fn new_pane(
         &self,
         session: &str,
         floating: bool,
         name: Option<String>,
     ) -> anyhow::Result<ActionAck>;
+    /// Assign a display name to a pane.
     fn rename_pane(&self, session: &str, pane: PaneRef, name: String) -> anyhow::Result<ActionAck>;
+    /// Resize a pane in the specified direction.
     fn resize_pane(
         &self,
         session: &str,
@@ -101,17 +107,24 @@ pub trait MuxBackend: Send + Sync + std::fmt::Debug {
         kind: ResizeKind,
         dir: Option<ResizeDir>,
     ) -> anyhow::Result<ActionAck>;
+    /// Toggle a floating pane between floating and tiled layout.
     fn toggle_pane_floating(&self, session: &str, pane: PaneRef) -> anyhow::Result<ActionAck>;
+    /// Toggle fullscreen for a pane (ephemeral; relay uses `MuxSender::toggle_fullscreen`).
     fn toggle_pane_fullscreen(&self, session: &str, pane: PaneRef) -> anyhow::Result<ActionAck>;
+    /// Scroll a pane's scrollback buffer up or down.
     fn scroll_pane(
         &self,
         session: &str,
         pane: PaneRef,
         dir: ScrollDir,
     ) -> anyhow::Result<ActionAck>;
+    /// Create a new tab in the session, optionally with a name.
     fn new_tab(&self, session: &str, name: Option<String>) -> anyhow::Result<ActionAck>;
+    /// Close the specified tab.
     fn close_tab(&self, session: &str, tab_id: u64) -> anyhow::Result<ActionAck>;
+    /// Switch the active tab to the specified tab id.
     fn go_to_tab(&self, session: &str, tab_id: u64) -> anyhow::Result<ActionAck>;
+    /// Assign a display name to a tab.
     fn rename_tab(&self, session: &str, tab_id: u64, name: String) -> anyhow::Result<ActionAck>;
 
     // ── Read-only queries ───────────────────────────────────────────────────
