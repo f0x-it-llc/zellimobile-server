@@ -40,7 +40,11 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 // ─── Service ─────────────────────────────────────────────────────────────────
 
 /// Tonic service implementing the `Muxr` gRPC service.
-#[derive(Debug, Default, Clone)]
+///
+/// `Default` is hand-written (below) rather than derived: the `backend` field is
+/// an `Arc<dyn MuxBackend>` trait object, which has no `Default`. `Clone` stays
+/// derived — the `Arc` clone is cheap and all relays share one backend.
+#[derive(Debug, Clone)]
 pub struct MuxrService {
     /// Per-session count of clients attached through this server (Phase F).
     /// Shared with every relay so `ListSessions` can report `connected_clients`.
@@ -57,6 +61,20 @@ pub struct MuxrService {
     /// single-client-correct values — only when the relay that served the query
     /// is the caller's own relay (exact connection_id match).
     view_state: crate::relay::ViewStateRegistry,
+    /// The terminal-multiplexer backend (Phase 1 seam). Today a `ZellijBackend`;
+    /// Phase 2 adds a herdr backend behind the same `MuxBackend` trait.
+    ///
+    /// Constructed here so the seam is real, but NOT yet read by any handler —
+    /// P1.02 reroutes the ephemeral handlers through it and P1.03 drives the
+    /// relay off `backend.open_attach()`. Cheap to clone (`Arc`).
+    #[allow(dead_code)]
+    backend: std::sync::Arc<dyn crate::multiplexer::MuxBackend>,
+}
+
+impl Default for MuxrService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MuxrService {
@@ -78,6 +96,7 @@ impl MuxrService {
             clients: crate::client_count::SessionClients::new(),
             control: crate::relay::ControlRegistry::default(),
             view_state: crate::relay::ViewStateRegistry::default(),
+            backend: std::sync::Arc::new(crate::multiplexer::ZellijBackend),
         }
     }
 

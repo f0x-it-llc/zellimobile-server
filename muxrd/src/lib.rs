@@ -8,6 +8,7 @@
 //! - `tls`     — B3 self-signed TLS cert generation + persistence
 //! - `relay`   — B2 blocking-IPC ↔ async-gRPC bridge
 //! - `query`   — C1 short-lived cli-client query helper (ListTabs/ListPanes JSON)
+//! - `multiplexer` — P1 backend-agnostic `MuxBackend` trait + neutral types + `ZellijBackend`
 //! - `cli`     — E1 clap CLI definitions (subcommand structs)
 //! - `config`  — E1 config file + precedence resolution
 //! - `control` — E2 control socket (status/stop IPC contract)
@@ -21,6 +22,7 @@ pub mod config;
 pub mod control;
 pub mod grpc;
 pub mod ipc;
+pub mod multiplexer;
 pub mod query;
 pub mod relay;
 pub mod tls;

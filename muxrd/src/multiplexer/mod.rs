@@ -1,0 +1,218 @@
+//! multiplexer — the backend-agnostic seam between muxrd's gRPC/relay layer and
+//! a concrete terminal multiplexer (P1.01).
+//!
+//! [`MuxBackend`] is the contract: methods take and return the neutral types in
+//! [`types`] (`PaneRef`, `ResizeKind`/`ResizeDir`, `LayoutSnapshot`,
+//! `MuxServerMsg`/`MuxEvent`, …) and never zellij's. [`ZellijBackend`] is the
+//! first — and, in Phase 1, only — implementation; it translates neutral ↔
+//! `zellij_utils` at its own boundary by delegating to the existing
+//! `crate::{ipc, actions, query}` free functions. A Phase 2 *herdr* backend will
+//! implement the same trait without any zellij coupling.
+//!
+//! ## Blocking, not async
+//!
+//! Every [`MuxBackend`] method is **blocking** — it wraps the blocking zellij IPC
+//! free functions. Callers (the gRPC handlers and the relay) already run these on
+//! `tokio::task::spawn_blocking`, exactly as they do today for the underlying
+//! `ipc`/`actions`/`query` calls. The trait is deliberately NOT `async`: making
+//! it so would force a `spawn_blocking` *inside* every impl method and buy
+//! nothing.
+//!
+//! ## Object safety
+//!
+//! `MuxrService` holds an `Arc<dyn MuxBackend>`, so the trait must be
+//! object-safe. The attach seam therefore uses **concrete boxed halves**
+//! ([`DualHandle`] of `Box<dyn MuxSender>` + `Box<dyn MuxReceiver>`) rather than
+//! generic associated types.
+//!
+//! ## Phase 1 status
+//!
+//! P1.01 is a **pure addition**: this module exists and `MuxrService` constructs
+//! an `Arc<dyn MuxBackend>`, but no handler or the relay is rerouted through it
+//! yet. P1.02 reroutes the ephemeral handlers; P1.03 drives the relay off
+//! [`MuxBackend::open_attach`].
+
+pub mod types;
+mod zellij;
+
+pub use types::{
+    ActionAck, FullscreenHint, LayoutSnapshot, MuxEvent, MuxServerMsg, PaneRef, PaneSnapshot,
+    ResizeDir, ResizeKind, ScrollDir, TabSnapshot,
+};
+pub use zellij::ZellijBackend;
+
+use std::time::Duration;
+
+// ─── MuxBackend ─────────────────────────────────────────────────────────────────
+
+/// A terminal-multiplexer backend.
+///
+/// All methods are **blocking** (they wrap blocking IPC); call them from a
+/// `spawn_blocking` context. `anyhow::Result` is used internally — handlers map
+/// to `tonic::Status` at their own boundary (unchanged by this trait).
+pub trait MuxBackend: Send + Sync + std::fmt::Debug {
+    // ── Session lifecycle ───────────────────────────────────────────────────
+
+    /// List live sessions as `(name, age)` pairs.
+    fn list_sessions(&self) -> anyhow::Result<Vec<(String, Duration)>>;
+
+    /// List live + resurrectable sessions as `(name, age_secs, resurrectable)`.
+    fn list_sessions_with_resurrectables(&self) -> anyhow::Result<Vec<(String, u64, bool)>>;
+
+    /// Validate a session name (path-traversal / allowlist guard). Returns the
+    /// offending message on rejection.
+    fn validate_session_name(&self, name: &str) -> Result<(), String>;
+
+    /// Create a new detached session, optionally with a layout path.
+    fn create_session(&self, name: &str, layout: Option<String>) -> anyhow::Result<ActionAck>;
+
+    /// Kill a session.
+    fn kill_session(&self, session: &str) -> anyhow::Result<()>;
+
+    /// Rename a session.
+    fn rename_session(&self, session: &str, new_name: String) -> anyhow::Result<ActionAck>;
+
+    // ── Ephemeral control actions ───────────────────────────────────────────
+
+    fn write_to_pane(
+        &self,
+        session: &str,
+        pane: PaneRef,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<ActionAck>;
+    fn focus_pane(&self, session: &str, pane: PaneRef) -> anyhow::Result<ActionAck>;
+    fn close_pane(&self, session: &str, pane: PaneRef) -> anyhow::Result<ActionAck>;
+    fn new_pane(
+        &self,
+        session: &str,
+        floating: bool,
+        name: Option<String>,
+    ) -> anyhow::Result<ActionAck>;
+    fn rename_pane(&self, session: &str, pane: PaneRef, name: String) -> anyhow::Result<ActionAck>;
+    fn resize_pane(
+        &self,
+        session: &str,
+        pane: PaneRef,
+        kind: ResizeKind,
+        dir: Option<ResizeDir>,
+    ) -> anyhow::Result<ActionAck>;
+    fn toggle_pane_floating(&self, session: &str, pane: PaneRef) -> anyhow::Result<ActionAck>;
+    fn toggle_pane_fullscreen(&self, session: &str, pane: PaneRef) -> anyhow::Result<ActionAck>;
+    fn scroll_pane(
+        &self,
+        session: &str,
+        pane: PaneRef,
+        dir: ScrollDir,
+    ) -> anyhow::Result<ActionAck>;
+    fn new_tab(&self, session: &str, name: Option<String>) -> anyhow::Result<ActionAck>;
+    fn close_tab(&self, session: &str, tab_id: u64) -> anyhow::Result<ActionAck>;
+    fn go_to_tab(&self, session: &str, tab_id: u64) -> anyhow::Result<ActionAck>;
+    fn rename_tab(&self, session: &str, tab_id: u64, name: String) -> anyhow::Result<ActionAck>;
+
+    // ── Read-only queries ───────────────────────────────────────────────────
+
+    /// Build a neutral [`LayoutSnapshot`] for `session` (raw queried values;
+    /// no per-relay-client override, plugin panes included).
+    fn query_layout(&self, session: &str) -> anyhow::Result<LayoutSnapshot>;
+
+    /// Current `(rows, cols)` of the session's active tab display area.
+    fn query_session_size(&self, session: &str) -> anyhow::Result<(u16, u16)>;
+
+    /// `(is_floating, floating_panes_visible, focused_floating_pane)` for `pane`.
+    fn pane_is_floating_with_visibility(
+        &self,
+        session: &str,
+        pane: PaneRef,
+    ) -> anyhow::Result<(bool, bool, Option<PaneRef>)>;
+
+    // ── Attach (the relay seam) ─────────────────────────────────────────────
+
+    /// Open an attach to `session` at `rows`×`cols`, returning a [`DualHandle`]
+    /// of boxed neutral sender/receiver halves. `read_only` is part of the
+    /// contract for backends that vary the open by mode; the zellij backend's
+    /// read-only geometry handling lives at the call site (the relay pre-resolves
+    /// the size) and in the shutdown path (`send_client_exited` vs resize nudge).
+    fn open_attach(
+        &self,
+        session: &str,
+        rows: u16,
+        cols: u16,
+        read_only: bool,
+    ) -> anyhow::Result<DualHandle>;
+
+    // ── Backend identity ────────────────────────────────────────────────────
+
+    /// Backend version string (today: `zellij_utils::consts::VERSION`).
+    fn backend_version(&self) -> String;
+}
+
+// ─── DualHandle + split halves ──────────────────────────────────────────────────
+
+/// An open attach, split into a [`MuxSender`] (input/control) and a
+/// [`MuxReceiver`] (render/event stream), plus the resolved session name.
+///
+/// Concrete boxed halves keep `dyn MuxBackend` object-safe (no generic
+/// associated types) and let the relay move the receiver onto a dedicated
+/// blocking reader thread while keeping the sender on the async side — exactly
+/// the split it does today with `ipc::AttachHandle::split`.
+pub struct DualHandle {
+    pub sender: Box<dyn MuxSender>,
+    pub receiver: Box<dyn MuxReceiver>,
+    pub session_name: String,
+}
+
+impl DualHandle {
+    /// Consume the handle into its two halves.
+    pub fn split(self) -> (Box<dyn MuxSender>, Box<dyn MuxReceiver>) {
+        (self.sender, self.receiver)
+    }
+}
+
+/// The input/control half of a [`DualHandle`].
+///
+/// Exposes the neutral operations the relay's inbound task + `ShutdownGuard`
+/// drive today (matching the current `AttachSender` call sites so P1.03 can
+/// consume it). All sends are **blocking** but cheap.
+pub trait MuxSender: Send {
+    /// Switch the rendering client to the tab with this id.
+    fn go_to_tab(&mut self, tab_id: u64) -> anyhow::Result<()>;
+
+    /// Focus a specific pane (as this rendering client).
+    fn focus_pane(&mut self, pane: PaneRef) -> anyhow::Result<()>;
+
+    /// Toggle fullscreen / floating-fill for `pane`, given the resolved floating
+    /// context `hint`. Encapsulates the fill-vs-hide-vs-tiled action sequence the
+    /// relay performs today. The caller (relay) updates its own view state from
+    /// the same `hint` it passes, so no return value is needed.
+    fn toggle_fullscreen(&mut self, pane: PaneRef, hint: FullscreenHint) -> anyhow::Result<()>;
+
+    /// Fire a layout query over the persistent connection (ListTabs then
+    /// ListPanes). The replies arrive as two [`MuxServerMsg::Log`] messages on
+    /// the [`MuxReceiver`], which the relay's reader pairs (tabs then panes).
+    fn query_layout(&mut self) -> anyhow::Result<()>;
+
+    /// Send UTF-8 text input to this client's focused pane.
+    fn send_input_chars(&mut self, text: &str) -> anyhow::Result<()>;
+
+    /// Send raw byte input (e.g. ESC sequences) to this client's focused pane.
+    fn send_input_bytes(&mut self, bytes: Vec<u8>) -> anyhow::Result<()>;
+
+    /// Notify the server of a new terminal size.
+    fn send_resize(&mut self, rows: u16, cols: u16) -> anyhow::Result<()>;
+
+    /// Tell the server this client is leaving (read-only teardown nudge).
+    fn send_client_exited(&mut self) -> anyhow::Result<()>;
+
+    /// Clone an independent sender over the same underlying connection — used by
+    /// the relay's `ShutdownGuard` to nudge a parked reader on teardown.
+    fn box_clone(&self) -> Box<dyn MuxSender>;
+}
+
+/// The render/event half of a [`DualHandle`].
+///
+/// Moved onto the relay's dedicated blocking reader thread; [`Self::recv`] is
+/// **blocking** and returns `None` on stream close (EOF / decode error).
+pub trait MuxReceiver: Send {
+    /// Receive the next neutral server message (blocking). `None` ends the stream.
+    fn recv(&mut self) -> Option<MuxServerMsg>;
+}
