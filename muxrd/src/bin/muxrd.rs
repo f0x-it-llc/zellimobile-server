@@ -34,6 +34,7 @@ use muxrd::cli::{BackendKind, Cli, Command, InitArgs, StartArgs};
 use muxrd::config::{self, CertSource, check_h2c_bind_safety};
 use muxrd::control::{self, ControlRequest, ControlResponse};
 use muxrd::grpc::MuxrService;
+use muxrd::multiplexer::detect;
 use muxrd::multiplexer::{HerdrBackend, MuxBackend, ZellijBackend};
 use muxrd::proto::muxr_server::MuxrServer;
 use muxrd::tls::SanEntry;
@@ -93,129 +94,35 @@ fn pidfile_path() -> Result<PathBuf> {
 }
 
 /// Env var that bypasses the zellij version-mismatch check (review Major F).
+/// Referenced in error messages; the actual skip logic lives in
+/// `muxrd::multiplexer::detect::probe_zellij`.
 const SKIP_VERSION_CHECK_ENV: &str = "ZELLIMSERVER_SKIP_VERSION_CHECK";
-
-/// Timeout for the `zellij --version` subprocess.
-const VERSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Refuse to start when the **installed** `zellij` binary's version differs from
 /// the zellij crate this server was compiled against.
 ///
-/// A mismatch leads to silent IPC decode failures at runtime (the wire contract
-/// drifted), so we fail fast at `start` with a clear, actionable error.  Set
-/// `ZELLIMSERVER_SKIP_VERSION_CHECK=1` to proceed anyway (power-user override).
+/// Delegates the actual probe (binary discovery, `zellij --version` run,
+/// version comparison, and `ZELLIMSERVER_SKIP_VERSION_CHECK` handling) to
+/// [`detect::probe_zellij`] so the startup check and backend auto-detection
+/// share a single implementation.
 ///
 /// Returns the resolved zellij binary path so the caller can reuse it for
 /// `create_session` (TOCTOU fix: resolve once, pass everywhere).
 fn check_zellij_version() -> Result<PathBuf> {
     if std::env::var(SKIP_VERSION_CHECK_ENV).is_ok_and(|v| !v.is_empty() && v != "0") {
         log::warn!("{SKIP_VERSION_CHECK_ENV} set — skipping zellij version-mismatch check");
-        // Still resolve the binary path so it can be threaded through to create_session.
-        return muxrd::actions::which_zellij()
-            .context("could not locate the zellij binary (even with version check skipped)");
     }
-
-    // The version of the linked zellij crate (our IPC contract).
-    let linked = zellij_utils::consts::VERSION;
-
-    // Resolve the zellij binary ONCE — reused for both version check and
-    // create_session (TOCTOU fix: a single lookup, not two independent ones).
-    let bin = muxrd::actions::which_zellij()
-        .context("version check: could not locate the zellij binary")?;
-
-    // Spawn `zellij --version` with a timeout so a wedged binary can't hang startup.
-    // Use a background thread + channel so we can enforce a hard wall-clock
-    // timeout without depending on an external `wait_timeout` crate.
-    let bin_clone = bin.clone();
-    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::process::Output>>();
-    std::thread::Builder::new()
-        .name("zellij-version-check".into())
-        .spawn(move || {
-            let result = std::process::Command::new(&bin_clone)
-                .arg("--version")
-                .output()
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to run '{} --version': {e}", bin_clone.display())
-                });
-            let _ = tx.send(result);
-        })
-        .context("version check: failed to spawn helper thread")?;
-
-    let output = match rx.recv_timeout(VERSION_CHECK_TIMEOUT) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            anyhow::bail!(
-                "version check: '{} --version' failed: {e}. \
-                 Set {SKIP_VERSION_CHECK_ENV}=1 to override.",
-                bin.display(),
-            );
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!(
-                "version check: '{} --version' timed out after {:?} — \
-                 the zellij binary may be wedged. Set {SKIP_VERSION_CHECK_ENV}=1 to override.",
-                bin.display(),
-                VERSION_CHECK_TIMEOUT,
-            );
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!(
-                "version check: helper thread exited unexpectedly. \
-                 Set {SKIP_VERSION_CHECK_ENV}=1 to override."
-            );
-        }
-    };
-
-    if !output.status.success() {
+    if !detect::probe_zellij() {
+        let linked = zellij_utils::consts::VERSION;
         anyhow::bail!(
-            "version check: '{} --version' exited with {} — cannot verify zellij version. \
-             Set {SKIP_VERSION_CHECK_ENV}=1 to override.",
-            bin.display(),
-            output.status,
+            "zellij version check failed: the zellij binary was not found on PATH or its \
+             version does not match the linked IPC contract {linked}. \
+             Install zellij {linked}, or set {SKIP_VERSION_CHECK_ENV}=1 to proceed anyway.",
         );
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let installed = parse_zellij_version(&stdout);
-
-    if installed.is_empty() {
-        anyhow::bail!(
-            "version check: could not parse a version from '{} --version' output: {:?}. \
-             Set {SKIP_VERSION_CHECK_ENV}=1 to override.",
-            bin.display(),
-            stdout.trim(),
-        );
-    }
-
-    if installed != linked {
-        anyhow::bail!(
-            "zellij version mismatch: this server was built against zellij {linked}, but the \
-             installed binary at {} reports {installed}. Running with a mismatched zellij causes \
-             silent IPC decode failures. Install zellij {linked}, or set \
-             {SKIP_VERSION_CHECK_ENV}=1 to proceed anyway.",
-            bin.display(),
-        );
-    }
-
-    log::info!(
-        "zellij version check OK: installed {installed} matches linked contract {linked} ({})",
-        bin.display()
-    );
-    Ok(bin)
-}
-
-/// Parse the version string from `zellij --version` output.
-///
-/// `"zellij 0.44.3\n"` → `"0.44.3"`.  Returns `""` if unparseable.
-///
-/// This is a pure function exposed for unit testing.
-pub fn parse_zellij_version(output: &str) -> String {
-    output
-        .split_whitespace()
-        .last()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    // probe_zellij passed → the binary is present and version-matched.
+    // Resolve its path for the caller (cheap second lookup on the same PATH).
+    muxrd::actions::which_zellij().context("locate zellij binary (post version-check)")
 }
 
 /// Collect extra SANs from CLI `--san` values and the `ZELLIMSERVER_SAN` env var.
