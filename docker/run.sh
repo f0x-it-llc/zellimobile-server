@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh — convenience wrapper for the ZelliMobile dev rig.
+# run.sh — convenience wrapper for the Muxr dev rig.
 #
 # Usage:
 #   ./docker/run.sh [OPTIONS] [-- EXTRA_COMPOSE_ARGS...]
@@ -20,9 +20,9 @@
 #   # Build without cache, then run:
 #   ./docker/run.sh --host 192.168.1.50 -- --no-deps
 #
-# Once it is up, SSH in (no password) and start the server with zellimctl:
+# Once it is up, SSH in (no password) and start the server with muxrctl:
 #   ssh -t root@<host> -p 2222
-#   zellimctl
+#   muxrctl
 
 set -euo pipefail
 
@@ -67,7 +67,7 @@ export BIND_ADDR
 
 echo "[run.sh] BIND_ADDR=${BIND_ADDR}"
 echo "[run.sh] publishing  gRPC ${BIND_ADDR}:${GRPC_PORT:-50051}  +  SSH ${BIND_ADDR}:${SSH_PORT:-2222}"
-echo "[run.sh] after boot:  ssh -t root@${BIND_ADDR} -p ${SSH_PORT:-2222}  then run  zellimctl"
+echo "[run.sh] after boot:  ssh -t root@${BIND_ADDR} -p ${SSH_PORT:-2222}  then run  muxrctl"
 echo ""
 
 exec sudo docker compose -f "${COMPOSE_FILE}" up --build "${EXTRA_ARGS[@]}"

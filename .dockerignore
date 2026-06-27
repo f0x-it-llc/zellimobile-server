@@ -1,5 +1,5 @@
 # .dockerignore — keep the Docker build context small.
-# The build only needs docker/ + zellimserver/; exclude the rest.
+# The build only needs docker/ + muxrd/; exclude the rest.
 
 # Rust build artifacts (huge — must exclude)
 target/

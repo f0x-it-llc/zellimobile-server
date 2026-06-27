@@ -2,7 +2,7 @@
 # gen_manifest.sh — regenerate manifest.json from the fonts/ directory.
 #
 # Usage:
-#   cd zellimobile-server/fonts && ./gen_manifest.sh
+#   cd muxr-core/fonts && ./gen_manifest.sh
 #
 # The script is re-runnable and deterministic.  It:
 #   1. Scans *.ttf AND *.otf files in this directory.
@@ -26,7 +26,7 @@ cd "$(dirname "$0")"
 # GitHub Release and the app downloads each file from its absolute "url".
 # Override the tag with FONTS_RELEASE_TAG=... when cutting a new release.
 RELEASE_TAG="${FONTS_RELEASE_TAG:-fonts-v1}"
-RELEASE_BASE="https://github.com/f0x-it-llc/zellimobile-server/releases/download/${RELEASE_TAG}"
+RELEASE_BASE="https://github.com/f0x-it-llc/muxr-core/releases/download/${RELEASE_TAG}"
 
 # ─── Metadata table ──────────────────────────────────────────────────────────
 # Columns (tab-separated):

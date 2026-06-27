@@ -1,20 +1,20 @@
-# ZelliMobile dev rig (Docker)
+# Muxr dev rig (Docker)
 
-A Debian container running the **ZelliMobile backend** — `zellimserver` (the gRPC
-server) and `zellimctl` (the configure/pair TUI) — pre-loaded with a realistic
+A Debian container running the **Muxr backend** — `muxrd` (the gRPC
+server) and `muxrctl` (the configure/pair TUI) — pre-loaded with a realistic
 Zellij session and a full set of terminal tools so the mobile client has a real,
 interesting target. You SSH into the container and drive everything with
-`zellimctl`.
+`muxrctl`.
 
-**Zellij is pinned to v0.44.3** (the version zellimserver was compiled against;
+**Zellij is pinned to v0.44.3** (the version muxrd was compiled against;
 it refuses to start on any other version).
 
 ## What's inside
 
-- **zellimserver** + **zellimctl** (static musl binaries built from the Cargo
+- **muxrd** + **muxrctl** (static musl binaries built from the Cargo
   workspace) — the TLS gRPC server (port **50051**, self-signed cert +
   bearer-token auth) and the TUI that configures and starts it.
-- **OpenSSH server** (port **22**) — root login so you can attach and run `zellimctl`.
+- **OpenSSH server** (port **22**) — root login so you can attach and run `muxrctl`.
 - **Zellij v0.44.3** running a pre-populated `backend-dev` session (see `layout.kdl`):
   an `editor` tab (nvim + shell + btop), a `shell` tab (shell + htop), and a
   `logs` tab (live log stream).
@@ -31,14 +31,14 @@ docker compose -f docker/compose.yaml up --build
 ```
 
 The container boots a zellij session + sshd and prints a banner. SSH in (a TTY
-is required for the TUI — note the `-t`) and start the server with `zellimctl`:
+is required for the TUI — note the `-t`) and start the server with `muxrctl`:
 
 ```bash
 ssh -t root@127.0.0.1 -p 2222      # no password
-zellimctl                          # Configure → Cert → Tokens → Server → Pair
+muxrctl                          # Configure → Cert → Tokens → Server → Pair
 ```
 
-In `zellimctl`: generate the cert, create a token, **start** the server, then
+In `muxrctl`: generate the cert, create a token, **start** the server, then
 open **Pair** to scan the QR from the app (or copy the token + cert manually).
 
 ## LAN / phone access
@@ -57,7 +57,7 @@ BIND_ADDR="${LAN_IP}" docker compose -f docker/compose.yaml up --build
 ```
 
 `BIND_ADDR` controls which host interface the ports are published on (default
-`127.0.0.1` — loopback, nothing exposed). When you run `zellimctl`, pick that
+`127.0.0.1` — loopback, nothing exposed). When you run `muxrctl`, pick that
 same LAN IP in **Configure** so it lands in the cert's **Subject Alternative
 Name** — the phone validates the self-signed cert against the IP it connects to.
 
@@ -67,28 +67,28 @@ Name** — the phone validates the self-signed cert against the IP it connects t
 |-------|-------|
 | Host  | the host/IP you published on (e.g. `127.0.0.1` or your LAN IP) |
 | Port  | `50051` |
-| Token | created in `zellimctl` → Tokens (or via the CLI below) |
+| Token | created in `muxrctl` → Tokens (or via the CLI below) |
 | TLS   | self-signed cert — pair via QR, trust the PEM, or use the app's insecure-dev mode |
 
 ## Auth token & TLS cert — CLI fallback
 
-`zellimctl` is the intended path, but you can also use the server CLI directly
-(over SSH, or via `docker exec`). The container is **`zellimobile-grpc-rig`**;
+`muxrctl` is the intended path, but you can also use the server CLI directly
+(over SSH, or via `docker exec`). The container is **`muxr-grpc-rig`**;
 locally (your user in the `docker` group) no `sudo` is needed, otherwise prefix
 every `docker` command with `sudo`.
 
 ```bash
 # Mint a token (prints a fresh UUID on stdout):
-docker exec zellimobile-grpc-rig zellimserver create-token --name mytoken
+docker exec muxr-grpc-rig muxrd create-token --name mytoken
 # read-only variant:
-docker exec zellimobile-grpc-rig zellimserver create-token --name viewer --read-only
+docker exec muxr-grpc-rig muxrd create-token --name viewer --read-only
 
 # List token names + read-only flag (does NOT print the secret):
-docker exec zellimobile-grpc-rig zellimserver list-tokens
+docker exec muxr-grpc-rig muxrd list-tokens
 
 # The self-signed TLS cert (PEM) — for clients that pin/trust it:
-docker exec zellimobile-grpc-rig \
-  cat /root/.local/share/zellij/zellimserver/server.crt > /tmp/rig-server.crt
+docker exec muxr-grpc-rig \
+  cat /root/.local/share/zellij/muxrd/server.crt > /tmp/rig-server.crt
 ```
 
 ## Shell into the container / view the live Zellij session
@@ -116,8 +116,8 @@ zellij --session backend-dev action list-panes
 ## Running the Dart / gRPC test client
 
 ```bash
-# From zellimserver/clients/dart_test_client/
-dart run bin/zelli_client.dart \
+# From muxrd/clients/dart_test_client/
+dart run bin/muxr_client.dart \
   --host 127.0.0.1 --port 50051 \
   --token <paste-token-here> \
   --cert /tmp/rig-server.crt
@@ -126,7 +126,7 @@ dart run bin/zelli_client.dart \
 ## Using `read_client` (Rust example)
 
 ```bash
-# From zellimserver/
+# From muxrd/
 cargo run --example read_client -- \
   --addr 127.0.0.1:50051 \
   --auth-token <token> \
@@ -155,7 +155,7 @@ cargo run --example read_client -- \
 - **SSH:** passwordless root login (the entrypoint clears root's password —
   dev-rig only). `SSH_PORT` changes the published SSH port (default `2222`).
 - **Zellij version:** must remain 0.44.3. Upgrading zellij without recompiling
-  zellimserver will cause a version-mismatch error at startup.
+  muxrd will cause a version-mismatch error at startup.
 - **Security:** this is a **dev/test rig** — the self-signed cert, the
   passwordless SSH root login, and the `BIND_ADDR` LAN exposure are intentional
   dev affordances. Do not expose this container on an untrusted network.

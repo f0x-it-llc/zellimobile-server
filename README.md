@@ -1,6 +1,6 @@
-# zellimobile-server
+# muxr-core
 
-The open-source backend for **ZelliMobile** — a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/workspaces.html)
+The open-source backend for **Muxr** — a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/workspaces.html)
 that lets a mobile client attach to and control remote [Zellij](https://zellij.dev/)
 terminal-multiplexer sessions over a TLS, bearer-authenticated gRPC API.
 
@@ -8,27 +8,27 @@ Two binaries:
 
 | Crate | Binary | What it does |
 |-------|--------|--------------|
-| [`zellimserver`](zellimserver/) | `zellimserver` | gRPC server (protobuf package `zellimserver.v1`) that relays over Zellij's Unix-domain IPC. TLS (self-signed, an external CA cert, or plaintext h2c behind a proxy) + per-token auth, read-only tokens, daemonize. |
-| [`zellimctl`](zellimctl/) | `zellimctl` | Terminal UI to install, configure, and pair the server: cert/SAN setup, token management, QR-code device pairing (fingerprint-pinned or system-CA), live status. Links `zellimserver` as a library for its pure ops. |
+| [`muxrd`](muxrd/) | `muxrd` | gRPC server (protobuf package `muxr.v1`) that relays over Zellij's Unix-domain IPC. TLS (self-signed, an external CA cert, or plaintext h2c behind a proxy) + per-token auth, read-only tokens, daemonize. |
+| [`muxrctl`](muxrctl/) | `muxrctl` | Terminal UI to install, configure, and pair the server: cert/SAN setup, token management, QR-code device pairing (fingerprint-pinned or system-CA), live status. Links `muxrd` as a library for its pure ops. |
 
 ## Build
 
 ```bash
 cargo build              # both binaries (debug)
 cargo build --release    # both binaries (release)
-cargo build -p zellimserver   # just the server
-cargo build -p zellimctl      # just the TUI
+cargo build -p muxrd   # just the server
+cargo build -p muxrctl      # just the TUI
 ```
 
 ## Run
 
 ```bash
 # Generate the TLS cert, then serve:
-cargo run -p zellimserver -- init
-ZELLIMSERVER_SKIP_VERSION_CHECK=1 cargo run -p zellimserver -- start
+cargo run -p muxrd -- init
+ZELLIMSERVER_SKIP_VERSION_CHECK=1 cargo run -p muxrd -- start
 
 # The configure/pair TUI:
-cargo run -p zellimctl
+cargo run -p muxrctl
 ```
 
 `start` opens a control socket for `status`/`stop`; add `--daemonize` to detach.
@@ -47,10 +47,10 @@ The server resolves its TLS identity by precedence **h2c > external cert > self-
 | **External cert** | `--tls-cert <pem> --tls-key <pem>` (or `ZELLIMSERVER_TLS_CERT` / `ZELLIMSERVER_TLS_KEY`) | Serving a real, publicly-trusted cert directly — Let's Encrypt, a Cloudflare Origin CA cert, or a corporate CA. The client trusts it via the system CA store; no pinning. Both files are validated at `init`/`start`. |
 | **Plaintext h2c** | `--insecure-h2c` (or `ZELLIMSERVER_H2C=1`) | Sitting behind a TLS-terminating reverse proxy (Traefik / Dokploy / Cloudflare) that owns the public cert. Serves **unencrypted** HTTP/2, so it **refuses a non-loopback bind** unless you also pass `--i-know-this-is-behind-a-proxy` (env `ZELLIMSERVER_H2C_ALLOW_PUBLIC`). |
 
-External and h2c are mutually exclusive with each other. `zellimserver init` validates the
+External and h2c are mutually exclusive with each other. `muxrd init` validates the
 chosen mode (e.g. parses the external key) so misconfigurations surface before `start`.
 
-`zellimctl` detects the active mode over the control socket and builds the pairing QR to match:
+`muxrctl` detects the active mode over the control socket and builds the pairing QR to match:
 a **fingerprint-pinned** pairing (`tm=pin`) for self-signed, or a **system-CA** pairing (`tm=ca`,
 no fingerprint) for external/h2c. Press **`t`** on the Cert screen to override the advertised trust
 (**Auto → CA → Pin**) — needed when a *self-signed* origin sits behind a CA-terminating proxy. The
@@ -85,10 +85,10 @@ BIND_ADDR=100.x.y.z docker compose -f docker/compose.yaml up --build
 
 ## gRPC contract
 
-The wire contract is `zellimserver/proto/zellimserver.proto` (package
-`zellimserver.v1`). The server compiles it via `build.rs`; clients generate
+The wire contract is `muxrd/proto/muxr.proto` (package
+`muxr.v1`). The server compiles it via `build.rs`; clients generate
 their own stubs from the same file. A reference Dart client lives in
-[`zellimserver/clients/dart_test_client/`](zellimserver/clients/dart_test_client/).
+[`muxrd/clients/dart_test_client/`](muxrd/clients/dart_test_client/).
 
 ## License
 

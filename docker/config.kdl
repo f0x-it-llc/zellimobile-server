@@ -1,4 +1,4 @@
-// ZelliMobile dev-rig zellij config.
+// Muxr dev-rig zellij config.
 //
 // Intentionally minimal: zellij fills in its built-in defaults for every section
 // we omit (keybinds, plugin aliases, themes, web client, …). The one thing we pin

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Entrypoint for the ZelliMobile dev rig.
+# Entrypoint for the Muxr dev rig.
 #
 # Boots a backgrounded Zellij session (pre-populated via layout.kdl) and an SSH
-# server, then waits. You SSH in (no password) and run `zellimctl` to configure
+# server, then waits. You SSH in (no password) and run `muxrctl` to configure
 # the cert + tokens and start the gRPC server:
 #
 #   ssh -t root@<host> -p <ssh-port>      # no password
-#   zellimctl                             # Configure → Cert → Tokens → Server → Pair
+#   muxrctl                             # Configure → Cert → Tokens → Server → Pair
 #
 # Environment variables:
 #   SESSION  — zellij session name  (default: backend-dev)
@@ -16,7 +16,7 @@ SESSION="${SESSION:-backend-dev}"
 
 # ── 0. Propagate the zellim env to SSH login shells ──────────────────────────
 # sshd does NOT pass the container's docker `ENV` (ZELLIMSERVER_BIND /
-# ZELLIMSERVER_SAN) to interactive sessions, so `zellimctl` run over SSH would
+# ZELLIMSERVER_SAN) to interactive sessions, so `muxrctl` run over SSH would
 # not see them — the cert SAN and the pairing-QR advertise host would silently
 # fall back to the container-internal bridge IP instead of the advertised
 # tailnet/LAN address. The entrypoint runs WITH the container env, so mirror the
@@ -40,24 +40,24 @@ passwd -d root
 # (re)install on every boot rather than relying on the build-time COPY, which only
 # seeds a fresh volume.
 mkdir -p /root/.config/zellij
-cp /usr/local/share/zellimobile/config.kdl /root/.config/zellij/config.kdl
+cp /usr/local/share/muxr/config.kdl /root/.config/zellij/config.kdl
 
 # ── 2. Start a backgrounded zellij session from the layout ───────────────────
-# zellimserver attaches to this live session once you start it from zellimctl.
+# muxrd attaches to this live session once you start it from muxrctl.
 echo "[rig] starting zellij session '${SESSION}'…"
-zellij --layout zellimobile attach --create-background "${SESSION}" || true
+zellij --layout muxr attach --create-background "${SESSION}" || true
 
 # ── 3. Connection banner ─────────────────────────────────────────────────────
 cat <<BANNER
 
 ╔══════════════════════════════════════════════════════════════════╗
-║  ZelliMobile dev rig is up — drive it with zellimctl over SSH     ║
+║  Muxr dev rig is up — drive it with muxrctl over SSH     ║
 ╠══════════════════════════════════════════════════════════════════╣
   1. SSH in — no password (a TTY is required for the TUI — note the -t):
        ssh -t root@<host> -p <ssh-port>
 
   2. Run the control TUI and start the server:
-       zellimctl
+       muxrctl
      → Configure → Cert → Tokens → Server (start) → Pair (scan the QR)
 
   zellij session : ${SESSION}
