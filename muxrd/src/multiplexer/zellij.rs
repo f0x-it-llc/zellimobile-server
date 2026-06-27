@@ -63,6 +63,71 @@ fn to_direction(dir: ResizeDir) -> Direction {
     }
 }
 
+// ─── Layout parse (the single zellij-JSON → snapshot conversion) ──────────────────
+
+/// Parse zellij `ListTabs` + `ListPanes` JSON into a neutral [`LayoutSnapshot`].
+///
+/// **This is THE single zellij-JSON → snapshot parse in the codebase** (P1.03).
+/// Two call sites share it, so both layout paths produce a byte-identical
+/// snapshot:
+///
+/// - [`ZellijBackend::query_layout`] — the ephemeral path (queries the two JSON
+///   payloads over short-lived connections, then parses here).
+/// - `grpc/layout.rs` — the relay-routed path, which parses the two JSON strings
+///   the relay captures from its persistent connection's `Log` replies (retiring
+///   the former `parse_relay_json` duplicate).
+///
+/// Plugin panes are **included** in the snapshot (raw layout); the gRPC layer
+/// applies the client-visibility filter at the proto-build stage.
+pub(crate) fn parse_zellij_layout(tabs_json: &str, panes_json: &str) -> Result<LayoutSnapshot> {
+    use std::collections::HashMap;
+    use zellij_utils::data::{ListPanesResponse, ListTabsResponse};
+
+    let tabs: ListTabsResponse = serde_json::from_str(tabs_json)
+        .map_err(|e| anyhow!("parse_zellij_layout: parse ListTabs JSON: {e}"))?;
+    let panes: ListPanesResponse = serde_json::from_str(panes_json)
+        .map_err(|e| anyhow!("parse_zellij_layout: parse ListPanes JSON: {e}"))?;
+
+    // Group panes by tab_id, preserving ListPanes order.
+    let mut panes_by_tab: HashMap<usize, Vec<PaneSnapshot>> = HashMap::new();
+    for entry in panes {
+        let p = &entry.pane_info;
+        let pane = PaneSnapshot {
+            id: p.id,
+            title: p.title.clone(),
+            is_focused: p.is_focused,
+            is_floating: p.is_floating,
+            exited: p.exited,
+            command: entry.pane_command.unwrap_or_default(),
+            cwd: entry.pane_cwd.unwrap_or_default(),
+            x: p.pane_x as u32,
+            y: p.pane_y as u32,
+            rows: p.pane_rows as u32,
+            cols: p.pane_columns as u32,
+            is_plugin: p.is_plugin,
+            is_fullscreen: p.is_fullscreen,
+        };
+        panes_by_tab.entry(entry.tab_id).or_default().push(pane);
+    }
+
+    let tab_snaps: Vec<TabSnapshot> = tabs
+        .into_iter()
+        .map(|tab| TabSnapshot {
+            tab_id: tab.tab_id as u64,
+            position: tab.position as u32,
+            name: tab.name.clone(),
+            active: tab.active,
+            has_bell: tab.has_bell_notification,
+            panes_to_hide: tab.panes_to_hide as u32,
+            fullscreen_active: tab.is_fullscreen_active,
+            floating_panes_visible: tab.are_floating_panes_visible,
+            panes: panes_by_tab.remove(&tab.tab_id).unwrap_or_default(),
+        })
+        .collect();
+
+    Ok(LayoutSnapshot { tabs: tab_snaps })
+}
+
 // ─── ZellijBackend ──────────────────────────────────────────────────────────────
 
 /// The zellij-backed [`MuxBackend`]. Stateless: every call opens its own
@@ -166,62 +231,14 @@ impl MuxBackend for ZellijBackend {
     // ── Read-only queries ───────────────────────────────────────────────────
 
     fn query_layout(&self, session: &str) -> Result<LayoutSnapshot> {
-        // TEMPORARY DUPLICATION (P1.01→P1.02): this mirrors the
-        // `ListTabsResponse`/`ListPanesResponse` deserialization in
-        // `grpc/layout.rs`, building a neutral snapshot that carries EXACTLY the
-        // fields the handler extracts to build the proto. P1.02 switches the
-        // handler to consume this and removes its own copy.
-        use std::collections::HashMap;
-        use zellij_utils::data::{ListPanesResponse, ListTabsResponse};
-
+        // Query the two JSON payloads over ephemeral connections, then parse via
+        // the SINGLE zellij-JSON → snapshot parse ([`parse_zellij_layout`]). The
+        // relay-routed path (`grpc/layout.rs`) reuses that same parse on the JSON
+        // strings it captures from its persistent connection — so there is now
+        // exactly one such deserialization in the codebase (P1.03).
         let tabs_json = query::query_list_tabs_json(session)?;
-        let tabs: ListTabsResponse = serde_json::from_str(&tabs_json)
-            .map_err(|e| anyhow!("query_layout: parse ListTabs JSON: {e}"))?;
-
         let panes_json = query::query_list_panes_json(session)?;
-        let panes: ListPanesResponse = serde_json::from_str(&panes_json)
-            .map_err(|e| anyhow!("query_layout: parse ListPanes JSON: {e}"))?;
-
-        // Group panes by tab_id, preserving ListPanes order. Plugin panes are
-        // INCLUDED here (the gRPC layer applies the client-visibility filter);
-        // the snapshot is the raw layout.
-        let mut panes_by_tab: HashMap<usize, Vec<PaneSnapshot>> = HashMap::new();
-        for entry in panes {
-            let p = &entry.pane_info;
-            let pane = PaneSnapshot {
-                id: p.id,
-                title: p.title.clone(),
-                is_focused: p.is_focused,
-                is_floating: p.is_floating,
-                exited: p.exited,
-                command: entry.pane_command.unwrap_or_default(),
-                cwd: entry.pane_cwd.unwrap_or_default(),
-                x: p.pane_x as u32,
-                y: p.pane_y as u32,
-                rows: p.pane_rows as u32,
-                cols: p.pane_columns as u32,
-                is_plugin: p.is_plugin,
-                is_fullscreen: p.is_fullscreen,
-            };
-            panes_by_tab.entry(entry.tab_id).or_default().push(pane);
-        }
-
-        let tab_snaps: Vec<TabSnapshot> = tabs
-            .into_iter()
-            .map(|tab| TabSnapshot {
-                tab_id: tab.tab_id as u64,
-                position: tab.position as u32,
-                name: tab.name.clone(),
-                active: tab.active,
-                has_bell: tab.has_bell_notification,
-                panes_to_hide: tab.panes_to_hide as u32,
-                fullscreen_active: tab.is_fullscreen_active,
-                floating_panes_visible: tab.are_floating_panes_visible,
-                panes: panes_by_tab.remove(&tab.tab_id).unwrap_or_default(),
-            })
-            .collect();
-
-        Ok(LayoutSnapshot { tabs: tab_snaps })
+        parse_zellij_layout(&tabs_json, &panes_json)
     }
 
     fn query_session_size(&self, session: &str) -> Result<(u16, u16)> {

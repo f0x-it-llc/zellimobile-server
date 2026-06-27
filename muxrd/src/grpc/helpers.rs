@@ -194,9 +194,9 @@ where
 /// Validate a [`PaneTarget`] (non-empty session) and map it to `(session, PaneRef)`.
 ///
 /// The neutral [`PaneRef`] carries the same `(id, is_plugin)` pair as the proto
-/// `PaneTarget`. Callers that pass the result to a [`crate::relay::RelayControl`]
-/// variant (which still uses `zellij_utils::data::PaneId` until P1.03) must
-/// convert locally via `crate::actions::pane_id_from_target(pr.id, pr.is_plugin)`.
+/// `PaneTarget` and is passed straight through to the backend handlers and the
+/// [`crate::relay::RelayControl`] variants (both neutral as of P1.03 — no
+/// per-call-site pane-id conversion).
 pub(super) fn resolve_pane_target(target: &PaneTarget) -> Result<(String, PaneRef), Status> {
     validate_session(&target.session)?;
     let pane = PaneRef {

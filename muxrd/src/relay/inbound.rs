@@ -1,16 +1,15 @@
 //! Tokio inbound task: drives the gRPC ClientFrame stream → IPC sender.
 
+use std::sync::Arc;
+
 use futures::StreamExt;
 use tonic::Streaming;
 
-use zellij_utils::input::actions::Action;
-
 use tokio::sync::mpsc;
 
-use crate::ipc::AttachSender;
+use crate::multiplexer::{FullscreenHint, MuxBackend, MuxSender};
 use crate::proto::{ClientFrame, client_frame};
 
-use super::helpers::{fill_floating_pane, hide_floating_panes, toggle_active_fullscreen};
 use super::reader::ShutdownGuard;
 use super::types::{
     ControlRegistry, FLOAT_QUERY_TIMEOUT, InFlightQuery, MAX_INPUT_FRAME_BYTES, QueryTx,
@@ -37,7 +36,10 @@ use super::types::{
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn inbound_loop(
     mut inbound: Streaming<ClientFrame>,
-    mut sender: AttachSender,
+    mut sender: Box<dyn MuxSender>,
+    // The multiplexer backend — used for the hint-less `ToggleFullscreen`
+    // fallback query (`pane_is_floating_with_visibility`). Cheap to clone (`Arc`).
+    backend: Arc<dyn MuxBackend>,
     guard: ShutdownGuard,
     session: String,
     // Process-unique id minted at attach time; used as the registry key for
@@ -107,9 +109,7 @@ pub(crate) async fn inbound_loop(
                     // switch that never happened). B-FOCUS state is only updated
                     // on the RW path below, after the action is actually sent.
                     if !read_only {
-                        if let Err(e) =
-                            sender.send_action_as_self(Action::GoToTabById { id: tab_id })
-                        {
+                        if let Err(e) = sender.go_to_tab(tab_id) {
                             log::warn!("relay inbound [{session}]: SwitchTab send failed: {e:#}");
                         } else {
                             // Update relay view state: active tab is now tab_id.
@@ -129,9 +129,7 @@ pub(crate) async fn inbound_loop(
                         log::trace!(
                             "relay inbound [{session}]: dropping FocusPane (read-only token)"
                         );
-                    } else if let Err(e) =
-                        sender.send_action_as_self(Action::FocusPaneByPaneId { pane_id: pane })
-                    {
+                    } else if let Err(e) = sender.focus_pane(pane) {
                         log::warn!("relay inbound [{session}]: FocusPane send failed: {e:#}");
                     } else {
                         // B-FOCUS: track focused pane for this relay client.
@@ -155,33 +153,37 @@ pub(crate) async fn inbound_loop(
                         // synchronous IPC query on this select-loop hot path
                         // (the query stalled input forwarding + the bearer
                         // recheck for a whole round trip, and spawned yet another
-                        // ephemeral AttachClient on the shared session).
+                        // ephemeral client on the shared session).
                         //
                         // FALLBACK (no hint — keyboard-driven / hint-less
-                        // callers): the original live query, derived fully from
-                        // live zellij state so an out-of-band SHOW/HIDE is
-                        // reflected immediately (M4 behaviour). HANG FIX
-                        // (BE-HANG) preserved: the blocking query runs in
-                        // spawn_blocking wrapped in tokio::time::timeout so a
-                        // stalled socket can never wedge the loop; on timeout we
-                        // skip the toggle rather than hang.
-                        let (is_floating, floating_visible, is_focused_floating) = match hint {
-                            Some(h) => (
-                                h.target_is_floating,
-                                h.floating_visible,
-                                h.target_is_focused_floating,
-                            ),
+                        // callers): a live query through the backend so an
+                        // out-of-band SHOW/HIDE is reflected immediately (M4
+                        // behaviour). HANG FIX (BE-HANG) preserved: the blocking
+                        // query runs in spawn_blocking wrapped in
+                        // tokio::time::timeout so a stalled socket can never wedge
+                        // the loop; on timeout we skip the toggle rather than hang.
+                        let resolved = match hint {
+                            Some(h) => FullscreenHint {
+                                is_floating: h.target_is_floating,
+                                floating_visible: h.floating_visible,
+                                is_focused_floating: h.target_is_focused_floating,
+                            },
                             None => {
+                                let backend = backend.clone();
                                 let s = session.clone();
                                 let query_fut = tokio::task::spawn_blocking(move || {
-                                    crate::query::pane_is_floating_with_visibility(&s, pane)
+                                    backend.pane_is_floating_with_visibility(&s, pane)
                                 });
                                 match tokio::time::timeout(FLOAT_QUERY_TIMEOUT, query_fut).await {
                                     Ok(join_result) => {
                                         let (f, v, focused) = join_result
                                             .unwrap_or(Ok((false, false, None)))
                                             .unwrap_or((false, false, None));
-                                        (f, v, focused == Some(pane))
+                                        FullscreenHint {
+                                            is_floating: f,
+                                            floating_visible: v,
+                                            is_focused_floating: focused == Some(pane),
+                                        }
                                     }
                                     Err(_elapsed) => {
                                         log::warn!(
@@ -197,56 +199,25 @@ pub(crate) async fn inbound_loop(
                             }
                         };
 
-                        if is_floating {
-                            // Floating path: fill-vs-hide derived fully from
-                            // LIVE zellij state.  Hide only when floating panes
-                            // are visible AND this specific pane is the focused
-                            // floating pane (per live `is_focused` from
-                            // ListPanes).  An out-of-band SHOW or HIDE by
-                            // another client or the keyboard is reflected in
-                            // `focused_floating` immediately, so the decision
-                            // never requires a double-tap to re-sync.
-                            if floating_visible && is_focused_floating {
-                                hide_floating_panes(&mut sender, &session);
-                                // B-FOCUS: hiding the floating panes returns focus
-                                // to whatever tiled pane was focused underneath —
-                                // which we don't track here. Mark unknown (None) so
-                                // get_layout falls back to the queried is_focused
-                                // rather than asserting this now-hidden floating
-                                // pane is still focused.
-                                // Key by connection_id so concurrent relays each update their own slot.
-                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
-                                    entry.state.focused_pane = None;
-                                }
-                            } else {
-                                fill_floating_pane(&mut sender, pane, &session);
-                                // B-FOCUS: fill_floating_pane focuses `pane` (it
-                                // sends FocusPaneByPaneId), so this relay client's
-                                // focused pane is now `pane` — track it, same as
-                                // the tiled branch does (folded minor).
-                                // Key by connection_id so concurrent relays each update their own slot.
-                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
-                                    entry.state.focused_pane = Some(pane);
-                                }
-                            }
+                        // The fill-vs-hide-vs-tiled action sequence is
+                        // backend-specific and lives behind `toggle_fullscreen`
+                        // (the zellij impl in `multiplexer::zellij`). The relay
+                        // updates its OWN view state from the SAME resolved hint:
+                        //   - hide path (floating, visible, focused) → focus is
+                        //     handed back to an untracked tiled pane → None;
+                        //   - fill path / tiled path → this client now focuses
+                        //     `pane` → Some(pane).
+                        let is_hide = resolved.is_floating
+                            && resolved.floating_visible
+                            && resolved.is_focused_floating;
+                        if let Err(e) = sender.toggle_fullscreen(pane, resolved) {
+                            log::warn!(
+                                "relay inbound [{session}]: ToggleFullscreen failed: {e:#}"
+                            );
                         } else {
-                            // Tiled path: Ctrl+p,f keyboard cadence — focus then
-                            // active-pane toggle. This is always a clean parity
-                            // toggle (enter or exit on the focused pane) — no
-                            // FS_SETTLE_MS exit-then-reenter dance needed.
-                            if let Err(e) = sender.send_action_as_self(
-                                Action::FocusPaneByPaneId { pane_id: pane },
-                            ) {
-                                log::warn!(
-                                    "relay inbound [{session}]: ToggleFullscreen focus failed: {e:#}"
-                                );
-                            } else {
-                                // B-FOCUS: track the pane we just focused.
-                                // Key by connection_id so concurrent relays each update their own slot.
-                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
-                                    entry.state.focused_pane = Some(pane);
-                                }
-                                toggle_active_fullscreen(&mut sender, &session, "toggle");
+                            // Key by connection_id so concurrent relays each update their own slot.
+                            if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                                entry.state.focused_pane = if is_hide { None } else { Some(pane) };
                             }
                         }
                     }
@@ -297,38 +268,14 @@ pub(crate) async fn inbound_loop(
                         continue;
                     }
 
-                    // Send both query actions. The render thread retires the slot
-                    // (its receiver cancels) if a send fails to produce a Log; we
-                    // don't need to await or own that path here.
-                    let tabs_action = Action::ListTabs {
-                        show_state: true,
-                        show_dimensions: true,
-                        show_panes: false,
-                        show_layout: false,
-                        show_all: true,
-                        output_json: true,
-                    };
-                    if let Err(e) = sender.send_action_as_self(tabs_action) {
-                        // The InFlightQuery is already owned by the render thread;
-                        // its reply will cancel via RELAY_QUERY_TIMEOUT / close
-                        // detection. Just log — we can't reach `reply` anymore.
+                    // Fire the layout query (ListTabs THEN ListPanes) over the
+                    // neutral sender. The InFlightQuery is already owned by the
+                    // render thread; if a send fails to produce a Log, its reply
+                    // cancels via RELAY_QUERY_TIMEOUT / close detection. We just
+                    // log — we can't reach `reply` from here anymore.
+                    if let Err(e) = sender.query_layout() {
                         log::warn!(
-                            "relay inbound [{session}]: QueryLayout seq={seq}: ListTabs send \
-                             failed (render thread will retire the query): {e:#}"
-                        );
-                        continue;
-                    }
-                    let panes_action = Action::ListPanes {
-                        show_tab: true,
-                        show_command: true,
-                        show_state: true,
-                        show_geometry: true,
-                        show_all: true,
-                        output_json: true,
-                    };
-                    if let Err(e) = sender.send_action_as_self(panes_action) {
-                        log::warn!(
-                            "relay inbound [{session}]: QueryLayout seq={seq}: ListPanes send \
+                            "relay inbound [{session}]: QueryLayout seq={seq}: query_layout send \
                              failed (render thread will retire the query): {e:#}"
                         );
                         continue;
@@ -441,11 +388,7 @@ async fn revalidate_token(token: Option<&str>, session: &str) -> bool {
         return false;
     };
     let token = token.to_owned();
-    match tokio::task::spawn_blocking(move || {
-        zellij_utils::web_authentication_tokens::validate_session_token(&token)
-    })
-    .await
-    {
+    match tokio::task::spawn_blocking(move || crate::ipc::validate_session_token(&token)).await {
         Ok(Ok(valid)) => valid,
         Ok(Err(e)) => {
             log::warn!("relay [{session}]: token re-validation DB error (failing closed): {e}");
@@ -464,11 +407,11 @@ async fn revalidate_token(token: Option<&str>, session: &str) -> bool {
 
 /// Forward raw input bytes to the focused pane.
 ///
-/// UTF-8 text goes via `WriteChars` (the A2-proven path); non-UTF-8 byte
-/// sequences (e.g. raw ESC) go via `Write`.
-fn forward_input(sender: &mut AttachSender, bytes: Vec<u8>) -> anyhow::Result<()> {
+/// UTF-8 text goes via `send_input_chars` (the A2-proven `WriteChars` path);
+/// non-UTF-8 byte sequences (e.g. raw ESC) go via `send_input_bytes` (`Write`).
+fn forward_input(sender: &mut Box<dyn MuxSender>, bytes: Vec<u8>) -> anyhow::Result<()> {
     match String::from_utf8(bytes) {
-        Ok(text) => sender.send_chars(&text),
-        Err(e) => sender.send_bytes(e.into_bytes()),
+        Ok(text) => sender.send_input_chars(&text),
+        Err(e) => sender.send_input_bytes(e.into_bytes()),
     }
 }

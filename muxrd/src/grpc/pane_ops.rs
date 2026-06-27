@@ -66,15 +66,12 @@ impl MuxrService {
         // Route through the live relay client if attached, so focus applies to
         // the rendering client (and re-points the single-pane sub).
         // connection_id targets the exact relay that sent the request.
-        //
-        // RelayControl::FocusPane still takes zellij PaneId (changed in P1.03);
-        // convert PaneRef → PaneId locally.
-        let pane_id_for_relay = crate::actions::pane_id_from_target(pane.id, pane.is_plugin);
+        // RelayControl::FocusPane carries the neutral PaneRef directly (P1.03).
         if let Some(resp) = try_route_control(
             &self.control,
             &session,
             &connection_id,
-            crate::relay::RelayControl::FocusPane(pane_id_for_relay),
+            crate::relay::RelayControl::FocusPane(pane),
         ) {
             log::info!("FocusPane: routed via relay client (session='{session}')");
             return Ok(resp);
@@ -227,18 +224,12 @@ impl MuxrService {
         // Route through the live relay client if attached so the fullscreen
         // toggle applies to the *rendering* client (is_cli_client:false).
         // connection_id targets the exact relay that sent the request.
-        //
-        // RelayControl::ToggleFullscreen still takes zellij PaneId (changed in
-        // P1.03); convert PaneRef → PaneId locally.
-        let pane_id_for_relay = crate::actions::pane_id_from_target(pane.id, pane.is_plugin);
+        // RelayControl::ToggleFullscreen carries the neutral PaneRef directly (P1.03).
         if let Some(resp) = try_route_control(
             &self.control,
             &session,
             &connection_id,
-            crate::relay::RelayControl::ToggleFullscreen {
-                pane: pane_id_for_relay,
-                hint,
-            },
+            crate::relay::RelayControl::ToggleFullscreen { pane, hint },
         ) {
             log::info!("TogglePaneFullscreen: routed via relay client (session='{session}')");
             return Ok(resp);

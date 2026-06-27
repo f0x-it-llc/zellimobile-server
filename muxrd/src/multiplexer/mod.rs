@@ -40,6 +40,11 @@ pub use types::{
     ResizeDir, ResizeKind, ScrollDir, TabSnapshot,
 };
 pub use zellij::ZellijBackend;
+/// The single zellij-JSON → [`LayoutSnapshot`] parse, shared by the ephemeral
+/// [`MuxBackend::query_layout`] impl and the relay-routed `GetLayout` path
+/// (`grpc/layout.rs`). `pub(crate)` so the gRPC layer can reuse it on the JSON
+/// strings captured by the relay, instead of duplicating the deserialization.
+pub(crate) use zellij::parse_zellij_layout;
 
 use std::time::Duration;
 

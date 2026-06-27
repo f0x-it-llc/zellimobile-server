@@ -5,8 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use zellij_utils::data::PaneId;
-
+use crate::multiplexer::PaneRef;
 use crate::proto::ServerFrame;
 
 // ─── RelayControl ─────────────────────────────────────────────────────────────
@@ -41,17 +40,21 @@ pub enum RelayControl {
     SwitchTab(u64),
     /// Focus a specific pane (and, in single-pane mode, re-point the display
     /// subscription to it).
-    FocusPane(PaneId),
+    FocusPane(PaneRef),
     /// Toggle fullscreen (or floating-fill) for a specific pane.
-    /// Tiled panes: focus then active-pane toggle (clean parity toggle).
-    /// Floating panes: fill-or-hide via [`fill_floating_pane`]/[`hide_floating_panes`].
+    ///
+    /// The relay resolves the floating context (from `hint` or a live
+    /// `MuxBackend::pane_is_floating_with_visibility` query) into a neutral
+    /// `FullscreenHint` and calls `MuxSender::toggle_fullscreen`, which owns the
+    /// fill-vs-hide-vs-tiled action sequence (backend-specific; the zellij impl
+    /// lives in `multiplexer::zellij`).
     ///
     /// `hint` (Bug 2c): client-supplied floating context so the relay can skip a
     /// synchronous `pane_is_floating_with_visibility` IPC query on the hot path.
     /// `None` → the relay falls back to a live query (keyboard-driven / hint-less
     /// callers).
     ToggleFullscreen {
-        pane: PaneId,
+        pane: PaneRef,
         hint: Option<FloatingHint>,
     },
     /// Query the current tab+pane layout over this relay's existing persistent
@@ -88,7 +91,7 @@ pub struct RelayViewState {
     pub active_tab: Option<u64>,
     /// The focused pane for this relay client.
     /// `None` when unknown (e.g. just after a bare tab switch or on init failure).
-    pub focused_pane: Option<PaneId>,
+    pub focused_pane: Option<PaneRef>,
 }
 
 /// A registry entry pairing a relay's owning session name with its control sender.

@@ -2,7 +2,7 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::multiplexer::{LayoutSnapshot, MuxBackend, PaneSnapshot, TabSnapshot};
+use crate::multiplexer::{LayoutSnapshot, MuxBackend};
 use crate::proto::{Layout, PaneMsg, SessionRef, TabMsg};
 
 use super::MuxrService;
@@ -40,11 +40,12 @@ impl MuxrService {
         //      scoped fallback; preserves solo-client and legacy-client behavior).
         //   3. No relay → ephemeral backend.query_layout() path.
         //
-        // Both paths now produce a neutral `LayoutSnapshot`; the relay branch
-        // parses the JSON strings it receives from the relay reader thread (via
-        // the QueryLayout oneshot), while the ephemeral branch delegates to
-        // `self.backend.query_layout()` directly. P1.03 will convert the relay
-        // to produce neutral messages, eliminating `parse_relay_json`.
+        // Both paths now produce a neutral `LayoutSnapshot` via the SAME parse
+        // ([`crate::multiplexer::parse_zellij_layout`], the single zellij-JSON →
+        // snapshot conversion). The relay branch feeds it the two JSON strings it
+        // captured from the relay reader thread (via the QueryLayout oneshot); the
+        // ephemeral branch delegates to `self.backend.query_layout()`, which calls
+        // the same parse internally (P1.03 retired the duplicate `parse_relay_json`).
         let (snapshot, via_relay, relay_conn_id) = {
             // Try per-connection lookup first, then session-scoped fallback.
             let relay_entry: Option<(
@@ -92,7 +93,20 @@ impl MuxrService {
                                 t.len(),
                                 p.len()
                             );
-                            let snap = parse_relay_json(&t, &p)?;
+                            let snap =
+                                crate::multiplexer::parse_zellij_layout(&t, &p).map_err(|e| {
+                                    // Keep the serde detail + payload sizes in the
+                                    // server log only; return a generic Status so
+                                    // neither the internal error nor the
+                                    // (cwd/command-bearing) layout JSON leaks.
+                                    log::warn!(
+                                        "GetLayout: failed to parse relay layout JSON \
+                                         (tabs={}B panes={}B): {e:#}",
+                                        t.len(),
+                                        p.len()
+                                    );
+                                    Status::internal("failed to parse layout response from session")
+                                })?;
                             (snap, true, matched_conn_id)
                         }
                         Ok(Ok(Err(e))) => {
@@ -191,11 +205,9 @@ impl MuxrService {
         // Panes are already nested under their tab in LayoutSnapshot (no HashMap
         // grouping step needed). Plugin panes are filtered here (single chokepoint).
         //
-        // B-FOCUS: relay_vs.focused_pane is still Option<zellij_utils::data::PaneId>
-        // (RelayViewState unchanged until P1.03); PaneId is used only for this
-        // comparison, keeping the override logic byte-identical to the pre-P1.02 code.
-        use zellij_utils::data::PaneId;
-
+        // B-FOCUS: relay_vs.focused_pane is a neutral `PaneRef` (P1.03), compared
+        // against each pane's (id, is_plugin) — byte-identical to the prior
+        // `PaneId::Terminal/Plugin` match.
         let tab_msgs: Vec<TabMsg> = snapshot
             .tabs
             .iter()
@@ -247,10 +259,7 @@ impl MuxrService {
                             relay_vs
                                 .as_ref()
                                 .and_then(|vs| vs.focused_pane)
-                                .map(|fp| match fp {
-                                    PaneId::Terminal(fid) => !p.is_plugin && p.id == fid,
-                                    PaneId::Plugin(fid) => p.is_plugin && p.id == fid,
-                                })
+                                .map(|fp| fp.is_plugin == p.is_plugin && fp.id == p.id)
                                 .unwrap_or(p.is_focused)
                         } else {
                             // Non-active tab (or active_tab unknown): keep the queried
@@ -353,82 +362,6 @@ pub(crate) fn should_apply_view_state_override(
     relay_conn_id: &str,
 ) -> bool {
     via_relay && !request_connection_id.is_empty() && relay_conn_id == request_connection_id
-}
-
-/// Parse relay-sourced `ListTabs` + `ListPanes` JSON strings into a neutral
-/// [`LayoutSnapshot`].
-///
-/// The JSON strings arrive from the relay reader thread via the
-/// `RelayControl::QueryLayout` oneshot channel: they are the raw JSON payloads
-/// from `Action::ListTabs` and `Action::ListPanes` Log replies captured over the
-/// relay's existing persistent connection.
-///
-/// **P1.03 TODO:** when the relay is converted to produce neutral
-/// [`crate::multiplexer::MuxServerMsg`] messages directly (P1.03), this helper
-/// and the remaining `zellij_utils` imports in this file can be removed.
-fn parse_relay_json(tabs_json: &str, panes_json: &str) -> Result<LayoutSnapshot, Status> {
-    use std::collections::HashMap;
-    use zellij_utils::data::{ListPanesResponse, ListTabsResponse};
-
-    // On parse failure keep the serde detail + payload size in the server log
-    // only; return a generic Status so neither the internal error nor the
-    // (potentially large, cwd/command-bearing) layout JSON leaks to the client.
-    let tabs: ListTabsResponse = serde_json::from_str(tabs_json).map_err(|e| {
-        log::warn!(
-            "GetLayout: failed to parse relay ListTabs JSON ({}B): {e}",
-            tabs_json.len()
-        );
-        Status::internal("failed to parse layout response from session")
-    })?;
-
-    let panes: ListPanesResponse = serde_json::from_str(panes_json).map_err(|e| {
-        log::warn!(
-            "GetLayout: failed to parse relay ListPanes JSON ({}B): {e}",
-            panes_json.len()
-        );
-        Status::internal("failed to parse layout response from session")
-    })?;
-
-    // Group panes by tab_id, preserving ListPanes order. Plugin panes are
-    // INCLUDED here (the gRPC layer applies the client-visibility filter at the
-    // proto-build stage above); the snapshot is the raw layout.
-    let mut panes_by_tab: HashMap<usize, Vec<PaneSnapshot>> = HashMap::new();
-    for entry in panes {
-        let p = &entry.pane_info;
-        let snap = PaneSnapshot {
-            id: p.id,
-            title: p.title.clone(),
-            is_focused: p.is_focused,
-            is_floating: p.is_floating,
-            exited: p.exited,
-            command: entry.pane_command.unwrap_or_default(),
-            cwd: entry.pane_cwd.unwrap_or_default(),
-            x: p.pane_x as u32,
-            y: p.pane_y as u32,
-            rows: p.pane_rows as u32,
-            cols: p.pane_columns as u32,
-            is_plugin: p.is_plugin,
-            is_fullscreen: p.is_fullscreen,
-        };
-        panes_by_tab.entry(entry.tab_id).or_default().push(snap);
-    }
-
-    let tabs_snap: Vec<TabSnapshot> = tabs
-        .into_iter()
-        .map(|tab| TabSnapshot {
-            tab_id: tab.tab_id as u64,
-            position: tab.position as u32,
-            name: tab.name,
-            active: tab.active,
-            has_bell: tab.has_bell_notification,
-            panes_to_hide: tab.panes_to_hide as u32,
-            fullscreen_active: tab.is_fullscreen_active,
-            floating_panes_visible: tab.are_floating_panes_visible,
-            panes: panes_by_tab.remove(&tab.tab_id).unwrap_or_default(),
-        })
-        .collect();
-
-    Ok(LayoutSnapshot { tabs: tabs_snap })
 }
 
 #[cfg(test)]

@@ -1,26 +1,33 @@
-//! relay — the blocking-IPC ↔ async-gRPC bridge for `AttachTerminal`.
+//! relay — the blocking-multiplexer ↔ async-gRPC bridge for `AttachTerminal`.
 //!
-//! This is the Phase-B hot path, extended in Phase C to also surface control
-//! events.  One [`attach_relay`] call drives a single `AttachTerminal`
+//! This is the Phase-B hot path, extended in Phase C to surface control events
+//! and generalized in P1.03 to drive a neutral [`crate::multiplexer::MuxBackend`]
+//! dual handle ([`MuxSender`]/[`MuxReceiver`]/[`MuxServerMsg`]) instead of zellij
+//! IPC types directly — so a Phase-2 herdr backend reuses this machinery
+//! verbatim. One [`attach_relay`] call drives a single `AttachTerminal`
 //! bidirectional gRPC stream:
 //!
 //! ```text
 //!                 ┌──────────────── std reader thread ───────────────┐
-//!   zellij        │  loop { AttachReceiver::recv()  (BLOCKING)        │
-//!   session ──────┼──►  Render → bounded mpsc::blocking_send ─────────┼──► ReceiverStream
-//!   (IPC socket)  │  Control events (Exit/RenamedSession/…) ──────────┼──►  (outbound ServerFrame)
+//!   backend       │  loop { MuxReceiver::recv()  (BLOCKING)           │
+//!   open_attach ──┼──►  Render → bounded mpsc::blocking_send ─────────┼──► ReceiverStream
+//!   (DualHandle)  │  Event (Exit/RenamedSession/…) ───────────────────┼──►  (outbound ServerFrame)
 //!                 │  Log (query reply) → fills in-flight query slot ───┼──► reply oneshot
 //!                 │       break on stop-flag, Exit, OR send error     │
 //!                 └───────────────────────────────────────────────────┘
 //!
 //!                 ┌──────────────── tokio inbound task ──────────────┐
 //!   gRPC client   │  Streaming<ClientFrame>::next()                   │
-//!   ──────────────┼──►  input → AttachSender::send_chars/send_bytes   │
-//!                 │     resize → AttachSender::send_resize            │
-//!                 │     QueryLayout → send actions + HAND query to    │
-//!                 │                   render thread (no await!)       │
+//!   ──────────────┼──►  input → MuxSender::send_input_chars/bytes     │
+//!                 │     resize → MuxSender::send_resize               │
+//!                 │     QueryLayout → MuxSender::query_layout + HAND   │
+//!                 │                   query to render thread (no await)│
 //!                 └───────────────────────────────────────────────────┘
 //! ```
+//!
+//! [`MuxSender`]: crate::multiplexer::MuxSender
+//! [`MuxReceiver`]: crate::multiplexer::MuxReceiver
+//! [`MuxServerMsg`]: crate::multiplexer::MuxServerMsg
 //!
 //! ## Lifecycle / clean shutdown
 //!
@@ -74,7 +81,7 @@
 //!   inbound task (QueryLayout arm — NEVER awaits):
 //!     1. bump a monotonic `seq`
 //!     2. hand InFlightQuery { seq, reply, tabs:None } → query_tx
-//!     3. send Action::ListTabs THEN Action::ListPanes via AttachSender
+//!     3. MuxSender::query_layout() (fires ListTabs THEN ListPanes)
 //!     4. return immediately (no await, no per-arm timeout)
 //!
 //!   reader thread (render_loop) owns Option<InFlightQuery>:
@@ -115,7 +122,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Status, Streaming};
 
-use crate::ipc::AttachHandle;
+use crate::multiplexer::MuxBackend;
 use crate::proto::{ClientFrame, ServerFrame, client_frame};
 
 mod helpers;
@@ -145,6 +152,7 @@ use types::{InFlightQuery, RENDER_CHANNEL_BOUND, RO_FALLBACK_COLS, RO_FALLBACK_R
 ///
 /// Reads the first inbound frame (must be `AttachReq`), opens the IPC attach,
 /// spawns the relay tasks/thread, and returns the outbound render stream.
+#[allow(clippy::too_many_arguments)]
 pub async fn attach_relay(
     mut inbound: Streaming<ClientFrame>,
     read_only: bool,
@@ -152,6 +160,7 @@ pub async fn attach_relay(
     clients: crate::client_count::SessionClients,
     control: ControlRegistry,
     view_state: ViewStateRegistry,
+    backend: Arc<dyn MuxBackend>,
 ) -> Result<ServerFrameStream, Status> {
     // ── 1. First frame must be AttachReq ────────────────────────────────────
     let first = inbound
@@ -184,7 +193,8 @@ pub async fn attach_relay(
     // client's. Writers (RW) keep driving their own size exactly as before.
     let (rows, cols) = if read_only {
         let query_session = session.clone();
-        match tokio::task::spawn_blocking(move || crate::query::query_session_size(&query_session))
+        let size_backend = backend.clone();
+        match tokio::task::spawn_blocking(move || size_backend.query_session_size(&query_session))
             .await
         {
             Ok(Ok((r, c))) => {
@@ -223,16 +233,19 @@ pub async fn attach_relay(
         attach.session
     );
 
-    // ── 2. Open the IPC attach (blocking but cheap: connect + handshake) ────
+    // ── 2. Open the attach via the backend (blocking but cheap: connect +
+    //       handshake), yielding a neutral DualHandle of boxed sender/receiver. ─
     let attach_session = attach.session.clone();
-    let handle =
-        tokio::task::spawn_blocking(move || AttachHandle::open(&attach_session, rows, cols))
-            .await
-            .map_err(|e| Status::internal(format!("attach task panicked: {e}")))?
-            .map_err(|e| Status::not_found(format!("attach failed: {e:#}")))?;
+    let open_backend = backend.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        open_backend.open_attach(&attach_session, rows, cols, read_only)
+    })
+    .await
+    .map_err(|e| Status::internal(format!("attach task panicked: {e}")))?
+    .map_err(|e| Status::not_found(format!("attach failed: {e:#}")))?;
 
     let session_name = handle.session_name.clone();
-    let (sender, mut receiver) = handle.split();
+    let (sender, receiver) = handle.split();
 
     // ── Phase F: count this client against the session ──────────────────────
     // Increment now that the attach succeeded; the guard is moved into the
@@ -296,15 +309,15 @@ pub async fn attach_relay(
     let reader_session = session_name.clone();
     let reader: JoinHandle<u64> = std::thread::Builder::new()
         .name(format!("relay-reader-{session_name}"))
-        .spawn(move || render_loop(&mut receiver, tx, reader_stop, &reader_session, query_rx))
+        .spawn(move || render_loop(receiver, tx, reader_stop, &reader_session, query_rx))
         .expect("failed to spawn relay reader thread");
 
-    // ShutdownGuard owns the stop-flag, a cloned sender for the resize nudge,
-    // and the join handle. Dropping it (when the inbound task ends) tears the
-    // reader thread down deterministically.
+    // ShutdownGuard owns the stop-flag, an independent cloned sender for the
+    // teardown nudge, and the join handle. Dropping it (when the inbound task
+    // ends) tears the reader thread down deterministically.
     let guard = ShutdownGuard {
         stop,
-        nudge: sender.try_clone(),
+        nudge: sender.box_clone(),
         reader: Some(reader),
         rows,
         cols,
@@ -334,9 +347,11 @@ pub async fn attach_relay(
         let view_state_init = view_state.clone();
         let conn_id = connection_id.clone();
         let session_for_entry = session_name.clone();
-        let init_result =
-            tokio::task::spawn_blocking(move || helpers::init_relay_view_state(&init_session))
-                .await;
+        let init_backend = backend.clone();
+        let init_result = tokio::task::spawn_blocking(move || {
+            helpers::init_relay_view_state(&init_backend, &init_session)
+        })
+        .await;
         let relay_vs = match init_result {
             Ok(Ok(state)) => {
                 log::info!(
@@ -387,6 +402,7 @@ pub async fn attach_relay(
     tokio::spawn(inbound::inbound_loop(
         inbound,
         sender,
+        backend,
         guard,
         session_name,
         connection_id,

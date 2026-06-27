@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use tonic::Status;
 
-use crate::ipc::{self, AttachSender};
+use crate::multiplexer::{MuxEvent, MuxReceiver, MuxSender, MuxServerMsg};
 use crate::proto::ServerFrame;
 use crate::proto::{ControlEvent, server_frame};
 
@@ -48,14 +48,12 @@ use super::types::InFlightQuery;
 /// 3. Render frames are never dropped (`Log` is a distinct variant from
 ///    `Render`).
 pub(super) fn render_loop(
-    receiver: &mut ipc::AttachReceiver,
+    mut receiver: Box<dyn MuxReceiver>,
     tx: mpsc::Sender<Result<ServerFrame, Status>>,
     stop: Arc<AtomicBool>,
     session: &str,
     query_rx: std::sync::mpsc::Receiver<InFlightQuery>,
 ) -> u64 {
-    use zellij_utils::ipc::ServerToClientMsg;
-
     let mut renders: u64 = 0;
     // The single in-flight layout query, owned exclusively by this thread.
     // At most one is outstanding; a newer one replaces it (replace-on-new).
@@ -91,9 +89,9 @@ pub(super) fn render_loop(
         drain_queries(&query_rx, &mut in_flight, session);
 
         match msg {
-            ServerToClientMsg::Render { content } => {
+            MuxServerMsg::Render(content) => {
                 let frame = ServerFrame {
-                    kind: Some(server_frame::Kind::Render(content.into_bytes())),
+                    kind: Some(server_frame::Kind::Render(content)),
                 };
                 // blocking_send applies backpressure; Err == receiver dropped
                 // (gRPC client disconnected) → tear down.
@@ -105,99 +103,98 @@ pub(super) fn render_loop(
                 renders += 1;
             }
 
-            // FX-QUERY: Log is the reply to a ListTabs/ListPanes query action.
-            // First Log → tabs, second Log → panes; on the second, fulfill the
-            // reply and clear the slot. A Log with no in-flight query is a stale
-            // reply from an already-retired query — drop it.
-            ServerToClientMsg::Log { lines } => {
-                capture_query_log(&mut in_flight, lines, session);
+            // FX-QUERY: Log is one reply line to a ListTabs/ListPanes query (the
+            // neutral receiver already joined the server `Log` lines into one
+            // string). First Log → tabs, second Log → panes; on the second,
+            // fulfill the reply and clear the slot. A Log with no in-flight query
+            // is a stale reply from an already-retired query — drop it.
+            MuxServerMsg::Log(json) => {
+                capture_query_log(&mut in_flight, json, session);
             }
 
             // ── Phase C: control events ──────────────────────────────────────
             //
-            // Map pushed ServerToClientMsg variants → ServerFrame::control so
-            // the gRPC client can react to session lifecycle changes without
-            // polling.  Render bytes and control events interleave naturally on
-            // the same bounded mpsc channel.
-            ServerToClientMsg::Exit { exit_reason } => {
-                log::info!("relay reader [{session}]: session Exit: {exit_reason:?}");
-                // Drop any in-flight query (its receiver cancels → grpc falls
-                // back / errors out rather than hanging to the outer timeout).
-                drop(in_flight.take());
-                // Surface the exit reason to the client before closing.
-                let payload = exit_reason.to_string();
-                let frame = ServerFrame {
-                    kind: Some(server_frame::Kind::Control(ControlEvent {
-                        kind: "exit".to_owned(),
-                        payload,
-                    })),
-                };
-                // Best-effort send; if the channel is already gone we just exit.
-                let _ = tx.blocking_send(Ok(frame));
-                break;
-            }
-
-            ServerToClientMsg::RenamedSession { name } => {
-                log::info!("relay reader [{session}]: RenamedSession → '{name}'");
-                let frame = ServerFrame {
-                    kind: Some(server_frame::Kind::Control(ControlEvent {
-                        kind: "renamed_session".to_owned(),
-                        payload: name,
-                    })),
-                };
-                if tx.blocking_send(Ok(frame)).is_err() {
-                    log::info!("relay reader [{session}]: outbound dropped (client gone), exiting");
+            // Map neutral MuxEvent variants → ServerFrame::control so the gRPC
+            // client can react to session lifecycle changes without polling.
+            // Render bytes and control events interleave naturally on the same
+            // bounded mpsc channel.
+            MuxServerMsg::Event(event) => match event {
+                MuxEvent::Exit { reason } => {
+                    log::info!("relay reader [{session}]: session Exit: {reason:?}");
+                    // Drop any in-flight query (its receiver cancels → grpc falls
+                    // back / errors out rather than hanging to the outer timeout).
+                    drop(in_flight.take());
+                    // Surface the exit reason to the client before closing.
+                    let frame = ServerFrame {
+                        kind: Some(server_frame::Kind::Control(ControlEvent {
+                            kind: "exit".to_owned(),
+                            payload: reason,
+                        })),
+                    };
+                    // Best-effort send; if the channel is already gone we just exit.
+                    let _ = tx.blocking_send(Ok(frame));
                     break;
                 }
-            }
 
-            ServerToClientMsg::ConfigFileUpdated => {
-                log::info!("relay reader [{session}]: ConfigFileUpdated");
-                let frame = ServerFrame {
-                    kind: Some(server_frame::Kind::Control(ControlEvent {
-                        kind: "config_updated".to_owned(),
-                        payload: String::new(),
-                    })),
-                };
-                if tx.blocking_send(Ok(frame)).is_err() {
-                    log::info!("relay reader [{session}]: outbound dropped (client gone), exiting");
-                    break;
+                MuxEvent::RenamedSession { name } => {
+                    log::info!("relay reader [{session}]: RenamedSession → '{name}'");
+                    let frame = ServerFrame {
+                        kind: Some(server_frame::Kind::Control(ControlEvent {
+                            kind: "renamed_session".to_owned(),
+                            payload: name,
+                        })),
+                    };
+                    if tx.blocking_send(Ok(frame)).is_err() {
+                        log::info!(
+                            "relay reader [{session}]: outbound dropped (client gone), exiting"
+                        );
+                        break;
+                    }
                 }
-            }
 
-            ServerToClientMsg::SwitchSession { connect_to_session } => {
-                let target = connect_to_session.name.unwrap_or_default();
-                log::info!("relay reader [{session}]: SwitchSession → '{target}'");
-                let frame = ServerFrame {
-                    kind: Some(server_frame::Kind::Control(ControlEvent {
-                        kind: "switch_session".to_owned(),
-                        payload: target,
-                    })),
-                };
-                if tx.blocking_send(Ok(frame)).is_err() {
-                    log::info!("relay reader [{session}]: outbound dropped (client gone), exiting");
-                    break;
+                MuxEvent::ConfigUpdated => {
+                    log::info!("relay reader [{session}]: ConfigFileUpdated");
+                    let frame = ServerFrame {
+                        kind: Some(server_frame::Kind::Control(ControlEvent {
+                            kind: "config_updated".to_owned(),
+                            payload: String::new(),
+                        })),
+                    };
+                    if tx.blocking_send(Ok(frame)).is_err() {
+                        log::info!(
+                            "relay reader [{session}]: outbound dropped (client gone), exiting"
+                        );
+                        break;
+                    }
                 }
-            }
 
-            // Remaining variants we intentionally drop:
+                MuxEvent::SwitchSession { name } => {
+                    log::info!("relay reader [{session}]: SwitchSession → '{name}'");
+                    let frame = ServerFrame {
+                        kind: Some(server_frame::Kind::Control(ControlEvent {
+                            kind: "switch_session".to_owned(),
+                            payload: name,
+                        })),
+                    };
+                    if tx.blocking_send(Ok(frame)).is_err() {
+                        log::info!(
+                            "relay reader [{session}]: outbound dropped (client gone), exiting"
+                        );
+                        break;
+                    }
+                }
+            },
+
+            // Messages with no remote-client semantics (UnblockInputThread,
+            // Connected, QueryTerminalSize, PaneRenderUpdate, …) are mapped to
+            // `Other` by the backend's receiver and drained here — preserving the
+            // per-message loop cadence (stop-flag checks, query draining).
             //
-            // • UnblockInputThread / Connected / QueryTerminalSize — internal
-            //   plumbing; no semantic value to remote clients.
-            // • LogError — only delivered to cli-client query connections; should
-            //   not arrive here but we drain it if it does.
-            // • PaneRenderUpdate / SubscribedPaneClosed — require an explicit
-            //   SubscribeToPaneRenders subscription which we never send; these
-            //   messages will not arrive in practice.
-            // • UnblockCliPipeInput / CliPipeOutput — pipe plumbing.
-            // • StartWebServer — internal.
-            // • ForwardQueryToHost — terminal-query passthrough; not applicable.
-            //
-            // Known 0.44.3 limitation: no per-change push for tab/pane
-            // structure changes or bell notifications.  Clients that need
-            // up-to-date layout/bell state should poll GetLayout.
-            other => {
-                log::trace!("relay reader [{session}]: ignoring {other:?}");
+            // Known 0.44.3 limitation: no per-change push for tab/pane structure
+            // changes or bell notifications. Clients that need up-to-date
+            // layout/bell state should poll GetLayout.
+            MuxServerMsg::Other => {
+                log::trace!("relay reader [{session}]: draining Other message");
             }
         }
     }
@@ -268,12 +265,12 @@ fn drain_queries(
 /// query's tabs slot. This is inherent to untagged Logs (see the module NOTE);
 /// the alternative is issuing the two actions one-at-a-time, which would
 /// reintroduce an await on the inbound loop and is therefore rejected here.
-fn capture_query_log(in_flight: &mut Option<InFlightQuery>, lines: Vec<String>, session: &str) {
+fn capture_query_log(in_flight: &mut Option<InFlightQuery>, json: String, session: &str) {
     let Some(q) = in_flight.as_mut() else {
         log::debug!(
-            "relay reader [{session}]: Log ({} lines) with no in-flight query — \
+            "relay reader [{session}]: Log ({}B) with no in-flight query — \
              dropping (stale reply)",
-            lines.len()
+            json.len()
         );
         return;
     };
@@ -291,7 +288,6 @@ fn capture_query_log(in_flight: &mut Option<InFlightQuery>, lines: Vec<String>, 
         return;
     }
 
-    let json = lines.join("\n");
     if q.tabs.is_none() {
         log::trace!(
             "relay reader [{session}]: captured tabs Log ({}B) for query seq={}",
@@ -333,7 +329,7 @@ fn capture_query_log(in_flight: &mut Option<InFlightQuery>, lines: Vec<String>, 
 /// Tears down the std reader thread on drop.
 pub(super) struct ShutdownGuard {
     pub(super) stop: Arc<AtomicBool>,
-    pub(super) nudge: AttachSender,
+    pub(super) nudge: Box<dyn MuxSender>,
     pub(super) reader: Option<JoinHandle<u64>>,
     pub(super) rows: u16,
     pub(super) cols: u16,
@@ -407,10 +403,10 @@ mod tests {
         let (q, mut rx) = mk_query(1);
         let mut in_flight = Some(q);
 
-        capture_query_log(&mut in_flight, vec!["TABS".into()], "s");
+        capture_query_log(&mut in_flight, "TABS".into(), "s");
         assert!(in_flight.is_some(), "after first Log the slot stays armed");
 
-        capture_query_log(&mut in_flight, vec!["PANES".into()], "s");
+        capture_query_log(&mut in_flight, "PANES".into(), "s");
         assert!(in_flight.is_none(), "after second Log the slot is cleared");
 
         let got = rx.try_recv().expect("reply sent").expect("ok result");
@@ -420,7 +416,7 @@ mod tests {
     #[test]
     fn capture_with_no_in_flight_query_is_a_noop() {
         let mut in_flight: Option<InFlightQuery> = None;
-        capture_query_log(&mut in_flight, vec!["stray".into()], "s");
+        capture_query_log(&mut in_flight, "stray".into(), "s");
         assert!(in_flight.is_none());
     }
 
@@ -429,8 +425,8 @@ mod tests {
         let (q, mut rx) = mk_query(2);
         let mut in_flight = Some(q);
 
-        capture_query_log(&mut in_flight, vec![], "s"); // tabs Log → ""
-        capture_query_log(&mut in_flight, vec!["PANES".into()], "s");
+        capture_query_log(&mut in_flight, String::new(), "s"); // tabs Log → ""
+        capture_query_log(&mut in_flight, "PANES".into(), "s");
 
         let got = rx.try_recv().expect("reply sent");
         assert!(got.is_err(), "empty tabs JSON yields an error result");
@@ -442,7 +438,7 @@ mod tests {
         drop(rx); // grpc timed out and dropped the receiver
         let mut in_flight = Some(q);
 
-        capture_query_log(&mut in_flight, vec!["TABS".into()], "s");
+        capture_query_log(&mut in_flight, "TABS".into(), "s");
         assert!(
             in_flight.is_none(),
             "closed receiver → slot retired, Log discarded"
@@ -481,6 +477,206 @@ mod tests {
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed)
             ),
             "replaced query's receiver is cancelled so grpc falls back"
+        );
+    }
+
+    // ─── P1.03 characterization: render_loop over neutral MuxReceiver ─────────
+    //
+    // The neutral `MuxReceiver`/`MuxSender` traits let us drive `render_loop` and
+    // `ShutdownGuard` with in-process fakes — no live zellij socket. These pin the
+    // behavior the relay had over the concrete `AttachReceiver`/`AttachSender`
+    // before the dual-handle refactor: render passthrough, control-event
+    // forwarding, query-Log pairing, Other-draining, and the read-only-vs-write
+    // shutdown nudge.
+
+    use crate::multiplexer::{FullscreenHint, MuxEvent, MuxReceiver, MuxServerMsg, PaneRef};
+    use crate::proto::{ServerFrame, server_frame};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// A `MuxReceiver` that yields a fixed script of messages, then `None` (EOF).
+    struct ScriptedReceiver {
+        msgs: VecDeque<MuxServerMsg>,
+    }
+
+    impl MuxReceiver for ScriptedReceiver {
+        fn recv(&mut self) -> Option<MuxServerMsg> {
+            self.msgs.pop_front()
+        }
+    }
+
+    fn scripted(msgs: Vec<MuxServerMsg>) -> Box<dyn MuxReceiver> {
+        Box::new(ScriptedReceiver {
+            msgs: VecDeque::from(msgs),
+        })
+    }
+
+    #[test]
+    fn render_loop_forwards_render_control_and_drains_other() {
+        let (tx, mut rx) = mpsc::channel::<Result<ServerFrame, Status>>(64);
+        let receiver = scripted(vec![
+            MuxServerMsg::Render(b"hello".to_vec()),
+            MuxServerMsg::Other, // produces no frame; just drained
+            MuxServerMsg::Event(MuxEvent::RenamedSession {
+                name: "newname".into(),
+            }),
+            MuxServerMsg::Event(MuxEvent::Exit {
+                reason: "bye".into(),
+            }),
+            // Exit breaks the loop, so this trailing Render is never observed.
+            MuxServerMsg::Render(b"after".to_vec()),
+        ]);
+        let (_qtx, qrx) = std::sync::mpsc::channel::<InFlightQuery>();
+
+        let renders = render_loop(receiver, tx, Arc::new(AtomicBool::new(false)), "s", qrx);
+        assert_eq!(
+            renders, 1,
+            "exactly one Render forwarded (Other/control/Exit not counted)"
+        );
+
+        // Frame 1: the render bytes, verbatim.
+        match rx.try_recv() {
+            Ok(Ok(ServerFrame {
+                kind: Some(server_frame::Kind::Render(bytes)),
+            })) => assert_eq!(bytes, b"hello"),
+            other => panic!("expected render frame, got {other:?}"),
+        }
+        // Frame 2: renamed_session control (the Other in between emitted nothing).
+        match rx.try_recv() {
+            Ok(Ok(ServerFrame {
+                kind: Some(server_frame::Kind::Control(ev)),
+            })) => {
+                assert_eq!(ev.kind, "renamed_session");
+                assert_eq!(ev.payload, "newname");
+            }
+            other => panic!("expected renamed_session control, got {other:?}"),
+        }
+        // Frame 3: exit control with the reason as payload.
+        match rx.try_recv() {
+            Ok(Ok(ServerFrame {
+                kind: Some(server_frame::Kind::Control(ev)),
+            })) => {
+                assert_eq!(ev.kind, "exit");
+                assert_eq!(ev.payload, "bye");
+            }
+            other => panic!("expected exit control, got {other:?}"),
+        }
+        // Nothing after Exit (the loop broke before the trailing Render).
+        assert!(rx.try_recv().is_err(), "loop must stop emitting after Exit");
+    }
+
+    #[test]
+    fn render_loop_pairs_query_logs_tabs_then_panes() {
+        let (tx, _rx) = mpsc::channel::<Result<ServerFrame, Status>>(64);
+        let (qtx, qrx) = std::sync::mpsc::channel::<InFlightQuery>();
+        let (reply, mut reply_rx) = tokio::sync::oneshot::channel();
+        qtx.send(InFlightQuery {
+            seq: 1,
+            reply,
+            tabs: None,
+        })
+        .unwrap();
+
+        // Two consecutive Logs: first = tabs JSON, second = panes JSON.
+        let receiver = scripted(vec![
+            MuxServerMsg::Log("TABSJSON".into()),
+            MuxServerMsg::Log("PANESJSON".into()),
+        ]);
+
+        let _ = render_loop(receiver, tx, Arc::new(AtomicBool::new(false)), "s", qrx);
+
+        let got = reply_rx
+            .try_recv()
+            .expect("reply fulfilled")
+            .expect("ok result");
+        assert_eq!(got, ("TABSJSON".to_string(), "PANESJSON".to_string()));
+    }
+
+    /// A `MuxSender` that records the name of each method invoked.
+    #[derive(Clone)]
+    struct RecordingSender {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingSender {
+        fn note(&self, name: &str) {
+            self.calls.lock().unwrap().push(name.to_owned());
+        }
+    }
+
+    impl MuxSender for RecordingSender {
+        fn go_to_tab(&mut self, _tab_id: u64) -> anyhow::Result<()> {
+            self.note("go_to_tab");
+            Ok(())
+        }
+        fn focus_pane(&mut self, _pane: PaneRef) -> anyhow::Result<()> {
+            self.note("focus_pane");
+            Ok(())
+        }
+        fn toggle_fullscreen(
+            &mut self,
+            _pane: PaneRef,
+            _hint: FullscreenHint,
+        ) -> anyhow::Result<()> {
+            self.note("toggle_fullscreen");
+            Ok(())
+        }
+        fn query_layout(&mut self) -> anyhow::Result<()> {
+            self.note("query_layout");
+            Ok(())
+        }
+        fn send_input_chars(&mut self, _text: &str) -> anyhow::Result<()> {
+            self.note("send_input_chars");
+            Ok(())
+        }
+        fn send_input_bytes(&mut self, _bytes: Vec<u8>) -> anyhow::Result<()> {
+            self.note("send_input_bytes");
+            Ok(())
+        }
+        fn send_resize(&mut self, _rows: u16, _cols: u16) -> anyhow::Result<()> {
+            self.note("send_resize");
+            Ok(())
+        }
+        fn send_client_exited(&mut self) -> anyhow::Result<()> {
+            self.note("send_client_exited");
+            Ok(())
+        }
+        fn box_clone(&self) -> Box<dyn MuxSender> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn shutdown_guard_with(read_only: bool, calls: Arc<Mutex<Vec<String>>>) -> ShutdownGuard {
+        ShutdownGuard {
+            stop: Arc::new(AtomicBool::new(false)),
+            nudge: Box::new(RecordingSender { calls }),
+            reader: None, // no thread to join in the unit test
+            rows: 24,
+            cols: 80,
+            read_only,
+            session: "s".into(),
+        }
+    }
+
+    #[test]
+    fn shutdown_guard_read_only_nudges_via_client_exited() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        drop(shutdown_guard_with(true, calls.clone()));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["send_client_exited"],
+            "read-only teardown must nudge via ClientExited (never a resize)"
+        );
+    }
+
+    #[test]
+    fn shutdown_guard_read_write_nudges_via_resize() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        drop(shutdown_guard_with(false, calls.clone()));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["send_resize"],
+            "read-write teardown must nudge via a no-op resize"
         );
     }
 }

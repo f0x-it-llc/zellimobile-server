@@ -97,6 +97,7 @@ impl MuxrService {
             self.clients.clone(),
             self.control.clone(),
             self.view_state.clone(),
+            self.backend.clone(),
         )
         .await?;
         Ok(Response::new(stream))
