@@ -90,7 +90,6 @@ const CELL_PX_DISABLED: u32 = 0;
 /// `read_only` is logged for traceability; herdr enforces write ownership on the
 /// terminal itself, and the read-only teardown nudge is `Detach`
 /// ([`MuxSender::send_client_exited`]) for both modes.
-#[allow(dead_code)] // consumed by HerdrBackend::open_attach (P2.04)
 pub fn open_attach(
     control: Arc<HerdrControl>,
     wire_socket: PathBuf,
@@ -230,7 +229,6 @@ fn resolve_focused_terminal(control: &HerdrControl, workspace_id: &str) -> Resul
 /// The input/control half of a herdr [`DualHandle`]. Owns the wire **write** half
 /// and an `Arc<HerdrControl>` for JSON-API control/layout calls. Focus operations
 /// re-attach the wire stream to a new pane's `terminal_id`.
-#[allow(dead_code)] // constructed by open_attach; consumed by the relay (P2.04)
 pub struct HerdrMuxSender {
     /// Write half of the wire socket (raw input, resize, attach, detach).
     write: UnixStream,
@@ -364,7 +362,6 @@ impl MuxSender for HerdrMuxSender {
 
 /// The render/event half of a herdr [`DualHandle`]. Owns the wire **read** half
 /// and runs on the relay's blocking reader std-thread.
-#[allow(dead_code)] // constructed by open_attach; consumed by the relay (P2.04)
 pub struct HerdrMuxReceiver {
     /// Read half of the wire socket (blocking).
     read: UnixStream,

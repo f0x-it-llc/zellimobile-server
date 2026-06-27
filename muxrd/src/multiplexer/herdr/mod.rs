@@ -20,6 +20,8 @@
 //! - [`control`] — the JSON-API control client + neutral layout transcode (P2.02).
 //! - [`relay`] — the wire terminal relay (single-pane attach): the
 //!   `MuxSender`/`MuxReceiver`/`DualHandle` data plane (P2.03).
+//! - [`backend`] — `HerdrBackend`, the `MuxBackend` impl composing control +
+//!   relay + registries into a complete second backend (P2.04).
 //!
 //! # AGPL discipline
 //!
@@ -32,6 +34,7 @@
 //! discriminant tags, serde tagging); no code was copied or adapted.
 
 pub mod api;
+pub mod backend;
 pub mod control;
 pub mod paths;
 pub mod registry;
