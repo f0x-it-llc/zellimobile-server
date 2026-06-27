@@ -146,18 +146,6 @@ impl MuxrService {
         helpers::resolve_session(&self.backends, id)
     }
 
-    /// Primary-backend accessor for the two **not-yet-id-routed** session-enumerating
-    /// RPCs only: `ListSessions` and `CreateSession`.
-    ///
-    /// These are not session-scoped (no incoming `id` to route on): `ListSessions`
-    /// will fan out across **all** backends and `CreateSession` will pick a target
-    /// backend — both are T05's job. Until then they run against
-    /// [`primary`](crate::multiplexer::BackendSet::primary). Every other handler
-    /// routes through [`MuxrService::resolve_session`]; do not add new callers here.
-    fn backend(&self) -> &std::sync::Arc<dyn crate::multiplexer::MuxBackend> {
-        self.backends.primary()
-    }
-
     /// Returns a clone of the per-session attached-client registry.
     ///
     /// The clone shares the same underlying `DashMap` (via `Arc`), so callers

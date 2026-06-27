@@ -10,7 +10,7 @@ use crate::proto::{
 
 use super::MuxrService;
 use super::SERVER_VERSION;
-use super::helpers::reject_if_read_only;
+use super::helpers::{self, reject_if_read_only};
 
 impl MuxrService {
     // ── GetVersion ──────────────────────────────────────────────────────────
@@ -19,16 +19,43 @@ impl MuxrService {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<VersionInfo>, Status> {
+        // Phase 3: report a per-backend version for EVERY backend this server
+        // drives, plus the set of available backends. No session is needed — the
+        // versions come straight off each backend (`backend_version()`):
+        //   - zellij → `zellij_utils::consts::VERSION` (the linked version),
+        //   - herdr  → `herdr-wire-v<N>` (the wire-protocol compat marker, which
+        //     is the meaningful version between muxrd and a running herdr).
+        // `zellij_version` is kept as a back-compat scalar = the zellij backend's
+        // version if present, else "" (older clients read only this field).
+        let mut backend_versions: Vec<crate::proto::BackendVersion> = Vec::new();
+        let mut available_backends: Vec<i32> = Vec::new();
+        let mut zellij_version = String::new();
+
+        for (kind, backend) in self.backends.iter() {
+            let proto_kind = helpers::proto_backend(kind);
+            let version = backend.backend_version();
+            if kind == crate::cli::BackendKind::Zellij {
+                zellij_version = version.clone();
+            }
+            available_backends.push(proto_kind as i32);
+            backend_versions.push(crate::proto::BackendVersion {
+                backend: proto_kind as i32,
+                version,
+            });
+        }
+
         let info = VersionInfo {
             server_version: SERVER_VERSION.to_owned(),
-            zellij_version: zellij_utils::consts::VERSION.to_owned(),
-            backends: Vec::new(), // populated in Phase 3 (multi-backend)
-            available_backends: Vec::new(), // populated in Phase 3
+            zellij_version,
+            backends: backend_versions,
+            available_backends,
         };
         log::debug!(
-            "GetVersion → server={} zellij={}",
+            "GetVersion → server={} zellij={:?} backends={} available={:?}",
             info.server_version,
-            info.zellij_version
+            info.zellij_version,
+            info.backends.len(),
+            info.available_backends,
         );
         Ok(Response::new(info))
     }

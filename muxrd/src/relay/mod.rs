@@ -191,7 +191,18 @@ pub async fn attach_relay(
     // the path-traversal guard on the bare name (the attach path was previously
     // unvalidated — this tightens it).
     let id = attach.session.clone();
-    let (backend, session) = crate::grpc::helpers::resolve_session(&backends, &id)?;
+    let (backend_kind, backend, session) =
+        crate::grpc::helpers::resolve_session_kind(&backends, &id)?;
+
+    // ── Carried T04 fix: backend-qualified client-count key ──────────────────
+    // The relay's connected-client count must bucket by the SAME opaque id that
+    // `ListSessions` reads (`make_id(kind, bare)`), NOT by the bare session name.
+    // Keying by the bare name would make two same-name sessions on different
+    // backends (`zellij:dev` + `herdr:dev`) share one bucket and double-count.
+    // Canonicalize here (rather than reusing the raw client-sent `id`) so a legacy
+    // bare-name attach on a single-backend server still lands in the same bucket
+    // the canonical `make_id`-keyed `ListSessions` reads.
+    let count_key = crate::grpc::helpers::make_id(backend_kind, &session);
 
     // ── 1b. Major A (round-2): read-only attaches must NOT drive geometry ────
     //
@@ -262,7 +273,7 @@ pub async fn attach_relay(
     // inbound task below and decrements on every stream-end path when that task
     // (and the guard with it) drops. Attach-failure paths above returned early
     // and were never counted.
-    let client_guard = clients.attach(&session_name);
+    let client_guard = clients.attach(&count_key);
 
     // ── 3b. Mint a process-unique connection_id for this relay. ─────────────
     // Monotonic AtomicU64 is cheaper than UUID and sufficient: we only need

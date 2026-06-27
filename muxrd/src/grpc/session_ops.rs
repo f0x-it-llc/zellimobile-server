@@ -8,7 +8,10 @@ use crate::proto::{
 };
 
 use super::MuxrService;
-use super::helpers::{reject_if_read_only, run_action, validate_layout_name, validate_session};
+use super::helpers::{
+    kind_from_proto, make_id, proto_backend, reject_if_read_only, run_action, validate_layout_name,
+    validate_session,
+};
 
 impl MuxrService {
     // ── ListSessions (C1) ───────────────────────────────────────────────────
@@ -17,31 +20,51 @@ impl MuxrService {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<SessionList>, Status> {
-        log::debug!("ListSessions: scanning session sockets");
+        log::debug!("ListSessions: scanning session sockets across all backends");
 
-        let backend = self.backend().clone();
-        let sessions =
-            tokio::task::spawn_blocking(move || backend.list_sessions_with_resurrectables())
-                .await
-                .map_err(|e| Status::internal(format!("ListSessions task panicked: {e}")))?
-                .map_err(|e| {
-                    log::warn!("ListSessions: error enumerating sessions: {e:#}");
-                    Status::internal(format!("failed to list sessions: {e:#}"))
-                })?;
-
+        // Phase 3: fan ListSessions across EVERY backend this server drives and
+        // merge the results. Each session is tagged with its owning backend and
+        // assigned an opaque, backend-qualified `id` (`<backend>:<bare>`, via
+        // `make_id`) that round-trips through `resolve_session`. A backend that
+        // errors mid-run is skipped (warn-logged) rather than failing the whole
+        // RPC — one unreachable backend must not blind the client to the other.
+        //
         // `connected_clients` is sourced from this server's own relay registry
-        // (cheap, no IPC). The layout-derived enrichment fields
-        // (tab_count/pane_count/has_bell/is_current) are left at their zero
-        // defaults here: filling them requires a per-session layout query whose
-        // transient AttachClient can briefly resize the session, so polling them
-        // for every session is deferred pending the on-rig resize check (Phase
-        // F G4b). Clients fall back to GetLayout on demand for counts.
+        // (cheap, no IPC), keyed by the SAME opaque `id` the relay's attach site
+        // counts under — so two same-name sessions on different backends
+        // (`zellij:dev` + `herdr:dev`) no longer share one count bucket. The
+        // layout-derived enrichment fields (tab_count/pane_count/has_bell/
+        // is_current) are left at their zero defaults here: filling them requires
+        // a per-session layout query whose transient AttachClient can briefly
+        // resize the session (Phase F G4b). Clients fall back to GetLayout.
         let clients = self.clients.clone();
-        let proto_sessions: Vec<crate::proto::SessionInfo> = sessions
-            .into_iter()
-            .map(|(name, age_secs, resurrectable)| {
-                let connected_clients = clients.count(&name);
-                crate::proto::SessionInfo {
+        let mut proto_sessions: Vec<crate::proto::SessionInfo> = Vec::new();
+
+        for (kind, backend) in self.backends.iter() {
+            let backend = backend.clone();
+            let listed =
+                tokio::task::spawn_blocking(move || backend.list_sessions_with_resurrectables())
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("ListSessions task panicked ({kind:?}): {e}"))
+                    })?;
+
+            let sessions = match listed {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    // Mid-run-unreachable tolerance: skip this backend, keep the
+                    // others. The client still sees every reachable backend's
+                    // sessions instead of a blanket Internal error.
+                    log::warn!("backend {kind:?} unreachable, skipping in ListSessions: {e:#}");
+                    continue;
+                }
+            };
+
+            let proto_kind = proto_backend(kind) as i32;
+            for (name, age_secs, resurrectable) in sessions {
+                let id = make_id(kind, &name);
+                let connected_clients = clients.count(&id);
+                proto_sessions.push(crate::proto::SessionInfo {
                     name,
                     age_secs,
                     resurrectable,
@@ -50,14 +73,14 @@ impl MuxrService {
                     has_bell: false,
                     is_current: false,
                     connected_clients,
-                    backend: 0, // BACKEND_UNSPECIFIED — filled per-session in Phase 3
-                    id: String::new(),
-                }
-            })
-            .collect();
+                    backend: proto_kind,
+                    id,
+                });
+            }
+        }
 
         let count = proto_sessions.len();
-        log::info!("ListSessions: returning {count} session(s)");
+        log::info!("ListSessions: returning {count} session(s) across all backends");
         Ok(Response::new(SessionList {
             sessions: proto_sessions,
         }))
@@ -164,6 +187,41 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "CreateSession")?;
         let req = request.into_inner();
+
+        // ── Phase 3: route the create to the requested backend ────────────────
+        // `req.backend` (proto Backend) selects which multiplexer owns the new
+        // session. Resolution rules:
+        //   - a named backend that is running        → use it
+        //   - a named backend that is NOT running    → InvalidArgument
+        //   - BACKEND_UNSPECIFIED + exactly 1 backend → default to it (ergonomics)
+        //   - BACKEND_UNSPECIFIED + >1 backend       → InvalidArgument (ambiguous)
+        let req_backend = crate::proto::Backend::try_from(req.backend).map_err(|_| {
+            Status::invalid_argument(format!(
+                "CreateSession: unknown backend tag {}",
+                req.backend
+            ))
+        })?;
+        let kind = match kind_from_proto(req_backend) {
+            Some(kind) => kind,
+            None => {
+                // Unspecified: default only when there is a single unambiguous backend.
+                let mut kinds = self.backends.kinds();
+                let sole = kinds.next();
+                if kinds.next().is_some() {
+                    return Err(Status::invalid_argument(
+                        "CreateSession: this server runs multiple backends — specify which \
+                         backend to create the session on",
+                    ));
+                }
+                sole.expect("BackendSet invariant: at least one backend")
+            }
+        };
+        let backend = self.backends.get(kind).cloned().ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "CreateSession: backend '{kind}' is not running on this server"
+            ))
+        })?;
+
         validate_session(&req.name)?;
         let name = req.name;
 
@@ -187,8 +245,7 @@ impl MuxrService {
             validate_layout_name(&req.layout)?;
             Some(req.layout)
         };
-        log::info!("CreateSession: name='{name}' layout={layout:?}");
-        let backend = self.backend().clone();
+        log::info!("CreateSession: backend='{kind}' name='{name}' layout={layout:?}");
         run_action("CreateSession", move || {
             backend.create_session(&name, layout)
         })
