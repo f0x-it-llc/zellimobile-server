@@ -204,9 +204,27 @@ pub trait MuxSender: Send {
     /// the same `hint` it passes, so no return value is needed.
     fn toggle_fullscreen(&mut self, pane: PaneRef, hint: FullscreenHint) -> anyhow::Result<()>;
 
+    /// Answer a layout query **synchronously**, out-of-band of the render stream.
+    ///
+    /// A backend whose layout lives behind a separate control channel (herdr's
+    /// JSON-API socket) returns `Some(snapshot)`; the relay then fulfills the
+    /// `QueryLayout` reply directly and never arms the in-band `Log` path. A
+    /// backend whose layout query is answered **in-band** via the render stream's
+    /// `Log` replies (zellij's `ListTabs`/`ListPanes`) returns `None` (the
+    /// default) — the relay falls through to [`Self::query_layout`].
+    ///
+    /// **Contract for overrides:** this runs on the relay's inbound `select!`
+    /// task, so it MUST be bounded — a short local-socket request/response, never
+    /// an unbounded wait. The zellij default returns `None` immediately and pays
+    /// nothing.
+    fn query_layout_result(&mut self) -> Option<anyhow::Result<LayoutSnapshot>> {
+        None
+    }
+
     /// Fire a layout query over the persistent connection (ListTabs then
     /// ListPanes). The replies arrive as two [`MuxServerMsg::Log`] messages on
     /// the [`MuxReceiver`], which the relay's reader pairs (tabs then panes).
+    /// Only used by backends that return `None` from [`Self::query_layout_result`].
     fn query_layout(&mut self) -> anyhow::Result<()>;
 
     /// Send UTF-8 text input to this client's focused pane.

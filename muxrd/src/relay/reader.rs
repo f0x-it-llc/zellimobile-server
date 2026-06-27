@@ -33,9 +33,10 @@ use super::types::InFlightQuery;
 ///   `RELAY_QUERY_TIMEOUT` fired and dropped the receiver) — so the timed-out
 ///   query's stray Logs are DROPPED, never misattributed to it.
 /// - On a `Log` WITH a held query: the first fills `tabs`, the second fills
-///   `panes`; once both are present it `reply.send(Ok((tabs, panes)))` and
-///   clears the slot. On a `Log` with NO held query: it is dropped (it is a
-///   stale reply from an already-retired query).
+///   `panes`; once both are present it parses them into a `LayoutSnapshot`
+///   (P2.00 A-2) and `reply.send(Ok(snapshot))`, then clears the slot. On a
+///   `Log` with NO held query: it is dropped (it is a stale reply from an
+///   already-retired query).
 /// - Every `Render` is forwarded to `tx` regardless of query state.
 ///
 /// **Invariants** (see also the module-level FX-QUERY notes):
@@ -252,8 +253,11 @@ fn drain_queries(
 
 /// Apply a captured `Log` to the in-flight query (FX-QUERY).
 ///
-/// First Log → tabs, second Log → panes. When both are present, fulfill the
-/// `reply` with `(tabs_json, panes_json)` and clear the slot. A Log with no
+/// First Log → tabs, second Log → panes. When both are present, parse the two
+/// zellij-JSON payloads into a neutral [`LayoutSnapshot`] via the single
+/// `crate::multiplexer::parse_zellij_layout` (P2.00 A-2 — moved here from
+/// `grpc/layout.rs` so the gRPC layer is backend-agnostic), fulfill the `reply`
+/// with the snapshot (or the parse `Err`), and clear the slot. A Log with no
 /// in-flight query is a stale reply from an already-retired query — drop it.
 ///
 /// RESIDUAL RISK (Log-ordering assumption): Logs are NOT tagged with the query
@@ -317,7 +321,10 @@ fn capture_query_log(in_flight: &mut Option<InFlightQuery>, json: String, sessio
             "empty panes JSON from relay query (seq={seq})"
         ))
     } else {
-        Ok((tabs_json, panes_json))
+        // P2.00 A-2: parse here (render thread) into a neutral LayoutSnapshot so
+        // the gRPC layer never touches the zellij JSON wire format. This is THE
+        // single zellij-JSON → snapshot parse, shared with the ephemeral path.
+        crate::multiplexer::parse_zellij_layout(&tabs_json, &panes_json)
     };
     // Receiver may have been dropped between the is_closed() check and now; the
     // send just no-ops in that case.
@@ -384,7 +391,7 @@ impl Drop for ShutdownGuard {
 mod tests {
     use super::*;
 
-    type Rx = tokio::sync::oneshot::Receiver<anyhow::Result<(String, String)>>;
+    type Rx = tokio::sync::oneshot::Receiver<anyhow::Result<crate::multiplexer::LayoutSnapshot>>;
 
     fn mk_query(seq: u64) -> (InFlightQuery, Rx) {
         let (reply, rx) = tokio::sync::oneshot::channel();
@@ -403,14 +410,36 @@ mod tests {
         let (q, mut rx) = mk_query(1);
         let mut in_flight = Some(q);
 
-        capture_query_log(&mut in_flight, "TABS".into(), "s");
+        // P2.00 A-2: the render thread now PARSES the two captured Logs into a
+        // neutral LayoutSnapshot before fulfilling the reply, so the Logs must be
+        // valid ListTabs / ListPanes JSON (empty arrays → an empty snapshot). The
+        // tabs-then-panes capture/pairing state machine is unchanged.
+        capture_query_log(&mut in_flight, "[]".into(), "s");
         assert!(in_flight.is_some(), "after first Log the slot stays armed");
 
-        capture_query_log(&mut in_flight, "PANES".into(), "s");
+        capture_query_log(&mut in_flight, "[]".into(), "s");
         assert!(in_flight.is_none(), "after second Log the slot is cleared");
 
         let got = rx.try_recv().expect("reply sent").expect("ok result");
-        assert_eq!(got, ("TABS".to_string(), "PANES".to_string()));
+        assert!(
+            got.tabs.is_empty(),
+            "two empty-array Logs parse into an empty LayoutSnapshot"
+        );
+    }
+
+    #[test]
+    fn capture_with_invalid_json_fulfills_with_parse_error() {
+        // P2.00 A-2: a non-empty but unparseable panes Log yields an Err on the
+        // reply (the render thread's parse failed); grpc then falls back to the
+        // ephemeral path. (Empty payloads are still short-circuited to Err above.)
+        let (q, mut rx) = mk_query(7);
+        let mut in_flight = Some(q);
+
+        capture_query_log(&mut in_flight, "[]".into(), "s"); // valid tabs
+        capture_query_log(&mut in_flight, "not json".into(), "s"); // invalid panes
+
+        let got = rx.try_recv().expect("reply sent");
+        assert!(got.is_err(), "unparseable JSON yields an error result");
     }
 
     #[test]
@@ -577,10 +606,13 @@ mod tests {
         })
         .unwrap();
 
-        // Two consecutive Logs: first = tabs JSON, second = panes JSON.
+        // Two consecutive Logs: first = tabs JSON, second = panes JSON. P2.00 A-2:
+        // the render thread parses them into a LayoutSnapshot, so they must be
+        // valid ListTabs / ListPanes JSON (empty arrays → empty snapshot). The
+        // tabs-then-panes pairing over the neutral receiver is what this pins.
         let receiver = scripted(vec![
-            MuxServerMsg::Log("TABSJSON".into()),
-            MuxServerMsg::Log("PANESJSON".into()),
+            MuxServerMsg::Log("[]".into()),
+            MuxServerMsg::Log("[]".into()),
         ]);
 
         let _ = render_loop(receiver, tx, Arc::new(AtomicBool::new(false)), "s", qrx);
@@ -589,7 +621,10 @@ mod tests {
             .try_recv()
             .expect("reply fulfilled")
             .expect("ok result");
-        assert_eq!(got, ("TABSJSON".to_string(), "PANESJSON".to_string()));
+        assert!(
+            got.tabs.is_empty(),
+            "paired empty-array Logs parse into an empty LayoutSnapshot"
+        );
     }
 
     /// A `MuxSender` that records the name of each method invoked.

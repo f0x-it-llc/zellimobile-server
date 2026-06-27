@@ -91,7 +91,8 @@
 //!       receiver) → discard the slot so its stray Logs are dropped, not
 //!       misattributed
 //!     - on Log WITH an in-flight query: fill tabs (1st) then panes (2nd); when
-//!       both present, `reply.send(Ok((tabs, panes)))` and clear the slot
+//!       both present, parse into a `LayoutSnapshot` and `reply.send(Ok(snapshot))`,
+//!       then clear the slot (P2.00 A-2 — the parse moved here from `grpc/layout.rs`)
 //!     - on Log with NO in-flight query: discard it (drains a stale Log from a
 //!       previous, already-retired query)
 //!     - every Render is still forwarded unconditionally

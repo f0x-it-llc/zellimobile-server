@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use crate::multiplexer::PaneRef;
+use crate::multiplexer::{LayoutSnapshot, PaneRef};
 use crate::proto::ServerFrame;
 
 // ─── RelayControl ─────────────────────────────────────────────────────────────
@@ -60,15 +60,20 @@ pub enum RelayControl {
     /// Query the current tab+pane layout over this relay's existing persistent
     /// connection (B-QUERY, BE-LAYOUT; FX-QUERY redesign).
     ///
-    /// The inbound arm does NOT await the reply: it hands an
-    /// [`InFlightQuery`] (carrying this `reply`) to the render thread, sends
-    /// `Action::ListTabs` then `Action::ListPanes`, and returns immediately. The
-    /// render thread — the sole owner of `recv()` — captures the two `Log`
-    /// replies (tabs then panes) and fulfills `reply`. The single timeout bound
-    /// is `RELAY_QUERY_TIMEOUT` in `grpc.rs`; on timeout it drops the receiver,
+    /// The inbound arm first tries the synchronous fast-path
+    /// ([`MuxSender::query_layout_result`]); a backend that answers out-of-band
+    /// (herdr) fulfills `reply` directly. For the in-band (zellij) path it does
+    /// NOT await the reply: it hands an [`InFlightQuery`] (carrying this `reply`)
+    /// to the render thread, sends `Action::ListTabs` then `Action::ListPanes`,
+    /// and returns immediately. The render thread — the sole owner of `recv()` —
+    /// captures the two `Log` replies (tabs then panes), parses them into a
+    /// [`LayoutSnapshot`], and fulfills `reply`. The single timeout bound is
+    /// `RELAY_QUERY_TIMEOUT` in `grpc.rs`; on timeout it drops the receiver,
     /// which the render thread observes and uses to retire the query.
+    ///
+    /// [`MuxSender::query_layout_result`]: crate::multiplexer::MuxSender::query_layout_result
     QueryLayout {
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<(String, String)>>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<LayoutSnapshot>>,
     },
 }
 
@@ -155,7 +160,11 @@ pub type ControlRegistry = Arc<dashmap::DashMap<String, ControlEntry>>;
 // ─── Internal types ───────────────────────────────────────────────────────────
 
 /// Reply channel handed to `get_layout` for a single layout query (FX-QUERY).
-pub(crate) type QueryReply = tokio::sync::oneshot::Sender<anyhow::Result<(String, String)>>;
+///
+/// Carries a neutral [`LayoutSnapshot`] (P2.00 A-2): the render thread parses the
+/// two captured `Log` JSON payloads into the snapshot before sending, so the
+/// gRPC layer is backend-agnostic (no `parse_zellij_layout` at the call site).
+pub(crate) type QueryReply = tokio::sync::oneshot::Sender<anyhow::Result<LayoutSnapshot>>;
 
 /// An in-flight layout query, OWNED by the render thread (FX-QUERY).
 ///
@@ -168,9 +177,10 @@ pub(crate) struct InFlightQuery {
     /// Monotonic id; lets the render thread log/assert ordering and lets a newer
     /// query replace an older one deterministically.
     pub(crate) seq: u64,
-    /// Fulfilled with `(tabs_json, panes_json)` once both Logs are captured, or
-    /// dropped (cancelling the receiver) if replaced. `get_layout`'s outer
-    /// timeout drops the *receiver*, which we detect via `reply.is_closed()`.
+    /// Fulfilled with a parsed [`LayoutSnapshot`] once both Logs are captured
+    /// (tabs then panes), or dropped (cancelling the receiver) if replaced.
+    /// `get_layout`'s outer timeout drops the *receiver*, which we detect via
+    /// `reply.is_closed()`.
     pub(crate) reply: QueryReply,
     /// First captured Log → ListTabs JSON. The second Log (panes) is consumed
     /// inline at fulfillment, so it needs no field.

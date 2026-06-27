@@ -12,8 +12,8 @@ use crate::proto::{ClientFrame, client_frame};
 
 use super::reader::ShutdownGuard;
 use super::types::{
-    ControlRegistry, FLOAT_QUERY_TIMEOUT, InFlightQuery, MAX_INPUT_FRAME_BYTES, QueryTx,
-    RelayControl, TOKEN_RECHECK_INTERVAL, ViewStateRegistry,
+    ControlRegistry, FLOAT_QUERY_TIMEOUT, InFlightQuery, MAX_INPUT_FRAME_BYTES, QueryReply,
+    QueryTx, RelayControl, TOKEN_RECHECK_INTERVAL, ViewStateRegistry,
 };
 
 // ─── inbound_loop ─────────────────────────────────────────────────────────────
@@ -246,44 +246,7 @@ pub(crate) async fn inbound_loop(
                 Some(RelayControl::QueryLayout { reply }) => {
                     let seq = next_query_seq;
                     next_query_seq = next_query_seq.wrapping_add(1);
-                    log::debug!("relay inbound [{session}]: QueryLayout seq={seq} requested");
-
-                    // Hand the query to the render thread BEFORE sending the
-                    // actions, so the first Log can't arrive before the render
-                    // thread has the slot armed. (Even if it momentarily does,
-                    // the post-recv drain in render_loop picks it up; arming
-                    // first is the simpler ordering.)
-                    let in_flight = InFlightQuery { seq, reply, tabs: None };
-                    if let Err(returned) = query_tx.send(in_flight) {
-                        // Render thread is gone; reply via the sender we get back
-                        // so grpc falls back to the ephemeral path.
-                        log::warn!(
-                            "relay inbound [{session}]: QueryLayout seq={seq}: render thread \
-                             gone (query_tx send failed)"
-                        );
-                        let _ = returned
-                            .0
-                            .reply
-                            .send(Err(anyhow::anyhow!("render thread not available")));
-                        continue;
-                    }
-
-                    // Fire the layout query (ListTabs THEN ListPanes) over the
-                    // neutral sender. The InFlightQuery is already owned by the
-                    // render thread; if a send fails to produce a Log, its reply
-                    // cancels via RELAY_QUERY_TIMEOUT / close detection. We just
-                    // log — we can't reach `reply` from here anymore.
-                    if let Err(e) = sender.query_layout() {
-                        log::warn!(
-                            "relay inbound [{session}]: QueryLayout seq={seq}: query_layout send \
-                             failed (render thread will retire the query): {e:#}"
-                        );
-                        continue;
-                    }
-                    log::trace!(
-                        "relay inbound [{session}]: QueryLayout seq={seq} dispatched \
-                         (render thread will fulfill)"
-                    );
+                    handle_query_layout(&mut *sender, &query_tx, reply, seq, &session);
                 }
 
                 None => {
@@ -413,5 +376,220 @@ fn forward_input(sender: &mut dyn MuxSender, bytes: Vec<u8>) -> anyhow::Result<(
     match String::from_utf8(bytes) {
         Ok(text) => sender.send_input_chars(&text),
         Err(e) => sender.send_input_bytes(e.into_bytes()),
+    }
+}
+
+// ─── Layout-query dispatch (P2.00 A-1) ─────────────────────────────────────────
+
+/// Dispatch a relay-routed `QueryLayout`. **Never awaits** — runs inline on the
+/// inbound `select!` arm and returns immediately, so it can never wedge input
+/// forwarding or the bearer recheck.
+///
+/// Two paths, chosen by the backend (A-1):
+///
+/// 1. **Synchronous fast-path** — [`MuxSender::query_layout_result`] returns
+///    `Some(res)`. A backend that answers layout out-of-band of the render stream
+///    (herdr's JSON-API socket) fulfills `reply` directly; we do NOT arm an
+///    in-flight query nor fire any wire actions. The trait contract requires this
+///    call to be bounded (a short local-socket round-trip), so calling it inline
+///    here cannot hang the loop. The zellij backend returns `None` (the default),
+///    so this branch is dormant for it.
+///
+/// 2. **In-band path** (`None`) — the existing zellij flow, byte-identical: hand
+///    an [`InFlightQuery`] to the render thread BEFORE firing the actions (so the
+///    first `Log` can't arrive before the slot is armed), then fire ListTabs THEN
+///    ListPanes over the neutral sender and return. The render thread (sole owner
+///    of `recv()`) pairs the two `Log` replies and fulfills `reply`; the single
+///    timeout bound stays `RELAY_QUERY_TIMEOUT` in `grpc.rs`.
+fn handle_query_layout(
+    sender: &mut dyn MuxSender,
+    query_tx: &QueryTx,
+    reply: QueryReply,
+    seq: u64,
+    session: &str,
+) {
+    // A-1: synchronous fast-path. `query_layout_result` is bounded by contract;
+    // `Some(_)` means the backend already has the snapshot in hand.
+    if let Some(res) = sender.query_layout_result() {
+        log::debug!(
+            "relay inbound [{session}]: QueryLayout seq={seq} answered synchronously \
+             (out-of-band) — not arming in-flight query"
+        );
+        let _ = reply.send(res);
+        return;
+    }
+
+    log::debug!("relay inbound [{session}]: QueryLayout seq={seq} requested (in-band path)");
+
+    // In-band (zellij) path — unchanged. Hand the query to the render thread
+    // BEFORE sending the actions, so the first Log can't arrive before the render
+    // thread has the slot armed. (Even if it momentarily does, the post-recv
+    // drain in render_loop picks it up; arming first is the simpler ordering.)
+    let in_flight = InFlightQuery {
+        seq,
+        reply,
+        tabs: None,
+    };
+    if let Err(returned) = query_tx.send(in_flight) {
+        // Render thread is gone; reply via the sender we get back so grpc falls
+        // back to the ephemeral path.
+        log::warn!(
+            "relay inbound [{session}]: QueryLayout seq={seq}: render thread \
+             gone (query_tx send failed)"
+        );
+        let _ = returned
+            .0
+            .reply
+            .send(Err(anyhow::anyhow!("render thread not available")));
+        return;
+    }
+
+    // Fire the layout query (ListTabs THEN ListPanes) over the neutral sender.
+    // The InFlightQuery is already owned by the render thread; if a send fails to
+    // produce a Log, its reply cancels via RELAY_QUERY_TIMEOUT / close detection.
+    // We just log — we can't reach `reply` from here anymore.
+    if let Err(e) = sender.query_layout() {
+        log::warn!(
+            "relay inbound [{session}]: QueryLayout seq={seq}: query_layout send \
+             failed (render thread will retire the query): {e:#}"
+        );
+        return;
+    }
+    log::trace!(
+        "relay inbound [{session}]: QueryLayout seq={seq} dispatched \
+         (render thread will fulfill)"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multiplexer::{FullscreenHint, LayoutSnapshot, PaneRef, TabSnapshot};
+    use std::sync::{Arc, Mutex};
+
+    /// A configurable [`MuxSender`] fake for the `QueryLayout` dispatch tests.
+    ///
+    /// `sync` (taken once) is what `query_layout_result` returns; `wire_fired`
+    /// records whether the in-band `query_layout()` wire action was sent.
+    struct FakeSender {
+        sync: Option<anyhow::Result<LayoutSnapshot>>,
+        wire_fired: Arc<Mutex<bool>>,
+    }
+
+    impl MuxSender for FakeSender {
+        fn query_layout_result(&mut self) -> Option<anyhow::Result<LayoutSnapshot>> {
+            self.sync.take()
+        }
+        fn query_layout(&mut self) -> anyhow::Result<()> {
+            *self.wire_fired.lock().unwrap() = true;
+            Ok(())
+        }
+        fn go_to_tab(&mut self, _tab_id: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn focus_pane(&mut self, _pane: PaneRef) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn toggle_fullscreen(&mut self, _p: PaneRef, _h: FullscreenHint) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_input_chars(&mut self, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_input_bytes(&mut self, _bytes: Vec<u8>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_resize(&mut self, _rows: u16, _cols: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_client_exited(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn box_clone(&self) -> Box<dyn MuxSender> {
+            unreachable!("not used in these tests")
+        }
+    }
+
+    fn a_snapshot() -> LayoutSnapshot {
+        LayoutSnapshot {
+            tabs: vec![TabSnapshot {
+                tab_id: 1,
+                position: 0,
+                name: "main".into(),
+                active: true,
+                has_bell: false,
+                panes_to_hide: 0,
+                fullscreen_active: false,
+                floating_panes_visible: false,
+                panes: vec![],
+            }],
+        }
+    }
+
+    /// A-1 fast-path: `Some(snapshot)` from `query_layout_result` fulfills the
+    /// reply directly — NO in-flight query is armed and NO wire action is fired.
+    #[test]
+    fn query_layout_result_some_fulfills_without_wire_actions() {
+        let wire_fired = Arc::new(Mutex::new(false));
+        let mut sender = FakeSender {
+            sync: Some(Ok(a_snapshot())),
+            wire_fired: wire_fired.clone(),
+        };
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        let (query_tx, query_rx) = std::sync::mpsc::channel::<InFlightQuery>();
+
+        handle_query_layout(&mut sender, &query_tx, reply_tx, 0, "s");
+
+        // Reply fulfilled directly with the snapshot.
+        let snap = reply_rx
+            .try_recv()
+            .expect("reply sent synchronously")
+            .expect("ok snapshot");
+        assert_eq!(snap.tabs.len(), 1);
+        // No wire action fired and no in-flight query armed.
+        assert!(
+            !*wire_fired.lock().unwrap(),
+            "fast-path must not fire the in-band query_layout() wire action"
+        );
+        assert!(
+            query_rx.try_recv().is_err(),
+            "fast-path must not hand an InFlightQuery to the render thread"
+        );
+    }
+
+    /// In-band (zellij) path: `None` arms an in-flight query AND fires the wire
+    /// action; the reply stays pending (the render thread fulfills it later).
+    #[test]
+    fn query_layout_result_none_arms_in_flight_and_fires_wire() {
+        let wire_fired = Arc::new(Mutex::new(false));
+        let mut sender = FakeSender {
+            sync: None,
+            wire_fired: wire_fired.clone(),
+        };
+        let (reply_tx, mut reply_rx) =
+            tokio::sync::oneshot::channel::<anyhow::Result<LayoutSnapshot>>();
+        let (query_tx, query_rx) = std::sync::mpsc::channel::<InFlightQuery>();
+
+        handle_query_layout(&mut sender, &query_tx, reply_tx, 42, "s");
+
+        // An InFlightQuery was handed to the render thread, carrying our seq.
+        let q = query_rx.try_recv().expect("InFlightQuery armed");
+        assert_eq!(q.seq, 42);
+        assert!(q.tabs.is_none(), "fresh in-flight query has no tabs yet");
+        // The wire action was fired.
+        assert!(
+            *wire_fired.lock().unwrap(),
+            "in-band path must fire the query_layout() wire action"
+        );
+        // The reply is owned by the render thread now (moved into InFlightQuery),
+        // so the inbound side never fulfilled it directly.
+        assert!(
+            matches!(
+                reply_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "reply stays pending — the render thread fulfills it from the Log pair"
+        );
+        drop(q); // keeps the moved reply alive until here
     }
 }

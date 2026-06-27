@@ -40,12 +40,12 @@ impl MuxrService {
         //      scoped fallback; preserves solo-client and legacy-client behavior).
         //   3. No relay → ephemeral backend.query_layout() path.
         //
-        // Both paths now produce a neutral `LayoutSnapshot` via the SAME parse
-        // ([`crate::multiplexer::parse_zellij_layout`], the single zellij-JSON →
-        // snapshot conversion). The relay branch feeds it the two JSON strings it
-        // captured from the relay reader thread (via the QueryLayout oneshot); the
-        // ephemeral branch delegates to `self.backend.query_layout()`, which calls
-        // the same parse internally (P1.03 retired the duplicate `parse_relay_json`).
+        // Both paths now hand back a neutral `LayoutSnapshot` directly (P2.00 A-2):
+        // the relay branch receives the snapshot over the QueryLayout oneshot — the
+        // render thread already parsed the two captured JSON Logs into it via the
+        // single backend-owned parse — and the ephemeral branch delegates to
+        // `self.backend.query_layout()`, which parses internally. The gRPC layer is
+        // backend-agnostic: it never touches the zellij JSON wire format.
         let (snapshot, via_relay, relay_conn_id) = {
             // Try per-connection lookup first, then session-scoped fallback.
             let relay_entry: Option<(
@@ -77,7 +77,7 @@ impl MuxrService {
 
             if let Some(sender) = relay_sender {
                 let (reply_tx, reply_rx) =
-                    tokio::sync::oneshot::channel::<anyhow::Result<(String, String)>>();
+                    tokio::sync::oneshot::channel::<anyhow::Result<LayoutSnapshot>>();
                 let queued =
                     sender.send(crate::relay::RelayControl::QueryLayout { reply: reply_tx });
                 // `sender` is an owned clone of the UnboundedSender; the DashMap
@@ -86,32 +86,26 @@ impl MuxrService {
 
                 if queued.is_ok() {
                     match tokio::time::timeout(RELAY_QUERY_TIMEOUT, reply_rx).await {
-                        Ok(Ok(Ok((t, p)))) => {
+                        Ok(Ok(Ok(snap))) => {
+                            // P2.00 A-2: the render thread already parsed the two
+                            // captured JSON Logs into this neutral LayoutSnapshot;
+                            // the gRPC layer never sees the zellij JSON wire format.
                             log::debug!(
                                 "GetLayout: session='{session}' connection_id='{matched_conn_id}' \
-                                 query routed via relay (tabs={}B panes={}B)",
-                                t.len(),
-                                p.len()
+                                 query routed via relay ({} tab(s))",
+                                snap.tabs.len()
                             );
-                            let snap =
-                                crate::multiplexer::parse_zellij_layout(&t, &p).map_err(|e| {
-                                    // Keep the serde detail + payload sizes in the
-                                    // server log only; return a generic Status so
-                                    // neither the internal error nor the
-                                    // (cwd/command-bearing) layout JSON leaks.
-                                    log::warn!(
-                                        "GetLayout: failed to parse relay layout JSON \
-                                         (tabs={}B panes={}B): {e:#}",
-                                        t.len(),
-                                        p.len()
-                                    );
-                                    Status::internal("failed to parse layout response from session")
-                                })?;
                             (snap, true, matched_conn_id)
                         }
                         Ok(Ok(Err(e))) => {
+                            // Relay query OR render-thread parse failed (P2.00 A-2
+                            // moved the parse into the render thread). Either way
+                            // fall back to the ephemeral path, which re-queries and
+                            // may succeed. The error detail stays in the server log;
+                            // it never leaks to the client (and carries no layout
+                            // JSON, only a serde/empty-payload message).
                             log::warn!(
-                                "GetLayout: relay query failed for '{session}', \
+                                "GetLayout: relay query/parse failed for '{session}', \
                                  falling back to ephemeral: {e:#}"
                             );
                             let snap = backend_query_layout(&self.backend, &session).await?;
