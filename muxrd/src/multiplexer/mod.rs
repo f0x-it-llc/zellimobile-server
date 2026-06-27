@@ -32,6 +32,7 @@
 //! yet. P1.02 reroutes the ephemeral handlers; P1.03 drives the relay off
 //! [`MuxBackend::open_attach`].
 
+pub(crate) mod herdr;
 pub mod types;
 mod zellij;
 

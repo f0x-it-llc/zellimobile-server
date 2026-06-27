@@ -94,6 +94,10 @@ daemonize = "0.5"
 # Same crate zellij-utils uses for session sockets; pinned to match.
 interprocess = "2.3"
 
+# Binary framing for herdr wire protocol (v14, length-prefix + bincode standard).
+# bincode 2 API is bincode::serde::encode_to_vec / decode_from_slice.
+bincode = { version = "2", features = ["serde"] }
+
 # Utility
 anyhow = "1"
 log = "0.4"
