@@ -14,6 +14,14 @@ use super::helpers::{
     kind_from_proto, proto_backend, reject_if_read_only, run_action, validate_layout_name,
 };
 
+/// Per-backend ceiling for the concurrent ListSessions fan-out (S-M3).
+///
+/// Must be strictly above herdr's control-socket `READ_TIMEOUT` (3 s) so a
+/// well-behaved-but-slow backend can still complete within the budget, while
+/// bounding a truly hung one. Value mirrors `VERSION_CHECK_TIMEOUT` /
+/// `RECV_TIMEOUT` in the codebase (5 s = conservative local-IPC budget).
+const LIST_SESSIONS_BACKEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl MuxrService {
     // ── ListSessions (C1) ───────────────────────────────────────────────────
 
@@ -38,27 +46,69 @@ impl MuxrService {
         // is_current) are left at their zero defaults here: filling them requires
         // a per-session layout query whose transient AttachClient can briefly
         // resize the session (Phase F G4b). Clients fall back to GetLayout.
+        //
+        // S-M2: concurrent fan-out — all backend tasks are spawned up-front and
+        // joined together via `futures::future::join_all` so latency =
+        // max(per-backend) not Σ.
+        // S-M3: each backend query is wrapped in `tokio::time::timeout` so a hung
+        // (non-erroring) backend (e.g. herdr 3 s control-socket READ_TIMEOUT)
+        // can't stall the whole RPC; on timeout → warn + skip (partial results).
+        // S-M4: a JoinError (task panic or cancellation) degrades to warn + skip,
+        // same as a normal `Err`, rather than propagating via `?` and failing the
+        // entire ListSessions RPC.
         let clients = self.clients.clone();
+
+        // Build concurrent futures — one per backend, timeout-wrapped. The
+        // `spawn_blocking` keeps the blocking IPC call off the async executor
+        // (CODE_STANDARDS: never `.await` blocking IPC directly).
+        let backend_futures: Vec<_> = self
+            .backends
+            .iter()
+            .map(|(kind, backend)| {
+                let backend = backend.clone();
+                async move {
+                    let result = tokio::time::timeout(
+                        LIST_SESSIONS_BACKEND_TIMEOUT,
+                        tokio::task::spawn_blocking(move || {
+                            backend.list_sessions_with_resurrectables()
+                        }),
+                    )
+                    .await;
+                    (kind, result)
+                }
+            })
+            .collect();
+
+        // Await all backends concurrently; latency = max(per-backend).
+        let backend_results = futures::future::join_all(backend_futures).await;
+
+        // Merge sessions from all backends that succeeded within the timeout.
         let mut proto_sessions: Vec<crate::proto::SessionInfo> = Vec::new();
-
-        for (kind, backend) in self.backends.iter() {
-            let backend = backend.clone();
-            let listed =
-                tokio::task::spawn_blocking(move || backend.list_sessions_with_resurrectables())
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("ListSessions task panicked ({kind:?}): {e}"))
-                    })?;
-
-            let sessions = match listed {
-                Ok(sessions) => sessions,
-                Err(e) => {
-                    // Mid-run-unreachable tolerance: skip this backend, keep the
-                    // others. The client still sees every reachable backend's
-                    // sessions instead of a blanket Internal error.
+        for (kind, result) in backend_results {
+            let sessions = match result {
+                // S-M3: timeout — warn + skip, return whatever other backends had.
+                Err(_elapsed) => {
+                    log::warn!(
+                        "backend {kind:?} timed out after {:?} in ListSessions, skipping",
+                        LIST_SESSIONS_BACKEND_TIMEOUT
+                    );
+                    continue;
+                }
+                // S-M4: spawn_blocking task panicked or was cancelled — warn + skip.
+                Ok(Err(join_err)) => {
+                    log::warn!(
+                        "backend {kind:?} task panicked in ListSessions: {join_err}, skipping"
+                    );
+                    continue;
+                }
+                // Mid-run-unreachable tolerance: skip this backend, keep the
+                // others. The client still sees every reachable backend's sessions.
+                Ok(Ok(Err(e))) => {
                     log::warn!("backend {kind:?} unreachable, skipping in ListSessions: {e:#}");
                     continue;
                 }
+                // Happy path: backend returned a session list.
+                Ok(Ok(Ok(sessions))) => sessions,
             };
 
             let proto_kind = proto_backend(kind) as i32;
@@ -254,5 +304,423 @@ impl MuxrService {
             backend.create_session(&name, layout)
         })
         .await
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the concurrent ListSessions fan-out + resilience paths (S-M2/S-M3/S-M4).
+    //!
+    //! Uses fake `MuxBackend` implementations to exercise:
+    //!   - An erroring backend → skipped, other backend's sessions returned (Err path).
+    //!   - A panicking backend → skipped via JoinError (panic/cancel path, S-M4).
+    //!   - Two healthy backends → sessions from both merged.
+    //!   - All backends erroring → empty list (no RPC error).
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tonic::Request;
+
+    use crate::cli::BackendKind;
+    use crate::grpc::MuxrService;
+    use crate::multiplexer::{
+        ActionAck, BackendSet, DualHandle, LayoutSnapshot, MuxBackend, PaneRef, ResizeDir,
+        ResizeKind, ScrollDir,
+    };
+    use crate::proto::Empty;
+
+    // ── Fake MuxBackend implementations ──────────────────────────────────────
+
+    /// Returns a fixed session list from `list_sessions_with_resurrectables`.
+    #[derive(Debug)]
+    struct StubBackend {
+        sessions: Vec<(String, u64, bool)>,
+    }
+
+    impl MuxBackend for StubBackend {
+        fn list_sessions(&self) -> anyhow::Result<Vec<(String, Duration)>> {
+            Ok(self
+                .sessions
+                .iter()
+                .map(|(n, a, _)| (n.clone(), Duration::from_secs(*a)))
+                .collect())
+        }
+
+        fn list_sessions_with_resurrectables(&self) -> anyhow::Result<Vec<(String, u64, bool)>> {
+            Ok(self.sessions.clone())
+        }
+
+        fn validate_session_name(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn create_session(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn kill_session(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn rename_session(&self, _: &str, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn write_to_pane(&self, _: &str, _: PaneRef, _: Vec<u8>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn focus_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_pane(&self, _: &str, _: bool, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_pane(&self, _: &str, _: PaneRef, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn resize_pane(
+            &self,
+            _: &str,
+            _: PaneRef,
+            _: ResizeKind,
+            _: Option<ResizeDir>,
+        ) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_floating(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_fullscreen(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn scroll_pane(&self, _: &str, _: PaneRef, _: ScrollDir) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_tab(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn go_to_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_tab(&self, _: &str, _: u64, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn query_layout(&self, _: &str) -> anyhow::Result<LayoutSnapshot> {
+            unimplemented!()
+        }
+        fn query_session_size(&self, _: &str) -> anyhow::Result<(u16, u16)> {
+            unimplemented!()
+        }
+        fn pane_is_floating_with_visibility(
+            &self,
+            _: &str,
+            _: PaneRef,
+        ) -> anyhow::Result<(bool, bool, Option<PaneRef>)> {
+            unimplemented!()
+        }
+        fn open_attach(&self, _: &str, _: u16, _: u16, _: bool) -> anyhow::Result<DualHandle> {
+            unimplemented!()
+        }
+        fn backend_version(&self) -> String {
+            "stub".to_string()
+        }
+    }
+
+    /// Always errors from `list_sessions_with_resurrectables` (simulates an
+    /// unreachable backend — e.g. herdr socket not present).
+    #[derive(Debug)]
+    struct ErrorBackend;
+
+    impl MuxBackend for ErrorBackend {
+        fn list_sessions(&self) -> anyhow::Result<Vec<(String, Duration)>> {
+            anyhow::bail!("connection refused")
+        }
+        fn list_sessions_with_resurrectables(&self) -> anyhow::Result<Vec<(String, u64, bool)>> {
+            anyhow::bail!("connection refused")
+        }
+        fn validate_session_name(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn create_session(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn kill_session(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn rename_session(&self, _: &str, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn write_to_pane(&self, _: &str, _: PaneRef, _: Vec<u8>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn focus_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_pane(&self, _: &str, _: bool, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_pane(&self, _: &str, _: PaneRef, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn resize_pane(
+            &self,
+            _: &str,
+            _: PaneRef,
+            _: ResizeKind,
+            _: Option<ResizeDir>,
+        ) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_floating(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_fullscreen(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn scroll_pane(&self, _: &str, _: PaneRef, _: ScrollDir) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_tab(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn go_to_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_tab(&self, _: &str, _: u64, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn query_layout(&self, _: &str) -> anyhow::Result<LayoutSnapshot> {
+            unimplemented!()
+        }
+        fn query_session_size(&self, _: &str) -> anyhow::Result<(u16, u16)> {
+            unimplemented!()
+        }
+        fn pane_is_floating_with_visibility(
+            &self,
+            _: &str,
+            _: PaneRef,
+        ) -> anyhow::Result<(bool, bool, Option<PaneRef>)> {
+            unimplemented!()
+        }
+        fn open_attach(&self, _: &str, _: u16, _: u16, _: bool) -> anyhow::Result<DualHandle> {
+            unimplemented!()
+        }
+        fn backend_version(&self) -> String {
+            "error".to_string()
+        }
+    }
+
+    /// Panics inside `list_sessions_with_resurrectables` to exercise S-M4
+    /// (JoinError tolerance — a panic inside `spawn_blocking` surfaces as a
+    /// JoinError rather than an anyhow Err).
+    #[derive(Debug)]
+    struct PanickingBackend;
+
+    impl MuxBackend for PanickingBackend {
+        fn list_sessions(&self) -> anyhow::Result<Vec<(String, Duration)>> {
+            panic!("simulated backend panic")
+        }
+        fn list_sessions_with_resurrectables(&self) -> anyhow::Result<Vec<(String, u64, bool)>> {
+            panic!("simulated backend panic")
+        }
+        fn validate_session_name(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn create_session(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn kill_session(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn rename_session(&self, _: &str, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn write_to_pane(&self, _: &str, _: PaneRef, _: Vec<u8>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn focus_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_pane(&self, _: &str, _: bool, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_pane(&self, _: &str, _: PaneRef, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn resize_pane(
+            &self,
+            _: &str,
+            _: PaneRef,
+            _: ResizeKind,
+            _: Option<ResizeDir>,
+        ) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_floating(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_fullscreen(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn scroll_pane(&self, _: &str, _: PaneRef, _: ScrollDir) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_tab(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn go_to_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_tab(&self, _: &str, _: u64, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn query_layout(&self, _: &str) -> anyhow::Result<LayoutSnapshot> {
+            unimplemented!()
+        }
+        fn query_session_size(&self, _: &str) -> anyhow::Result<(u16, u16)> {
+            unimplemented!()
+        }
+        fn pane_is_floating_with_visibility(
+            &self,
+            _: &str,
+            _: PaneRef,
+        ) -> anyhow::Result<(bool, bool, Option<PaneRef>)> {
+            unimplemented!()
+        }
+        fn open_attach(&self, _: &str, _: u16, _: u16, _: bool) -> anyhow::Result<DualHandle> {
+            unimplemented!()
+        }
+        fn backend_version(&self) -> String {
+            "panic".to_string()
+        }
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// S-M4 (Err path): an erroring backend is skipped; the reachable backend's
+    /// sessions are returned. The RPC must not fail.
+    #[tokio::test]
+    async fn list_sessions_skips_erroring_backend_returns_other() {
+        let error_backend: Arc<dyn MuxBackend> = Arc::new(ErrorBackend);
+        let stub_backend: Arc<dyn MuxBackend> = Arc::new(StubBackend {
+            sessions: vec![("my-session".to_string(), 100, false)],
+        });
+        let backends = BackendSet::new(vec![
+            (BackendKind::Zellij, error_backend),
+            (BackendKind::Herdr, stub_backend),
+        ]);
+        let service = MuxrService::with_backends(backends);
+
+        let sessions = service
+            .list_sessions_impl(Request::new(Empty {}))
+            .await
+            .expect("RPC must not error when one backend is reachable")
+            .into_inner()
+            .sessions;
+
+        assert_eq!(sessions.len(), 1, "only the reachable backend's session");
+        assert_eq!(sessions[0].name, "my-session");
+        assert_eq!(sessions[0].id, "herdr:my-session");
+    }
+
+    /// S-M4 (JoinError path): a panicking backend's `spawn_blocking` task yields
+    /// a JoinError; the healthy backend's sessions must still be returned and the
+    /// RPC must not propagate the panic as an error.
+    #[tokio::test]
+    async fn list_sessions_tolerates_panicking_backend() {
+        let panicking: Arc<dyn MuxBackend> = Arc::new(PanickingBackend);
+        let stub: Arc<dyn MuxBackend> = Arc::new(StubBackend {
+            sessions: vec![("live-session".to_string(), 0, false)],
+        });
+        let backends = BackendSet::new(vec![
+            (BackendKind::Zellij, panicking),
+            (BackendKind::Herdr, stub),
+        ]);
+        let service = MuxrService::with_backends(backends);
+
+        let sessions = service
+            .list_sessions_impl(Request::new(Empty {}))
+            .await
+            .expect("RPC must not propagate a backend panic as an error")
+            .into_inner()
+            .sessions;
+
+        assert_eq!(
+            sessions.len(),
+            1,
+            "non-panicking backend's session survives"
+        );
+        assert_eq!(sessions[0].name, "live-session");
+    }
+
+    /// S-M2 (concurrent fan-out, happy path): both backends succeed; sessions from
+    /// both are merged. The opaque `id` fields carry the correct backend prefix.
+    #[tokio::test]
+    async fn list_sessions_both_backends_ok_returns_all() {
+        let zellij_backend: Arc<dyn MuxBackend> = Arc::new(StubBackend {
+            sessions: vec![("zellij-session".to_string(), 0, false)],
+        });
+        let herdr_backend: Arc<dyn MuxBackend> = Arc::new(StubBackend {
+            sessions: vec![("herdr-session".to_string(), 0, false)],
+        });
+        let backends = BackendSet::new(vec![
+            (BackendKind::Zellij, zellij_backend),
+            (BackendKind::Herdr, herdr_backend),
+        ]);
+        let service = MuxrService::with_backends(backends);
+
+        let sessions = service
+            .list_sessions_impl(Request::new(Empty {}))
+            .await
+            .expect("RPC must succeed when both backends are reachable")
+            .into_inner()
+            .sessions;
+
+        assert_eq!(sessions.len(), 2, "sessions from both backends merged");
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"zellij:zellij-session"));
+        assert!(ids.contains(&"herdr:herdr-session"));
+    }
+
+    /// All backends error → RPC still succeeds with an empty list (not an error).
+    #[tokio::test]
+    async fn list_sessions_all_erroring_returns_empty() {
+        let backends = BackendSet::new(vec![
+            (
+                BackendKind::Zellij,
+                Arc::new(ErrorBackend) as Arc<dyn MuxBackend>,
+            ),
+            (
+                BackendKind::Herdr,
+                Arc::new(ErrorBackend) as Arc<dyn MuxBackend>,
+            ),
+        ]);
+        let service = MuxrService::with_backends(backends);
+
+        let sessions = service
+            .list_sessions_impl(Request::new(Empty {}))
+            .await
+            .expect("RPC must not error even when all backends fail")
+            .into_inner()
+            .sessions;
+
+        assert!(sessions.is_empty(), "no reachable backends → empty list");
     }
 }
