@@ -15,6 +15,10 @@
 //! - [`api`] — line-delimited JSON control socket.  Used for workspace/tab/pane
 //!   lifecycle:  [`api::ApiRequest`] lines in, [`api::ApiRawResponse`] lines out.
 //!
+//! - [`paths`] — resolves herdr's two socket paths (JSON-API + derived wire).
+//! - [`registry`] — stable `u32`/`u64` ↔ herdr `String` id maps.
+//! - [`control`] — the JSON-API control client + neutral layout transcode (P2.02).
+//!
 //! # AGPL discipline
 //!
 //! The struct definitions in `wire.rs` and `api.rs` are **independently authored**
@@ -26,4 +30,7 @@
 //! discriminant tags, serde tagging); no code was copied or adapted.
 
 pub mod api;
+pub mod control;
+pub mod paths;
+pub mod registry;
 pub mod wire;
