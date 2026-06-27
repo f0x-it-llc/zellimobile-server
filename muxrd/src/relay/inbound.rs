@@ -381,26 +381,32 @@ fn forward_input(sender: &mut dyn MuxSender, bytes: Vec<u8>) -> anyhow::Result<(
 
 // ─── Layout-query dispatch (P2.00 A-1) ─────────────────────────────────────────
 
-/// Dispatch a relay-routed `QueryLayout`. **Never awaits** — runs inline on the
-/// inbound `select!` arm and returns immediately, so it can never wedge input
-/// forwarding or the bearer recheck.
+/// Dispatch a relay-routed `QueryLayout`. **Never awaits and never blocks the
+/// inbound task** — runs inline on the inbound `select!` arm and returns
+/// immediately, so it can never wedge input forwarding or the bearer recheck.
 ///
-/// Two paths, chosen by the backend (A-1):
+/// Two paths, chosen by the backend's [`MuxSender::has_sync_layout`] predicate
+/// (B1 — the predicate is cheap and side-effect-free; we can't "peek" by calling
+/// `query_layout_result`, since that call performs the blocking query):
 ///
-/// 1. **Synchronous fast-path** — [`MuxSender::query_layout_result`] returns
-///    `Some(res)`. A backend that answers layout out-of-band of the render stream
-///    (herdr's JSON-API socket) fulfills `reply` directly; we do NOT arm an
-///    in-flight query nor fire any wire actions. The trait contract requires this
-///    call to be bounded (a short local-socket round-trip), so calling it inline
-///    here cannot hang the loop. The zellij backend returns `None` (the default),
-///    so this branch is dormant for it.
+/// 1. **Out-of-band fast-path** (`has_sync_layout() == true`, herdr) — the backend
+///    answers layout over a separate control socket via
+///    [`MuxSender::query_layout_result`]. That is blocking local-socket I/O
+///    (`2 + N_tabs` round-trips), so we do NOT run it inline: we `box_clone` the
+///    sender and run `query_layout_result` on the **blocking pool**
+///    (`spawn_blocking`), fulfilling `reply` from there. We do NOT arm an in-flight
+///    query nor fire any wire actions, and the arm returns immediately — the
+///    inbound select loop never stalls on the query. The existing
+///    `RELAY_QUERY_TIMEOUT` in `grpc.rs` bounds the `reply` wait (herdr completes
+///    in ms, so it is never hit).
 ///
-/// 2. **In-band path** (`None`) — the existing zellij flow, byte-identical: hand
-///    an [`InFlightQuery`] to the render thread BEFORE firing the actions (so the
-///    first `Log` can't arrive before the slot is armed), then fire ListTabs THEN
-///    ListPanes over the neutral sender and return. The render thread (sole owner
-///    of `recv()`) pairs the two `Log` replies and fulfills `reply`; the single
-///    timeout bound stays `RELAY_QUERY_TIMEOUT` in `grpc.rs`.
+/// 2. **In-band path** (`has_sync_layout() == false`, zellij — the default) — the
+///    existing zellij flow, byte-identical: hand an [`InFlightQuery`] to the render
+///    thread BEFORE firing the actions (so the first `Log` can't arrive before the
+///    slot is armed), then fire ListTabs THEN ListPanes over the neutral sender and
+///    return. The render thread (sole owner of `recv()`) pairs the two `Log`
+///    replies and fulfills `reply`; the single timeout bound stays
+///    `RELAY_QUERY_TIMEOUT` in `grpc.rs`.
 fn handle_query_layout(
     sender: &mut dyn MuxSender,
     query_tx: &QueryTx,
@@ -408,14 +414,29 @@ fn handle_query_layout(
     seq: u64,
     session: &str,
 ) {
-    // A-1: synchronous fast-path. `query_layout_result` is bounded by contract;
-    // `Some(_)` means the backend already has the snapshot in hand.
-    if let Some(res) = sender.query_layout_result() {
+    // B1: out-of-band fast-path. A sync-layout backend (herdr) answers layout via
+    // blocking local-socket I/O — keep it OFF the inbound task by running it on the
+    // blocking pool. We branch on the cheap predicate (not on the query result)
+    // because `query_layout_result` *does* the blocking work.
+    if sender.has_sync_layout() {
         log::debug!(
-            "relay inbound [{session}]: QueryLayout seq={seq} answered synchronously \
-             (out-of-band) — not arming in-flight query"
+            "relay inbound [{session}]: QueryLayout seq={seq} → sync-layout backend; \
+             dispatching query_layout_result on the blocking pool (no in-flight arm)"
         );
-        let _ = reply.send(res);
+        // `box_clone` only needs `&self`; the clone is `Send + 'static`, so it (and
+        // the `reply` oneshot) move into the spawn_blocking closure. The query only
+        // touches the cloned control Arc; for herdr the dup'd wire fd is unused.
+        let mut q = sender.box_clone();
+        tokio::task::spawn_blocking(move || {
+            let res = q.query_layout_result().unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "query_layout_result returned None for a sync-layout backend"
+                ))
+            });
+            // Receiver may already be gone (grpc RELAY_QUERY_TIMEOUT dropped it) —
+            // a closed-channel send is a harmless no-op.
+            let _ = reply.send(res);
+        });
         return;
     }
 
@@ -469,16 +490,24 @@ mod tests {
 
     /// A configurable [`MuxSender`] fake for the `QueryLayout` dispatch tests.
     ///
-    /// `sync` (taken once) is what `query_layout_result` returns; `wire_fired`
-    /// records whether the in-band `query_layout()` wire action was sent.
+    /// `has_sync` is the backend predicate the dispatch branches on; `sync` (taken
+    /// once, shared across `box_clone`s) is what `query_layout_result` returns;
+    /// `wire_fired` records whether the in-band `query_layout()` wire action was
+    /// sent; `cloned` records whether `box_clone` was called (the sync path clones
+    /// the sender to move it onto the blocking pool).
     struct FakeSender {
-        sync: Option<anyhow::Result<LayoutSnapshot>>,
+        has_sync: bool,
+        sync: Arc<Mutex<Option<anyhow::Result<LayoutSnapshot>>>>,
         wire_fired: Arc<Mutex<bool>>,
+        cloned: Arc<Mutex<bool>>,
     }
 
     impl MuxSender for FakeSender {
+        fn has_sync_layout(&self) -> bool {
+            self.has_sync
+        }
         fn query_layout_result(&mut self) -> Option<anyhow::Result<LayoutSnapshot>> {
-            self.sync.take()
+            self.sync.lock().unwrap().take()
         }
         fn query_layout(&mut self) -> anyhow::Result<()> {
             *self.wire_fired.lock().unwrap() = true;
@@ -506,7 +535,16 @@ mod tests {
             Ok(())
         }
         fn box_clone(&self) -> Box<dyn MuxSender> {
-            unreachable!("not used in these tests")
+            // Sync-layout (herdr) path clones the sender to move it onto the
+            // blocking pool; the clone shares the `sync` slot so the cloned
+            // sender's `query_layout_result` returns the configured snapshot.
+            *self.cloned.lock().unwrap() = true;
+            Box::new(FakeSender {
+                has_sync: self.has_sync,
+                sync: self.sync.clone(),
+                wire_fired: self.wire_fired.clone(),
+                cloned: self.cloned.clone(),
+            })
         }
     }
 
@@ -526,26 +564,36 @@ mod tests {
         }
     }
 
-    /// A-1 fast-path: `Some(snapshot)` from `query_layout_result` fulfills the
-    /// reply directly — NO in-flight query is armed and NO wire action is fired.
-    #[test]
-    fn query_layout_result_some_fulfills_without_wire_actions() {
+    /// B1 out-of-band fast-path (`has_sync_layout() == true`, herdr): the dispatch
+    /// runs `query_layout_result` on the blocking pool (via `box_clone` +
+    /// `spawn_blocking`) and fulfills the reply from there — NO in-flight query is
+    /// armed and NO wire action is fired. Needs a runtime for `spawn_blocking`.
+    #[tokio::test]
+    async fn sync_layout_fulfills_via_spawn_blocking_without_wire_actions() {
         let wire_fired = Arc::new(Mutex::new(false));
+        let cloned = Arc::new(Mutex::new(false));
         let mut sender = FakeSender {
-            sync: Some(Ok(a_snapshot())),
+            has_sync: true,
+            sync: Arc::new(Mutex::new(Some(Ok(a_snapshot())))),
             wire_fired: wire_fired.clone(),
+            cloned: cloned.clone(),
         };
-        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let (query_tx, query_rx) = std::sync::mpsc::channel::<InFlightQuery>();
 
         handle_query_layout(&mut sender, &query_tx, reply_tx, 0, "s");
 
-        // Reply fulfilled directly with the snapshot.
+        // The reply is fulfilled from the blocking pool — await it.
         let snap = reply_rx
-            .try_recv()
-            .expect("reply sent synchronously")
+            .await
+            .expect("reply sent from spawn_blocking")
             .expect("ok snapshot");
         assert_eq!(snap.tabs.len(), 1);
+        // The sender was cloned to move it onto the blocking pool.
+        assert!(
+            *cloned.lock().unwrap(),
+            "sync-layout path must box_clone the sender for spawn_blocking"
+        );
         // No wire action fired and no in-flight query armed.
         assert!(
             !*wire_fired.lock().unwrap(),
@@ -557,14 +605,18 @@ mod tests {
         );
     }
 
-    /// In-band (zellij) path: `None` arms an in-flight query AND fires the wire
-    /// action; the reply stays pending (the render thread fulfills it later).
+    /// In-band (zellij) path (`has_sync_layout() == false`): arms an in-flight
+    /// query AND fires the wire action; the reply stays pending (the render thread
+    /// fulfills it later). Byte-identical to the pre-B1 behaviour — no
+    /// `query_layout_result` call, no thread-hop.
     #[test]
     fn query_layout_result_none_arms_in_flight_and_fires_wire() {
         let wire_fired = Arc::new(Mutex::new(false));
         let mut sender = FakeSender {
-            sync: None,
+            has_sync: false,
+            sync: Arc::new(Mutex::new(None)),
             wire_fired: wire_fired.clone(),
+            cloned: Arc::new(Mutex::new(false)),
         };
         let (reply_tx, mut reply_rx) =
             tokio::sync::oneshot::channel::<anyhow::Result<LayoutSnapshot>>();

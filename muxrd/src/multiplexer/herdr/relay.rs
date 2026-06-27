@@ -303,10 +303,20 @@ impl MuxSender for HerdrMuxSender {
         Ok(())
     }
 
+    fn has_sync_layout(&self) -> bool {
+        // herdr answers layout out-of-band (see query_layout_result), so the relay
+        // routes the query onto the blocking pool instead of arming the in-band
+        // Log path. (B1 fix: keeps the blocking JSON-API round-trips off the
+        // inbound select! task.)
+        true
+    }
+
     fn query_layout_result(&mut self) -> Option<Result<LayoutSnapshot>> {
         // The P2.00 payoff: herdr answers layout out-of-band over its JSON-API
         // socket, bounded by HerdrControl's per-call timeout — so the relay never
         // arms the in-band Log path nor waits out the 18 s relay query timeout.
+        // B1: the relay invokes this from spawn_blocking (has_sync_layout == true),
+        // never inline on the inbound task.
         Some(self.control.query_layout(&self.workspace_id))
     }
 

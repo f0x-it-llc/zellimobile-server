@@ -210,6 +210,22 @@ pub trait MuxSender: Send {
     /// the same `hint` it passes, so no return value is needed.
     fn toggle_fullscreen(&mut self, pane: PaneRef, hint: FullscreenHint) -> anyhow::Result<()>;
 
+    /// Whether this backend answers layout **synchronously**, out-of-band of the
+    /// render stream (via [`Self::query_layout_result`]).
+    ///
+    /// This is a cheap, side-effect-free predicate the relay's `QueryLayout` arm
+    /// checks to choose its dispatch BEFORE doing any query work — we cannot
+    /// "peek" by calling [`Self::query_layout_result`], since that call performs
+    /// the (blocking) query. `true` routes the query onto the blocking pool;
+    /// `false` (the default, zellij) takes the in-band `Log` path.
+    ///
+    /// The default is `false` — backends with an out-of-band layout channel
+    /// (herdr's JSON-API socket) override it to `true`. Any override returning
+    /// `true` MUST also return `Some(_)` from [`Self::query_layout_result`].
+    fn has_sync_layout(&self) -> bool {
+        false
+    }
+
     /// Answer a layout query **synchronously**, out-of-band of the render stream.
     ///
     /// A backend whose layout lives behind a separate control channel (herdr's
@@ -219,10 +235,13 @@ pub trait MuxSender: Send {
     /// `Log` replies (zellij's `ListTabs`/`ListPanes`) returns `None` (the
     /// default) — the relay falls through to [`Self::query_layout`].
     ///
-    /// **Contract for overrides:** this runs on the relay's inbound `select!`
-    /// task, so it MUST be bounded — a short local-socket request/response, never
-    /// an unbounded wait. The zellij default returns `None` immediately and pays
-    /// nothing.
+    /// **Contract for overrides:** this performs blocking local-socket I/O, so the
+    /// relay runs it on the **blocking pool** (`spawn_blocking`), never inline on
+    /// the inbound `select!` task — a backend selects that path by returning `true`
+    /// from [`Self::has_sync_layout`]. It should still be bounded (a short
+    /// request/response per the backend's own per-call timeout) so the blocking
+    /// thread is freed promptly. The zellij default returns `None` immediately and
+    /// pays nothing.
     fn query_layout_result(&mut self) -> Option<anyhow::Result<LayoutSnapshot>> {
         None
     }
