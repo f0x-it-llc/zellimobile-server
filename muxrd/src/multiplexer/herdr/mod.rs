@@ -18,6 +18,8 @@
 //! - [`paths`] — resolves herdr's two socket paths (JSON-API + derived wire).
 //! - [`registry`] — stable `u32`/`u64` ↔ herdr `String` id maps.
 //! - [`control`] — the JSON-API control client + neutral layout transcode (P2.02).
+//! - [`relay`] — the wire terminal relay (single-pane attach): the
+//!   `MuxSender`/`MuxReceiver`/`DualHandle` data plane (P2.03).
 //!
 //! # AGPL discipline
 //!
@@ -33,4 +35,5 @@ pub mod api;
 pub mod control;
 pub mod paths;
 pub mod registry;
+pub mod relay;
 pub mod wire;
