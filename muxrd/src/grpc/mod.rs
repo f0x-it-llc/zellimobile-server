@@ -41,9 +41,10 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Tonic service implementing the `Muxr` gRPC service.
 ///
-/// `Default` is hand-written (below) rather than derived: the `backend` field is
-/// an `Arc<dyn MuxBackend>` trait object, which has no `Default`. `Clone` stays
-/// derived — the `Arc` clone is cheap and all relays share one backend.
+/// `Default` is hand-written (below) rather than derived: the `backends` field is
+/// a [`BackendSet`](crate::multiplexer::BackendSet) of `Arc<dyn MuxBackend>` trait
+/// objects, which has no `Default`. `Clone` stays derived — every backend is an
+/// `Arc`, so the clone is cheap and all relays share the same backends.
 #[derive(Debug, Clone)]
 pub struct MuxrService {
     /// Per-session count of clients attached through this server (Phase F).
@@ -61,12 +62,15 @@ pub struct MuxrService {
     /// single-client-correct values — only when the relay that served the query
     /// is the caller's own relay (exact connection_id match).
     view_state: crate::relay::ViewStateRegistry,
-    /// The terminal-multiplexer backend (Phase 1 seam). Today a `ZellijBackend`;
-    /// Phase 2 adds a herdr backend behind the same `MuxBackend` trait.
+    /// The terminal-multiplexer backends this server drives (Phase 1 seam,
+    /// Phase 3 multi-backend). Holds **every** detected backend (zellij and/or
+    /// herdr) behind the same `MuxBackend` trait, in detection order.
     ///
-    /// Used by all ephemeral gRPC handlers (P1.02). P1.03 drives the relay off
-    /// `backend.open_attach()`. Cheap to clone (`Arc`).
-    backend: std::sync::Arc<dyn crate::multiplexer::MuxBackend>,
+    /// Used by all ephemeral gRPC handlers (P1.02) and the relay (P1.03) via the
+    /// [`MuxrService::backend`] shim, which routes through
+    /// [`BackendSet::primary`](crate::multiplexer::BackendSet::primary) for now.
+    /// T04 replaces the shim with per-session id routing. Cheap to clone (`Arc`s).
+    backends: crate::multiplexer::BackendSet,
 }
 
 impl Default for MuxrService {
@@ -94,32 +98,46 @@ impl MuxrService {
             clients: crate::client_count::SessionClients::new(),
             control: crate::relay::ControlRegistry::default(),
             view_state: crate::relay::ViewStateRegistry::default(),
-            backend: std::sync::Arc::new(crate::multiplexer::ZellijBackend),
+            backends: crate::multiplexer::BackendSet::single(
+                crate::cli::BackendKind::Zellij,
+                std::sync::Arc::new(crate::multiplexer::ZellijBackend),
+            ),
         }
     }
 
-    /// Construct a [`MuxrService`] using the supplied backend.
+    /// Construct a [`MuxrService`] driving the supplied [`BackendSet`].
     ///
     /// Builds the service with the same shared registries as [`MuxrService::new`]
-    /// but accepts any [`crate::multiplexer::MuxBackend`] — used by the
-    /// `--backend` selector in `bin/muxrd.rs` so an operator can choose `herdr`
-    /// without the binary hard-coding `ZellijBackend`.
+    /// but accepts a whole set of detected backends — used by `cmd_start` in
+    /// `bin/muxrd.rs` so one server can serve `zellij` and `herdr` simultaneously
+    /// (Phase 3) instead of hard-coding `ZellijBackend`.
     ///
     /// # Zellij version assertion
     ///
     /// [`MuxrService::new`] performs an advisory zellij-contract-version check
     /// (logged as `warn!`/`info!`).  This method intentionally **skips** that
     /// check: it is backend-agnostic, and the zellij assertion is meaningless for
-    /// the herdr path.  The zellij startup path enforces a hard version gate via
-    /// `check_zellij_version()` in `cmd_start` before this is ever called.  Full
-    /// backend-aware `VersionInfo` reporting is Phase 3.
-    pub fn with_backend(backend: std::sync::Arc<dyn crate::multiplexer::MuxBackend>) -> Self {
+    /// a herdr-only set.  The zellij startup path enforces a hard version gate via
+    /// `check_zellij_version()` in `cmd_start` (when zellij is among the detected
+    /// backends) before this is ever called.  Full per-backend `VersionInfo`
+    /// reporting is T05.
+    pub fn with_backends(backends: crate::multiplexer::BackendSet) -> Self {
         Self {
             clients: crate::client_count::SessionClients::new(),
             control: crate::relay::ControlRegistry::default(),
             view_state: crate::relay::ViewStateRegistry::default(),
-            backend,
+            backends,
         }
+    }
+
+    /// Temporary single-backend accessor: returns the set's
+    /// [`primary`](crate::multiplexer::BackendSet::primary) backend.
+    ///
+    // TODO(T04): replace with `resolve_session(id)` routing so each handler
+    // targets the backend that actually owns the session, instead of always the
+    // primary. The ephemeral handlers + relay call this until then.
+    fn backend(&self) -> &std::sync::Arc<dyn crate::multiplexer::MuxBackend> {
+        self.backends.primary()
     }
 
     /// Returns a clone of the per-session attached-client registry.

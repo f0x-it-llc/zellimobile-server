@@ -27,7 +27,7 @@ impl MuxrService {
             Some(req.tab_name)
         };
         log::info!("NewTab: session='{session}' name={tab_name:?}");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("NewTab", move || backend.new_tab(&session, tab_name)).await
     }
 
@@ -40,7 +40,7 @@ impl MuxrService {
         let req = request.into_inner();
         let (session, tab_id) = resolve_tab_target(&req)?;
         log::info!("CloseTab: session='{session}' tab_id={tab_id}");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("CloseTab", move || backend.close_tab(&session, tab_id)).await
     }
 
@@ -67,7 +67,7 @@ impl MuxrService {
             log::info!("GoToTab: routed via relay client (session='{session}', tab_id={tab_id})");
             return Ok(resp);
         }
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("GoToTab", move || backend.go_to_tab(&session, tab_id)).await
     }
 
@@ -86,7 +86,7 @@ impl MuxrService {
             return Err(Status::invalid_argument("tab name must not be empty"));
         }
         log::info!("RenameTab: session='{session}' tab_id={tab_id} name='{name}'");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("RenameTab", move || {
             backend.rename_tab(&session, tab_id, name)
         })

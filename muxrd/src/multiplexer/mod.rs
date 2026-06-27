@@ -53,7 +53,89 @@ pub use herdr::backend::HerdrBackend;
 /// strings captured by the relay, instead of duplicating the deserialization.
 pub(crate) use zellij::parse_zellij_layout;
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::cli::BackendKind;
+
+// ─── BackendSet ─────────────────────────────────────────────────────────────────
+
+/// An ordered set of the multiplexer backends this server is driving.
+///
+/// Phase 3 lets one `muxrd` serve **every** detected backend simultaneously
+/// (`zellij` and `herdr` side by side) instead of a single operator-selected one.
+/// `MuxrService` holds a `BackendSet` instead of a lone `Arc<dyn MuxBackend>`;
+/// `bin/muxrd.rs::cmd_start` builds it from [`detect::detect_backends`].
+///
+/// Insertion order is preserved (detection order: zellij first, then herdr) and
+/// is significant: [`BackendSet::primary`] returns the first backend, which the
+/// not-yet-id-aware handlers route through until T04 adds per-session id routing.
+/// Cheap to clone — every entry is an `Arc`.
+#[derive(Debug, Clone)]
+pub struct BackendSet {
+    /// `(kind, backend)` pairs in detection order. Small (≤ 2 today), so a `Vec`
+    /// linear scan in [`BackendSet::get`] is cheaper than a hash map.
+    backends: Vec<(BackendKind, Arc<dyn MuxBackend>)>,
+}
+
+impl BackendSet {
+    /// Build a set from `(kind, backend)` pairs in the desired routing order.
+    ///
+    /// The caller (`cmd_start`) guarantees the vec is non-empty (detection
+    /// fails fast when no backend is usable); [`BackendSet::primary`] relies on
+    /// that invariant.
+    pub fn new(backends: Vec<(BackendKind, Arc<dyn MuxBackend>)>) -> Self {
+        debug_assert!(!backends.is_empty(), "BackendSet must hold ≥ 1 backend");
+        Self { backends }
+    }
+
+    /// Convenience constructor for a single-backend set (used by
+    /// [`MuxrService::new`](crate::grpc::MuxrService::new)'s zellij default).
+    pub fn single(kind: BackendKind, backend: Arc<dyn MuxBackend>) -> Self {
+        Self::new(vec![(kind, backend)])
+    }
+
+    /// The backend registered for `kind`, if present.
+    pub fn get(&self, kind: BackendKind) -> Option<&Arc<dyn MuxBackend>> {
+        self.backends
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, b)| b)
+    }
+
+    /// Iterate over `(kind, backend)` pairs in detection order.
+    pub fn iter(&self) -> impl Iterator<Item = (BackendKind, &Arc<dyn MuxBackend>)> {
+        self.backends.iter().map(|(k, b)| (*k, b))
+    }
+
+    /// The kinds in this set, in detection order.
+    pub fn kinds(&self) -> impl Iterator<Item = BackendKind> + '_ {
+        self.backends.iter().map(|(k, _)| *k)
+    }
+
+    /// Number of backends held.
+    pub fn len(&self) -> usize {
+        self.backends.len()
+    }
+
+    /// Whether the set is empty (never true for a `cmd_start`-built set).
+    pub fn is_empty(&self) -> bool {
+        self.backends.is_empty()
+    }
+
+    /// The primary (first / highest-priority) backend.
+    ///
+    /// Used by the not-yet-id-aware handlers via the `MuxrService::backend()`
+    /// shim until T04 introduces `resolve_session(id)` routing. Panics on an
+    /// empty set, which the non-empty construction invariant prevents.
+    pub fn primary(&self) -> &Arc<dyn MuxBackend> {
+        &self
+            .backends
+            .first()
+            .expect("BackendSet invariant: at least one backend")
+            .1
+    }
+}
 
 // ─── MuxBackend ─────────────────────────────────────────────────────────────────
 

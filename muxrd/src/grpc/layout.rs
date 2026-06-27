@@ -108,7 +108,7 @@ impl MuxrService {
                                 "GetLayout: relay query/parse failed for '{session}', \
                                  falling back to ephemeral: {e:#}"
                             );
-                            let snap = backend_query_layout(&self.backend, &session).await?;
+                            let snap = backend_query_layout(self.backend(), &session).await?;
                             (snap, false, String::new())
                         }
                         Ok(Err(_cancelled)) => {
@@ -116,7 +116,7 @@ impl MuxrService {
                                 "GetLayout: relay query oneshot cancelled for '{session}', \
                                  falling back to ephemeral"
                             );
-                            let snap = backend_query_layout(&self.backend, &session).await?;
+                            let snap = backend_query_layout(self.backend(), &session).await?;
                             (snap, false, String::new())
                         }
                         Err(_elapsed) => {
@@ -124,7 +124,7 @@ impl MuxrService {
                                 "GetLayout: relay query timed out for '{session}' \
                                  after {RELAY_QUERY_TIMEOUT:?}, falling back to ephemeral"
                             );
-                            let snap = backend_query_layout(&self.backend, &session).await?;
+                            let snap = backend_query_layout(self.backend(), &session).await?;
                             (snap, false, String::new())
                         }
                     }
@@ -134,13 +134,13 @@ impl MuxrService {
                         "GetLayout: relay sender closed for '{session}', \
                          falling back to ephemeral"
                     );
-                    let snap = backend_query_layout(&self.backend, &session).await?;
+                    let snap = backend_query_layout(self.backend(), &session).await?;
                     (snap, false, String::new())
                 }
             } else {
                 // No relay attached for this session — use the ephemeral backend path.
                 log::debug!("GetLayout: no relay for '{session}', using ephemeral query");
-                let snap = backend_query_layout(&self.backend, &session).await?;
+                let snap = backend_query_layout(self.backend(), &session).await?;
                 (snap, false, String::new())
             }
         };

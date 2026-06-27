@@ -19,7 +19,7 @@ impl MuxrService {
     ) -> Result<Response<SessionList>, Status> {
         log::debug!("ListSessions: scanning session sockets");
 
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         let sessions =
             tokio::task::spawn_blocking(move || backend.list_sessions_with_resurrectables())
                 .await
@@ -99,7 +99,7 @@ impl MuxrService {
             self.clients.clone(),
             self.control.clone(),
             self.view_state.clone(),
-            self.backend.clone(),
+            self.backend().clone(),
         )
         .await?;
         Ok(Response::new(stream))
@@ -120,7 +120,7 @@ impl MuxrService {
         let session = req.session;
         let new_name = req.name;
         log::info!("RenameSession: session='{session}' → '{new_name}'");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("RenameSession", move || {
             backend.rename_session(&session, new_name)
         })
@@ -140,7 +140,7 @@ impl MuxrService {
         validate_session(&req.session)?;
         let session = req.session;
         log::info!("KillSession: session='{session}'");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         tokio::task::spawn_blocking(move || backend.kill_session(&session))
             .await
             .map_err(|e| Status::internal(format!("KillSession task panicked: {e}")))?
@@ -186,7 +186,7 @@ impl MuxrService {
             Some(req.layout)
         };
         log::info!("CreateSession: name='{name}' layout={layout:?}");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("CreateSession", move || {
             backend.create_session(&name, layout)
         })

@@ -46,7 +46,7 @@ impl MuxrService {
             req.data.len()
         );
         let data = req.data;
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("WriteToPane", move || {
             backend.write_to_pane(&session, pane, data)
         })
@@ -76,7 +76,7 @@ impl MuxrService {
             log::info!("FocusPane: routed via relay client (session='{session}')");
             return Ok(resp);
         }
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("FocusPane", move || backend.focus_pane(&session, pane)).await
     }
 
@@ -89,7 +89,7 @@ impl MuxrService {
         let target = request.into_inner();
         let (session, pane) = resolve_pane_target(&target)?;
         log::info!("ClosePane: session='{session}' pane={pane:?}");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("ClosePane", move || backend.close_pane(&session, pane)).await
     }
 
@@ -109,7 +109,7 @@ impl MuxrService {
             Some(req.pane_name)
         };
         log::info!("NewPane: session='{session}' floating={floating} name={pane_name:?}");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("NewPane", move || {
             backend.new_pane(&session, floating, pane_name)
         })
@@ -129,7 +129,7 @@ impl MuxrService {
         let (session, pane) = resolve_pane_target(&target)?;
         let name = req.name;
         log::info!("RenamePane: session='{session}' pane={pane:?} name='{name}'");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("RenamePane", move || {
             backend.rename_pane(&session, pane, name)
         })
@@ -165,7 +165,7 @@ impl MuxrService {
             "ResizePane: session='{session}' pane={pane:?} resize={resize_kind:?} \
              dir={resize_dir:?}"
         );
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("ResizePane", move || {
             backend.resize_pane(&session, pane, resize_kind, resize_dir)
         })
@@ -181,7 +181,7 @@ impl MuxrService {
         let target = request.into_inner();
         let (session, pane) = resolve_pane_target(&target)?;
         log::info!("TogglePaneFloating: session='{session}' pane={pane:?}");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("TogglePaneFloating", move || {
             backend.toggle_pane_floating(&session, pane)
         })
@@ -234,7 +234,7 @@ impl MuxrService {
             log::info!("TogglePaneFullscreen: routed via relay client (session='{session}')");
             return Ok(resp);
         }
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("TogglePaneFullscreen", move || {
             backend.toggle_pane_fullscreen(&session, pane)
         })
@@ -266,7 +266,7 @@ impl MuxrService {
             _ => ScrollDir::Up,
         };
         log::info!("ScrollPane: session='{session}' pane={pane:?} dir={dir:?}");
-        let backend = self.backend.clone();
+        let backend = self.backend().clone();
         run_action("ScrollPane", move || {
             backend.scroll_pane(&session, pane, dir)
         })
