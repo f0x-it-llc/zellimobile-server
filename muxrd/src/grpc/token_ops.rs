@@ -22,6 +22,8 @@ impl MuxrService {
         let info = VersionInfo {
             server_version: SERVER_VERSION.to_owned(),
             zellij_version: zellij_utils::consts::VERSION.to_owned(),
+            backends: Vec::new(), // populated in Phase 3 (multi-backend)
+            available_backends: Vec::new(), // populated in Phase 3
         };
         log::debug!(
             "GetVersion → server={} zellij={}",

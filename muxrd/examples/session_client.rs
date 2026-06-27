@@ -353,6 +353,7 @@ async fn main() -> Result<()> {
         .create_session(CreateSessionReq {
             name: "d2new".to_owned(),
             layout: String::new(),
+            backend: 0, // BACKEND_UNSPECIFIED — server selects default
         })
         .await
         .context("CreateSession RPC failed")?
@@ -488,6 +489,7 @@ async fn main() -> Result<()> {
             .create_session(CreateSessionReq {
                 name: "ro_should_not_create".to_owned(),
                 layout: String::new(),
+                backend: 0, // BACKEND_UNSPECIFIED — server selects default
             })
             .await;
         check_permission_denied("CreateSession", ro_cs, &mut pass);

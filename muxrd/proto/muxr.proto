@@ -95,11 +95,28 @@ service Muxr {
 
 message Empty {}
 
+// Multiplexer backend that owns a session.
+enum Backend {
+  BACKEND_UNSPECIFIED = 0;
+  BACKEND_ZELLIJ      = 1;
+  BACKEND_HERDR       = 2;
+}
+
+// Version string for one available backend.
+message BackendVersion {
+  Backend backend = 1;
+  string  version = 2;
+}
+
 message VersionInfo {
   // Semantic version of muxrd itself.
   string server_version = 1;
-  // Zellij version this server was compiled against.
+  // Zellij version this server was compiled against (back-compat; = the zellij BackendVersion's value).
   string zellij_version = 2;
+  // Per-backend versions for all detected backends.
+  repeated BackendVersion backends           = 3;
+  // Detected/usable backends.
+  repeated Backend        available_backends = 4;
 }
 
 message LoginRequest {
@@ -225,6 +242,10 @@ message SessionInfo {
   // Count of mobile clients currently attached to this session THROUGH
   // muxrd (active AttachTerminal relays), not zellij-level clients.
   uint32 connected_clients  = 8;
+  // Multiplexer backend that owns this session (for client tint).
+  Backend backend           = 9;
+  // Opaque backend-qualified routing key (e.g. "zellij:dev").
+  string  id                = 10;
 }
 
 // Full tab/pane layout for a session (returned by GetLayout).
@@ -437,4 +458,6 @@ message CreateSessionReq {
   string name   = 1;
   // Optional layout file path (passed as --layout to zellij; unused if empty).
   string layout = 2;
+  // Which backend to create the session on (required when >1 backend available).
+  Backend backend = 3;
 }

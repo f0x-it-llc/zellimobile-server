@@ -50,6 +50,8 @@ impl MuxrService {
                     has_bell: false,
                     is_current: false,
                     connected_clients,
+                    backend: 0, // BACKEND_UNSPECIFIED — filled per-session in Phase 3
+                    id: String::new(),
                 }
             })
             .collect();
