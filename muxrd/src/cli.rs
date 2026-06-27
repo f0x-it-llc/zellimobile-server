@@ -3,7 +3,35 @@
 //! All subcommands are defined here; the `src/bin/muxrd.rs` entrypoint
 //! parses these and dispatches to the appropriate handler.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+// ── BackendKind ───────────────────────────────────────────────────────────────
+
+/// Which terminal-multiplexer backend muxrd drives.
+///
+/// Resolved at `start` time: CLI `--backend` wins over the `MUXRD_BACKEND`
+/// environment variable; absent both, the default is [`BackendKind::Zellij`].
+///
+/// `zellij` is the production default and requires a running zellij instance
+/// on the same machine; `herdr` requires a running herdr instance reachable via
+/// its public Unix-domain sockets (set `HERDR_SOCKET_PATH` to override the
+/// XDG-default socket location).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BackendKind {
+    /// Drive the local zellij instance via Unix-domain IPC (default).
+    Zellij,
+    /// Drive a running herdr instance via its public JSON-API + wire sockets.
+    Herdr,
+}
+
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendKind::Zellij => write!(f, "zellij"),
+            BackendKind::Herdr => write!(f, "herdr"),
+        }
+    }
+}
 
 /// muxrd — gRPC server for Zellij remote control.
 ///
@@ -184,6 +212,18 @@ pub struct StartArgs {
     /// (non-empty and not "0").
     #[arg(long = "i-know-this-is-behind-a-proxy")]
     pub h2c_allow_public: bool,
+
+    /// Terminal-multiplexer backend to drive.
+    ///
+    /// - `zellij` (default): drives the local zellij instance via Unix-domain IPC.
+    ///   Requires a running zellij binary that matches the linked zellij crate version.
+    /// - `herdr`: drives a running herdr instance via its public JSON-API + wire
+    ///   sockets.  Set `HERDR_SOCKET_PATH` to point at the herdr API socket when the
+    ///   instance is not at its XDG-default location (`$HOME/.config/herdr/herdr.sock`).
+    ///
+    /// CLI wins over the `MUXRD_BACKEND` environment variable.
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    pub backend: Option<BackendKind>,
 }
 
 // ── create-token ────────────────────────────────────────────────────────────

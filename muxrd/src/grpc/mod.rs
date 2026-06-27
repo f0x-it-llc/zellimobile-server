@@ -98,6 +98,30 @@ impl MuxrService {
         }
     }
 
+    /// Construct a [`MuxrService`] using the supplied backend.
+    ///
+    /// Builds the service with the same shared registries as [`MuxrService::new`]
+    /// but accepts any [`crate::multiplexer::MuxBackend`] — used by the
+    /// `--backend` selector in `bin/muxrd.rs` so an operator can choose `herdr`
+    /// without the binary hard-coding `ZellijBackend`.
+    ///
+    /// # Zellij version assertion
+    ///
+    /// [`MuxrService::new`] performs an advisory zellij-contract-version check
+    /// (logged as `warn!`/`info!`).  This method intentionally **skips** that
+    /// check: it is backend-agnostic, and the zellij assertion is meaningless for
+    /// the herdr path.  The zellij startup path enforces a hard version gate via
+    /// `check_zellij_version()` in `cmd_start` before this is ever called.  Full
+    /// backend-aware `VersionInfo` reporting is Phase 3.
+    pub fn with_backend(backend: std::sync::Arc<dyn crate::multiplexer::MuxBackend>) -> Self {
+        Self {
+            clients: crate::client_count::SessionClients::new(),
+            control: crate::relay::ControlRegistry::default(),
+            view_state: crate::relay::ViewStateRegistry::default(),
+            backend,
+        }
+    }
+
     /// Returns a clone of the per-session attached-client registry.
     ///
     /// The clone shares the same underlying `DashMap` (via `Arc`), so callers

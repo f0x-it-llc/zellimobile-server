@@ -25,13 +25,16 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use muxrd::auth::BearerAuthLayer;
-use muxrd::cli::{Cli, Command, InitArgs, StartArgs};
+use muxrd::cli::{BackendKind, Cli, Command, InitArgs, StartArgs};
 use muxrd::config::{self, CertSource, check_h2c_bind_safety};
 use muxrd::control::{self, ControlRequest, ControlResponse};
 use muxrd::grpc::MuxrService;
+use muxrd::multiplexer::{HerdrBackend, MuxBackend, ZellijBackend};
 use muxrd::proto::muxr_server::MuxrServer;
 use muxrd::tls::SanEntry;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
@@ -473,23 +476,71 @@ fn cmd_config(bind_override: Option<&str>, args: muxrd::cli::ConfigArgs) -> Resu
 
 // ── start ─────────────────────────────────────────────────────────────────────
 
-/// `start [--daemonize] [--san <san>...]`.
+/// `start [--daemonize] [--san <san>...] [--backend <zellij|herdr>]`.
 ///
 /// In foreground mode this constructs a tokio runtime and serves directly.  In
 /// daemon mode it forks FIRST (via `daemonize`, while still single-threaded),
 /// and only the detached child builds the runtime and serves.
 fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
-    // Major F: refuse to start if the installed `zellij` binary's version
+    // ── Backend selection: CLI wins over MUXRD_BACKEND env ──────────────────
+    // Resolve `--backend` first so we can skip the zellij version check for
+    // the herdr path (the check would error if zellij is not installed).
+    let resolved_backend = args.backend.unwrap_or_else(|| {
+        std::env::var("MUXRD_BACKEND")
+            .ok()
+            .and_then(|v| match v.to_lowercase().as_str() {
+                "zellij" => Some(BackendKind::Zellij),
+                "herdr" => Some(BackendKind::Herdr),
+                other => {
+                    log::warn!(
+                        "MUXRD_BACKEND={other:?} is not a recognized backend; \
+                         defaulting to zellij. Valid values: zellij, herdr."
+                    );
+                    None
+                }
+            })
+            .unwrap_or(BackendKind::Zellij)
+    });
+
+    // ── Zellij version check (zellij backend only) ───────────────────────────
+    // Major F: refuse to start when the installed `zellij` binary's version
     // disagrees with the zellij crate we linked against — a mismatch causes
     // silent IPC decode failures at runtime.  Overridable for power users.
     //
+    // The herdr path MUST NOT run this check: herdr has no zellij binary
+    // dependency, and `check_zellij_version` would error if zellij is absent.
+    // Full backend-aware VersionInfo is Phase 3; for now we just skip.
+    //
     // TOCTOU fix: resolve the binary path ONCE here and thread it through
     // rather than re-running which_zellij() independently in create_session.
-    let _zellij_bin = check_zellij_version()?;
-    // Note: _zellij_bin is currently unused here because create_session
-    // resolves it internally. Future refactor can thread it through
-    // actions::create_session for full TOCTOU elimination; the path
-    // is resolved once and the version verified.
+    match resolved_backend {
+        BackendKind::Zellij => {
+            let _zellij_bin = check_zellij_version()?;
+            // Note: _zellij_bin is currently unused here because create_session
+            // resolves it internally. Future refactor can thread it through
+            // actions::create_session for full TOCTOU elimination; the path
+            // is resolved once and the version verified.
+        }
+        BackendKind::Herdr => {
+            log::info!(
+                "backend: herdr selected — skipping zellij version check \
+                 (herdr has no zellij dependency)"
+            );
+        }
+    }
+
+    // ── Construct the backend ────────────────────────────────────────────────
+    let backend: Arc<dyn MuxBackend> = match resolved_backend {
+        BackendKind::Zellij => {
+            log::info!("backend: zellij (Unix-domain IPC)");
+            Arc::new(ZellijBackend)
+        }
+        BackendKind::Herdr => {
+            let b = HerdrBackend::from_env();
+            log::info!("backend: herdr ({})", b.backend_version());
+            Arc::new(b)
+        }
+    };
 
     let cfg = config::resolve(bind_override).context("resolve config")?;
     let addr: std::net::SocketAddr = cfg
@@ -587,6 +638,7 @@ fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
         args.daemonize,
         extra_sans,
         cert_source,
+        backend,
     ));
 
     // Foreground cleanup (in daemon mode daemonize owns the pidfile).
@@ -640,12 +692,16 @@ fn cert_identity(
 /// - `SelfSigned` → load or generate the self-signed cert; serve over TLS.
 /// - `External`   → load the caller-supplied cert+key; serve over TLS.
 /// - `H2c`        → serve plaintext HTTP/2; **MUST** sit behind a trusted TLS proxy.
+///
+/// `backend` is the resolved [`MuxBackend`] (zellij or herdr), constructed and
+/// logged by [`cmd_start`] before the runtime is entered.
 async fn serve(
     addr: std::net::SocketAddr,
     bind_addr: String,
     quiet: bool,
     extra_sans: Vec<SanEntry>,
     cert_source: CertSource,
+    backend: Arc<dyn MuxBackend>,
 ) -> Result<()> {
     install_crypto_provider();
 
@@ -683,7 +739,7 @@ async fn serve(
         }
     };
 
-    let service = MuxrService::new();
+    let service = MuxrService::with_backend(backend);
 
     // ── Control socket + graceful shutdown signal ────────────────────────────
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

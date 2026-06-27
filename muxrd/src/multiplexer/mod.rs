@@ -41,6 +41,11 @@ pub use types::{
     ResizeDir, ResizeKind, ScrollDir, TabSnapshot,
 };
 pub use zellij::ZellijBackend;
+
+/// Re-exported for the P2.05 backend selector in `bin/muxrd.rs` and the
+/// integration test harness.  The herdr sub-module remains `pub(crate)` to keep
+/// its wire/API internals crate-private; only the public entry point is lifted.
+pub use herdr::backend::HerdrBackend;
 /// The single zellij-JSON → [`LayoutSnapshot`] parse, shared by the ephemeral
 /// [`MuxBackend::query_layout`] impl and the relay-routed `GetLayout` path
 /// (`grpc/layout.rs`). `pub(crate)` so the gRPC layer can reuse it on the JSON
