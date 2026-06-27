@@ -2,7 +2,6 @@
 
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::actions;
 use crate::proto::{
     ActionAck as ProtoAck, ClientFrame, CreateSessionReq, Empty, RenameSessionReq, SessionList,
     SessionRef,
@@ -20,13 +19,15 @@ impl MuxrService {
     ) -> Result<Response<SessionList>, Status> {
         log::debug!("ListSessions: scanning session sockets");
 
-        let sessions = tokio::task::spawn_blocking(crate::query::list_sessions_with_resurrectables)
-            .await
-            .map_err(|e| Status::internal(format!("ListSessions task panicked: {e}")))?
-            .map_err(|e| {
-                log::warn!("ListSessions: error enumerating sessions: {e:#}");
-                Status::internal(format!("failed to list sessions: {e:#}"))
-            })?;
+        let backend = self.backend.clone();
+        let sessions =
+            tokio::task::spawn_blocking(move || backend.list_sessions_with_resurrectables())
+                .await
+                .map_err(|e| Status::internal(format!("ListSessions task panicked: {e}")))?
+                .map_err(|e| {
+                    log::warn!("ListSessions: error enumerating sessions: {e:#}");
+                    Status::internal(format!("failed to list sessions: {e:#}"))
+                })?;
 
         // `connected_clients` is sourced from this server's own relay registry
         // (cheap, no IPC). The layout-derived enrichment fields
@@ -116,8 +117,9 @@ impl MuxrService {
         let session = req.session;
         let new_name = req.name;
         log::info!("RenameSession: session='{session}' → '{new_name}'");
+        let backend = self.backend.clone();
         run_action("RenameSession", move || {
-            actions::rename_session(&session, new_name)
+            backend.rename_session(&session, new_name)
         })
         .await
     }
@@ -135,7 +137,8 @@ impl MuxrService {
         validate_session(&req.session)?;
         let session = req.session;
         log::info!("KillSession: session='{session}'");
-        tokio::task::spawn_blocking(move || actions::kill_session(&session))
+        let backend = self.backend.clone();
+        tokio::task::spawn_blocking(move || backend.kill_session(&session))
             .await
             .map_err(|e| Status::internal(format!("KillSession task panicked: {e}")))?
             .map_err(|e| {
@@ -180,8 +183,9 @@ impl MuxrService {
             Some(req.layout)
         };
         log::info!("CreateSession: name='{name}' layout={layout:?}");
+        let backend = self.backend.clone();
         run_action("CreateSession", move || {
-            actions::create_session(&name, layout)
+            backend.create_session(&name, layout)
         })
         .await
     }

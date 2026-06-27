@@ -2,10 +2,11 @@
 
 use tonic::{Request, Response, Status};
 
+use crate::multiplexer::{LayoutSnapshot, MuxBackend, PaneSnapshot, TabSnapshot};
 use crate::proto::{Layout, PaneMsg, SessionRef, TabMsg};
 
 use super::MuxrService;
-use super::helpers::{ephemeral_query, validate_session};
+use super::helpers::validate_session;
 
 /// Timeout for the oneshot reply when routing a `QueryLayout` through the relay.
 ///
@@ -37,12 +38,14 @@ impl MuxrService {
         //      multi-client misroute bug).
         //   2. Otherwise → find any relay registered for the session (session-
         //      scoped fallback; preserves solo-client and legacy-client behavior).
-        //   3. No relay → ephemeral AttachClient path (unchanged).
+        //   3. No relay → ephemeral backend.query_layout() path.
         //
-        // Clone the UnboundedSender (cheap: just a channel handle) so the
-        // DashMap Ref guard is dropped immediately — never hold a shard guard
-        // across an .await.
-        let (tabs_json, panes_json, via_relay, relay_conn_id) = {
+        // Both paths now produce a neutral `LayoutSnapshot`; the relay branch
+        // parses the JSON strings it receives from the relay reader thread (via
+        // the QueryLayout oneshot), while the ephemeral branch delegates to
+        // `self.backend.query_layout()` directly. P1.03 will convert the relay
+        // to produce neutral messages, eliminating `parse_relay_json`.
+        let (snapshot, via_relay, relay_conn_id) = {
             // Try per-connection lookup first, then session-scoped fallback.
             let relay_entry: Option<(
                 String,
@@ -89,31 +92,32 @@ impl MuxrService {
                                 t.len(),
                                 p.len()
                             );
-                            (t, p, true, matched_conn_id)
+                            let snap = parse_relay_json(&t, &p)?;
+                            (snap, true, matched_conn_id)
                         }
                         Ok(Ok(Err(e))) => {
                             log::warn!(
                                 "GetLayout: relay query failed for '{session}', \
                                  falling back to ephemeral: {e:#}"
                             );
-                            let (t, p, r) = ephemeral_query(&session).await?;
-                            (t, p, r, String::new())
+                            let snap = backend_query_layout(&self.backend, &session).await?;
+                            (snap, false, String::new())
                         }
                         Ok(Err(_cancelled)) => {
                             log::warn!(
                                 "GetLayout: relay query oneshot cancelled for '{session}', \
                                  falling back to ephemeral"
                             );
-                            let (t, p, r) = ephemeral_query(&session).await?;
-                            (t, p, r, String::new())
+                            let snap = backend_query_layout(&self.backend, &session).await?;
+                            (snap, false, String::new())
                         }
                         Err(_elapsed) => {
                             log::warn!(
                                 "GetLayout: relay query timed out for '{session}' \
                                  after {RELAY_QUERY_TIMEOUT:?}, falling back to ephemeral"
                             );
-                            let (t, p, r) = ephemeral_query(&session).await?;
-                            (t, p, r, String::new())
+                            let snap = backend_query_layout(&self.backend, &session).await?;
+                            (snap, false, String::new())
                         }
                     }
                 } else {
@@ -122,45 +126,22 @@ impl MuxrService {
                         "GetLayout: relay sender closed for '{session}', \
                          falling back to ephemeral"
                     );
-                    let (t, p, r) = ephemeral_query(&session).await?;
-                    (t, p, r, String::new())
+                    let snap = backend_query_layout(&self.backend, &session).await?;
+                    (snap, false, String::new())
                 }
             } else {
-                // No relay attached for this session — use the original ephemeral path.
+                // No relay attached for this session — use the ephemeral backend path.
                 log::debug!("GetLayout: no relay for '{session}', using ephemeral query");
-                let (t, p, r) = ephemeral_query(&session).await?;
-                (t, p, r, String::new())
+                let snap = backend_query_layout(&self.backend, &session).await?;
+                (snap, false, String::new())
             }
         };
 
         log::debug!(
-            "GetLayout: tabs JSON ({} bytes), panes JSON ({} bytes), via_relay={via_relay} \
+            "GetLayout: {} tab(s) in snapshot, via_relay={via_relay} \
              relay_conn_id='{relay_conn_id}'",
-            tabs_json.len(),
-            panes_json.len()
+            snapshot.tabs.len()
         );
-
-        // ── Deserialise ─────────────────────────────────────────────────────
-        use zellij_utils::data::{ListPanesResponse, ListTabsResponse, PaneId};
-
-        // On parse failure, keep the serde detail + payload size in the server
-        // log only; return a generic Status so neither the internal error nor the
-        // (potentially large, cwd/command-bearing) layout JSON leaks to the client.
-        let tabs: ListTabsResponse = serde_json::from_str(&tabs_json).map_err(|e| {
-            log::warn!(
-                "GetLayout: failed to parse ListTabs JSON ({}B): {e}",
-                tabs_json.len()
-            );
-            Status::internal("failed to parse layout response from session")
-        })?;
-
-        let panes: ListPanesResponse = serde_json::from_str(&panes_json).map_err(|e| {
-            log::warn!(
-                "GetLayout: failed to parse ListPanes JSON ({}B): {e}",
-                panes_json.len()
-            );
-            Status::internal("failed to parse layout response from session")
-        })?;
 
         // ── B-FOCUS: read relay view state for active_tab / focused_pane ────
         // Only meaningful when a relay is attached AND the relay that served the
@@ -206,83 +187,19 @@ impl MuxrService {
             );
         }
 
-        // ── Group panes by tab_id ────────────────────────────────────────────
-        let mut panes_by_tab: std::collections::HashMap<usize, Vec<PaneMsg>> =
-            std::collections::HashMap::new();
-        for entry in panes {
-            // Plugin panes (background-only plugins like zellij:link, and tab-bar/status-bar)
-            // are never user-facing terminals in the Muxr model — zellij renders the
-            // background ones headlessly and the bar-less app layout forbids the rest. Exclude
-            // them so they don't surface as selectable panes in the client rail/picker.
-            // See workflow/plans/bug/filter-plugin-panes/BUG.md. Single chokepoint: GetLayout
-            // is the only RPC that returns a pane list.
-            if !pane_is_client_visible(entry.pane_info.is_plugin) {
-                continue;
-            }
+        // ── Build proto from LayoutSnapshot + B-FOCUS override ────────────────
+        // Panes are already nested under their tab in LayoutSnapshot (no HashMap
+        // grouping step needed). Plugin panes are filtered here (single chokepoint).
+        //
+        // B-FOCUS: relay_vs.focused_pane is still Option<zellij_utils::data::PaneId>
+        // (RelayViewState unchanged until P1.03); PaneId is used only for this
+        // comparison, keeping the override logic byte-identical to the pre-P1.02 code.
+        use zellij_utils::data::PaneId;
 
-            // B-FOCUS: override is_focused with the per-relay-client value, but
-            // ONLY within the relay's ACTIVE tab.
-            //
-            // The relay tracks a single focused pane — the one focused in ITS
-            // active tab. Each tab, though, has its own independently-focused
-            // pane. If we applied the override across ALL tabs we'd force
-            // is_focused=false on every legitimately-focused pane of the
-            // NON-active tabs (none of them match the single tracked focused_pane),
-            // hiding per-tab focus from consumers. So we scope the override to the
-            // active tab and leave non-active tabs' queried is_focused untouched.
-            //
-            // When focused_pane is None (unknown, e.g. right after a bare SwitchTab
-            // with no subsequent FocusPane), leave the queried is_focused as-is
-            // everywhere (best-effort).
-            let in_active_tab = relay_vs
-                .as_ref()
-                .and_then(|vs| vs.active_tab)
-                .map(|at| entry.tab_id as u64 == at)
-                .unwrap_or(false);
-
-            let is_focused = if in_active_tab {
-                relay_vs
-                    .as_ref()
-                    .and_then(|vs| vs.focused_pane)
-                    .map(|fp| match fp {
-                        PaneId::Terminal(fid) => {
-                            !entry.pane_info.is_plugin && entry.pane_info.id == fid
-                        }
-                        PaneId::Plugin(fid) => {
-                            entry.pane_info.is_plugin && entry.pane_info.id == fid
-                        }
-                    })
-                    .unwrap_or(entry.pane_info.is_focused)
-            } else {
-                // Non-active tab (or active_tab unknown): keep the queried value —
-                // each tab carries its own focus.
-                entry.pane_info.is_focused
-            };
-
-            let pane_msg = PaneMsg {
-                id: entry.pane_info.id,
-                title: entry.pane_info.title.clone(),
-                is_focused,
-                is_floating: entry.pane_info.is_floating,
-                exited: entry.pane_info.exited,
-                command: entry.pane_command.unwrap_or_default(),
-                cwd: entry.pane_cwd.unwrap_or_default(),
-                x: entry.pane_info.pane_x as u32,
-                y: entry.pane_info.pane_y as u32,
-                rows: entry.pane_info.pane_rows as u32,
-                cols: entry.pane_info.pane_columns as u32,
-                is_plugin: entry.pane_info.is_plugin,
-                is_fullscreen: entry.pane_info.is_fullscreen,
-            };
-            panes_by_tab.entry(entry.tab_id).or_default().push(pane_msg);
-        }
-
-        // ── Build Layout ────────────────────────────────────────────────────
-        let tab_msgs: Vec<TabMsg> = tabs
-            .into_iter()
+        let tab_msgs: Vec<TabMsg> = snapshot
+            .tabs
+            .iter()
             .map(|tab| {
-                let panes = panes_by_tab.remove(&tab.tab_id).unwrap_or_default();
-
                 // B-FOCUS: override active with per-relay-client value.
                 // When relay_vs.active_tab is Some, the relay knows exactly
                 // which tab it switched to. When None (not yet set), fall back
@@ -291,19 +208,84 @@ impl MuxrService {
                 let active = relay_vs
                     .as_ref()
                     .and_then(|vs| vs.active_tab)
-                    .map(|at| tab.tab_id as u64 == at)
+                    .map(|at| tab.tab_id == at)
                     .unwrap_or(tab.active);
 
+                // Compute once per tab (all panes in a tab share the same tab_id).
+                let in_active_tab = relay_vs
+                    .as_ref()
+                    .and_then(|vs| vs.active_tab)
+                    .map(|at| tab.tab_id == at)
+                    .unwrap_or(false);
+
+                let panes: Vec<PaneMsg> = tab
+                    .panes
+                    .iter()
+                    // Plugin panes (background-only plugins like zellij:link, and
+                    // tab-bar/status-bar) are never user-facing terminals in the
+                    // Muxr model. Exclude them so they don't surface as selectable
+                    // panes in the client rail/picker. Single chokepoint: GetLayout
+                    // is the only RPC that returns a pane list.
+                    .filter(|p| pane_is_client_visible(p.is_plugin))
+                    .map(|p| {
+                        // B-FOCUS: override is_focused with the per-relay-client
+                        // value, but ONLY within the relay's ACTIVE tab.
+                        //
+                        // The relay tracks a single focused pane — the one focused
+                        // in ITS active tab. Each tab, though, has its own
+                        // independently-focused pane. If we applied the override
+                        // across ALL tabs we'd force is_focused=false on every
+                        // legitimately-focused pane of the NON-active tabs (none of
+                        // them match the single tracked focused_pane), hiding per-tab
+                        // focus from consumers. So we scope the override to the active
+                        // tab and leave non-active tabs' queried is_focused untouched.
+                        //
+                        // When focused_pane is None (unknown, e.g. right after a bare
+                        // SwitchTab with no subsequent FocusPane), leave the queried
+                        // is_focused as-is everywhere (best-effort).
+                        let is_focused = if in_active_tab {
+                            relay_vs
+                                .as_ref()
+                                .and_then(|vs| vs.focused_pane)
+                                .map(|fp| match fp {
+                                    PaneId::Terminal(fid) => !p.is_plugin && p.id == fid,
+                                    PaneId::Plugin(fid) => p.is_plugin && p.id == fid,
+                                })
+                                .unwrap_or(p.is_focused)
+                        } else {
+                            // Non-active tab (or active_tab unknown): keep the queried
+                            // value — each tab carries its own focus.
+                            p.is_focused
+                        };
+
+                        PaneMsg {
+                            id: p.id,
+                            title: p.title.clone(),
+                            is_focused,
+                            is_floating: p.is_floating,
+                            exited: p.exited,
+                            command: p.command.clone(),
+                            cwd: p.cwd.clone(),
+                            x: p.x,
+                            y: p.y,
+                            rows: p.rows,
+                            cols: p.cols,
+                            is_plugin: p.is_plugin,
+                            is_fullscreen: p.is_fullscreen,
+                        }
+                    })
+                    .collect();
+
                 TabMsg {
-                    position: tab.position as u32,
+                    position: tab.position,
                     name: tab.name.clone(),
                     active,
-                    has_bell: tab.has_bell_notification,
-                    panes_to_hide: tab.panes_to_hide as u32,
+                    has_bell: tab.has_bell,
+                    panes_to_hide: tab.panes_to_hide,
                     tab_id: tab.tab_id as u32,
                     panes,
-                    fullscreen_active: tab.is_fullscreen_active,
-                    floating_panes_visible: tab.are_floating_panes_visible,
+                    fullscreen_active: tab.fullscreen_active,
+                    floating_panes_visible: tab.floating_panes_visible,
                 }
             })
             .collect();
@@ -318,6 +300,29 @@ impl MuxrService {
 
         Ok(Response::new(Layout { tabs: tab_msgs }))
     }
+}
+
+// ─── Private async helper ─────────────────────────────────────────────────────
+
+/// Call `backend.query_layout()` in a blocking task, mapping errors to
+/// [`Status`].
+///
+/// Used by all ephemeral paths in `get_layout_impl` (no relay attached, relay
+/// fallback on error/timeout/cancel, relay sender closed). Replaces the old
+/// `ephemeral_query` free function that opened two separate IPC connections.
+async fn backend_query_layout(
+    backend: &std::sync::Arc<dyn MuxBackend>,
+    session: &str,
+) -> Result<LayoutSnapshot, Status> {
+    let backend = backend.clone();
+    let session = session.to_owned();
+    tokio::task::spawn_blocking(move || backend.query_layout(&session))
+        .await
+        .map_err(|e| Status::internal(format!("GetLayout query task panicked: {e}")))?
+        .map_err(|e| {
+            log::warn!("GetLayout ephemeral query failed: {e:#}");
+            Status::internal(format!("GetLayout query failed: {e:#}"))
+        })
 }
 
 // ─── Pure helpers (also used by tests) ───────────────────────────────────────
@@ -348,6 +353,82 @@ pub(crate) fn should_apply_view_state_override(
     relay_conn_id: &str,
 ) -> bool {
     via_relay && !request_connection_id.is_empty() && relay_conn_id == request_connection_id
+}
+
+/// Parse relay-sourced `ListTabs` + `ListPanes` JSON strings into a neutral
+/// [`LayoutSnapshot`].
+///
+/// The JSON strings arrive from the relay reader thread via the
+/// `RelayControl::QueryLayout` oneshot channel: they are the raw JSON payloads
+/// from `Action::ListTabs` and `Action::ListPanes` Log replies captured over the
+/// relay's existing persistent connection.
+///
+/// **P1.03 TODO:** when the relay is converted to produce neutral
+/// [`crate::multiplexer::MuxServerMsg`] messages directly (P1.03), this helper
+/// and the remaining `zellij_utils` imports in this file can be removed.
+fn parse_relay_json(tabs_json: &str, panes_json: &str) -> Result<LayoutSnapshot, Status> {
+    use std::collections::HashMap;
+    use zellij_utils::data::{ListPanesResponse, ListTabsResponse};
+
+    // On parse failure keep the serde detail + payload size in the server log
+    // only; return a generic Status so neither the internal error nor the
+    // (potentially large, cwd/command-bearing) layout JSON leaks to the client.
+    let tabs: ListTabsResponse = serde_json::from_str(tabs_json).map_err(|e| {
+        log::warn!(
+            "GetLayout: failed to parse relay ListTabs JSON ({}B): {e}",
+            tabs_json.len()
+        );
+        Status::internal("failed to parse layout response from session")
+    })?;
+
+    let panes: ListPanesResponse = serde_json::from_str(panes_json).map_err(|e| {
+        log::warn!(
+            "GetLayout: failed to parse relay ListPanes JSON ({}B): {e}",
+            panes_json.len()
+        );
+        Status::internal("failed to parse layout response from session")
+    })?;
+
+    // Group panes by tab_id, preserving ListPanes order. Plugin panes are
+    // INCLUDED here (the gRPC layer applies the client-visibility filter at the
+    // proto-build stage above); the snapshot is the raw layout.
+    let mut panes_by_tab: HashMap<usize, Vec<PaneSnapshot>> = HashMap::new();
+    for entry in panes {
+        let p = &entry.pane_info;
+        let snap = PaneSnapshot {
+            id: p.id,
+            title: p.title.clone(),
+            is_focused: p.is_focused,
+            is_floating: p.is_floating,
+            exited: p.exited,
+            command: entry.pane_command.unwrap_or_default(),
+            cwd: entry.pane_cwd.unwrap_or_default(),
+            x: p.pane_x as u32,
+            y: p.pane_y as u32,
+            rows: p.pane_rows as u32,
+            cols: p.pane_columns as u32,
+            is_plugin: p.is_plugin,
+            is_fullscreen: p.is_fullscreen,
+        };
+        panes_by_tab.entry(entry.tab_id).or_default().push(snap);
+    }
+
+    let tabs_snap: Vec<TabSnapshot> = tabs
+        .into_iter()
+        .map(|tab| TabSnapshot {
+            tab_id: tab.tab_id as u64,
+            position: tab.position as u32,
+            name: tab.name,
+            active: tab.active,
+            has_bell: tab.has_bell_notification,
+            panes_to_hide: tab.panes_to_hide as u32,
+            fullscreen_active: tab.is_fullscreen_active,
+            floating_panes_visible: tab.are_floating_panes_visible,
+            panes: panes_by_tab.remove(&tab.tab_id).unwrap_or_default(),
+        })
+        .collect();
+
+    Ok(LayoutSnapshot { tabs: tabs_snap })
 }
 
 #[cfg(test)]

@@ -8,8 +8,8 @@ use crate::proto::{
     TokenInfo, TokenList, VersionInfo,
 };
 
-use super::SERVER_VERSION;
 use super::MuxrService;
+use super::SERVER_VERSION;
 use super::helpers::reject_if_read_only;
 
 impl MuxrService {

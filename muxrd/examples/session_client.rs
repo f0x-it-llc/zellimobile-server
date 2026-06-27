@@ -24,16 +24,16 @@
 //! Default addr: https://[::1]:50051 ; default session: d2demo.
 
 use anyhow::{Context, Result};
+use muxrd::proto::muxr_client::MuxrClient;
+use muxrd::proto::{
+    CreateSessionReq, Empty, LoginRequest, NewTabReq, PaneTarget, RenameSessionReq, RenameTabReq,
+    ScrollDirection, ScrollReq, SessionRef, TabTarget,
+};
 use tonic::transport::Channel;
 use tonic::{
     Request,
     metadata::MetadataValue,
     transport::{Certificate, ClientTlsConfig},
-};
-use muxrd::proto::muxr_client::MuxrClient;
-use muxrd::proto::{
-    CreateSessionReq, Empty, LoginRequest, NewTabReq, PaneTarget, RenameSessionReq, RenameTabReq,
-    ScrollDirection, ScrollReq, SessionRef, TabTarget,
 };
 
 // ─── Args ─────────────────────────────────────────────────────────────────────

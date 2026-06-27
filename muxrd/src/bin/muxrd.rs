@@ -27,7 +27,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
 use muxrd::auth::BearerAuthLayer;
 use muxrd::cli::{Cli, Command, InitArgs, StartArgs};
 use muxrd::config::{self, CertSource, check_h2c_bind_safety};
@@ -35,6 +34,7 @@ use muxrd::control::{self, ControlRequest, ControlResponse};
 use muxrd::grpc::MuxrService;
 use muxrd::proto::muxr_server::MuxrServer;
 use muxrd::tls::SanEntry;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 /// Pidfile name inside the data dir.
 const PIDFILE_NAME: &str = "muxrd.pid";
@@ -266,9 +266,12 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
 
     // Use the same cert-source resolution as `cmd_start` (env fallbacks +
     // precedence + mutual-exclusion validation — no hand-rolled match here).
-    let cert_source =
-        config::resolve_cert_source(args.tls_cert.clone(), args.tls_key.clone(), args.insecure_h2c)
-            .context("invalid TLS cert configuration")?;
+    let cert_source = config::resolve_cert_source(
+        args.tls_cert.clone(),
+        args.tls_key.clone(),
+        args.insecure_h2c,
+    )
+    .context("invalid TLS cert configuration")?;
 
     match &cert_source {
         CertSource::External { cert, key } => {
@@ -299,7 +302,10 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
                 .copied()
                 .chain(extra_desc.iter().map(String::as_str))
                 .collect();
-            println!("Cert SANs: {} (note: external cert SANs are fixed by the issuer)", all_sans.join(", "));
+            println!(
+                "Cert SANs: {} (note: external cert SANs are fixed by the issuer)",
+                all_sans.join(", ")
+            );
         }
         CertSource::H2c => {
             // No cert needed — plaintext h2c delegates TLS to the proxy.
@@ -321,9 +327,8 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
         }
         CertSource::SelfSigned => {
             // Load or generate the self-signed cert+key (idempotent w.r.t. SANs).
-            let (_identity, _cert_pem) =
-                muxrd::tls::load_or_generate_identity(&extra_sans)
-                    .context("failed to load/generate TLS certificate")?;
+            let (_identity, _cert_pem) = muxrd::tls::load_or_generate_identity(&extra_sans)
+                .context("failed to load/generate TLS certificate")?;
 
             // Print the cert file path.
             let cert_path = data_dir.join("server.crt");
@@ -493,9 +498,12 @@ fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
         .with_context(|| format!("invalid bind address '{}'", cfg.bind_addr))?;
 
     // Resolve cert source from CLI args (applies precedence: h2c > external > self-signed).
-    let cert_source =
-        config::resolve_cert_source(args.tls_cert.clone(), args.tls_key.clone(), args.insecure_h2c)
-            .context("invalid TLS cert configuration")?;
+    let cert_source = config::resolve_cert_source(
+        args.tls_cert.clone(),
+        args.tls_key.clone(),
+        args.insecure_h2c,
+    )
+    .context("invalid TLS cert configuration")?;
 
     // Resolve the h2c non-loopback acknowledgement (CLI flag OR env var).
     let h2c_allow_public = args.h2c_allow_public || {
@@ -607,14 +615,13 @@ fn cert_identity(
             Ok(Some(pair))
         }
         CertSource::External { cert, key } => {
-            let pair = muxrd::tls::load_external_identity(cert, key)
-                .with_context(|| {
-                    format!(
-                        "failed to load external TLS cert '{}' and key '{}'",
-                        cert.display(),
-                        key.display()
-                    )
-                })?;
+            let pair = muxrd::tls::load_external_identity(cert, key).with_context(|| {
+                format!(
+                    "failed to load external TLS cert '{}' and key '{}'",
+                    cert.display(),
+                    key.display()
+                )
+            })?;
             log::info!(
                 "tls: using external certificate '{}' with key '{}'",
                 cert.display(),
@@ -702,9 +709,7 @@ async fn serve(
     // URI path — it can distinguish Login/GetVersion from AttachTerminal.
     let mut builder = Server::builder();
     if let Some(tls) = maybe_tls {
-        builder = builder
-            .tls_config(tls)
-            .context("failed to configure TLS")?;
+        builder = builder.tls_config(tls).context("failed to configure TLS")?;
     }
     builder
         .layer(BearerAuthLayer)
@@ -729,8 +734,15 @@ mod tests {
     fn cert_identity_h2c_returns_none() {
         // No crypto provider needed — h2c returns before touching TLS.
         let result = cert_identity(&CertSource::H2c, &[]);
-        assert!(result.is_ok(), "cert_identity(H2c) should not error: {:?}", result.err());
-        assert!(result.unwrap().is_none(), "cert_identity(H2c) must return None");
+        assert!(
+            result.is_ok(),
+            "cert_identity(H2c) should not error: {:?}",
+            result.err()
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "cert_identity(H2c) must return None"
+        );
     }
 
     /// `cert_identity` for SelfSigned must return `Some` with a non-empty cert PEM.
@@ -825,9 +837,7 @@ fn cmd_stop() -> Result<()> {
                 // is read from our own pidfile.
                 let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
                 if rc == 0 {
-                    println!(
-                        "muxrd: sent SIGTERM to pid {pid} (control socket was unresponsive)."
-                    );
+                    println!("muxrd: sent SIGTERM to pid {pid} (control socket was unresponsive).");
                 } else {
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::ESRCH) {

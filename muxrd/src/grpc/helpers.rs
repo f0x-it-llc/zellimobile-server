@@ -2,7 +2,8 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::actions::{self, ActionAck};
+use crate::actions::ActionAck;
+use crate::multiplexer::PaneRef;
 use crate::proto::{ActionAck as ProtoAck, PaneTarget, TabTarget};
 
 // ─── Control routing ──────────────────────────────────────────────────────────
@@ -161,38 +162,6 @@ pub fn validate_layout_name(layout: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// Fetch tabs JSON and panes JSON via the original ephemeral-AttachClient path.
-///
-/// Each query opens its own short-lived IPC connection. Used by `get_layout`
-/// when no relay is attached for the session (e.g. Sessions screen querying a
-/// non-active session), or as a fallback when the relay query fails/times out.
-///
-/// Returns `(tabs_json, panes_json, via_relay=false)`.
-pub(super) async fn ephemeral_query(session: &str) -> Result<(String, String, bool), Status> {
-    let session_tabs = session.to_owned();
-    let session_panes = session.to_owned();
-
-    let tabs_json =
-        tokio::task::spawn_blocking(move || crate::query::query_list_tabs_json(&session_tabs))
-            .await
-            .map_err(|e| Status::internal(format!("GetLayout tabs task panicked: {e}")))?
-            .map_err(|e| {
-                log::warn!("GetLayout tabs query failed: {e:#}");
-                Status::internal(format!("ListTabs query failed: {e:#}"))
-            })?;
-
-    let panes_json =
-        tokio::task::spawn_blocking(move || crate::query::query_list_panes_json(&session_panes))
-            .await
-            .map_err(|e| Status::internal(format!("GetLayout panes task panicked: {e}")))?
-            .map_err(|e| {
-                log::warn!("GetLayout panes query failed: {e:#}");
-                Status::internal(format!("ListPanes query failed: {e:#}"))
-            })?;
-
-    Ok((tabs_json, panes_json, false))
-}
-
 /// Run a blocking action helper on the blocking pool and map its result into a
 /// proto [`ProtoAck`].  A `LogError` ack (`ok == false`) is surfaced as an `Ok`
 /// response with `ok=false` + `error` populated (it's a logical failure, not a
@@ -222,12 +191,18 @@ where
     }))
 }
 
-/// Validate a [`PaneTarget`] (non-empty session) and map it to `(session, PaneId)`.
-pub(super) fn resolve_pane_target(
-    target: &PaneTarget,
-) -> Result<(String, zellij_utils::data::PaneId), Status> {
+/// Validate a [`PaneTarget`] (non-empty session) and map it to `(session, PaneRef)`.
+///
+/// The neutral [`PaneRef`] carries the same `(id, is_plugin)` pair as the proto
+/// `PaneTarget`. Callers that pass the result to a [`crate::relay::RelayControl`]
+/// variant (which still uses `zellij_utils::data::PaneId` until P1.03) must
+/// convert locally via `crate::actions::pane_id_from_target(pr.id, pr.is_plugin)`.
+pub(super) fn resolve_pane_target(target: &PaneTarget) -> Result<(String, PaneRef), Status> {
     validate_session(&target.session)?;
-    let pane = actions::pane_id_from_target(target.pane_id, target.is_plugin);
+    let pane = PaneRef {
+        id: target.pane_id,
+        is_plugin: target.is_plugin,
+    };
     Ok((target.session.clone(), pane))
 }
 

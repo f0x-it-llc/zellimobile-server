@@ -64,10 +64,8 @@ pub struct MuxrService {
     /// The terminal-multiplexer backend (Phase 1 seam). Today a `ZellijBackend`;
     /// Phase 2 adds a herdr backend behind the same `MuxBackend` trait.
     ///
-    /// Constructed here so the seam is real, but NOT yet read by any handler —
-    /// P1.02 reroutes the ephemeral handlers through it and P1.03 drives the
-    /// relay off `backend.open_attach()`. Cheap to clone (`Arc`).
-    #[allow(dead_code)]
+    /// Used by all ephemeral gRPC handlers (P1.02). P1.03 drives the relay off
+    /// `backend.open_attach()`. Cheap to clone (`Arc`).
     backend: std::sync::Arc<dyn crate::multiplexer::MuxBackend>,
 }
 

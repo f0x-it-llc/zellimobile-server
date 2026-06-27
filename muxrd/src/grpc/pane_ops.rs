@@ -3,7 +3,7 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::actions::{self, ScrollDir};
+use crate::multiplexer::{ResizeDir, ResizeKind as NeutralResizeKind, ScrollDir};
 use crate::proto::{
     ActionAck as ProtoAck, NewPaneReq, PaneTarget, RenamePaneReq, ResizeKind, ResizePaneReq,
     ScrollDirection, ScrollReq, ToggleFullscreenReq, WriteToPaneReq,
@@ -46,8 +46,9 @@ impl MuxrService {
             req.data.len()
         );
         let data = req.data;
+        let backend = self.backend.clone();
         run_action("WriteToPane", move || {
-            actions::write_to_pane(&session, pane, data)
+            backend.write_to_pane(&session, pane, data)
         })
         .await
     }
@@ -65,16 +66,21 @@ impl MuxrService {
         // Route through the live relay client if attached, so focus applies to
         // the rendering client (and re-points the single-pane sub).
         // connection_id targets the exact relay that sent the request.
+        //
+        // RelayControl::FocusPane still takes zellij PaneId (changed in P1.03);
+        // convert PaneRef → PaneId locally.
+        let pane_id_for_relay = crate::actions::pane_id_from_target(pane.id, pane.is_plugin);
         if let Some(resp) = try_route_control(
             &self.control,
             &session,
             &connection_id,
-            crate::relay::RelayControl::FocusPane(pane),
+            crate::relay::RelayControl::FocusPane(pane_id_for_relay),
         ) {
             log::info!("FocusPane: routed via relay client (session='{session}')");
             return Ok(resp);
         }
-        run_action("FocusPane", move || actions::focus_pane(&session, pane)).await
+        let backend = self.backend.clone();
+        run_action("FocusPane", move || backend.focus_pane(&session, pane)).await
     }
 
     /// Close a specific pane. MUTATING (read-only rejected).
@@ -86,7 +92,8 @@ impl MuxrService {
         let target = request.into_inner();
         let (session, pane) = resolve_pane_target(&target)?;
         log::info!("ClosePane: session='{session}' pane={pane:?}");
-        run_action("ClosePane", move || actions::close_pane(&session, pane)).await
+        let backend = self.backend.clone();
+        run_action("ClosePane", move || backend.close_pane(&session, pane)).await
     }
 
     /// Open a new pane; the new pane id surfaces in `ActionAck.info`. MUTATING.
@@ -105,8 +112,9 @@ impl MuxrService {
             Some(req.pane_name)
         };
         log::info!("NewPane: session='{session}' floating={floating} name={pane_name:?}");
+        let backend = self.backend.clone();
         run_action("NewPane", move || {
-            actions::new_pane(&session, floating, pane_name)
+            backend.new_pane(&session, floating, pane_name)
         })
         .await
     }
@@ -124,8 +132,9 @@ impl MuxrService {
         let (session, pane) = resolve_pane_target(&target)?;
         let name = req.name;
         log::info!("RenamePane: session='{session}' pane={pane:?} name='{name}'");
+        let backend = self.backend.clone();
         run_action("RenamePane", move || {
-            actions::rename_pane(&session, pane, name)
+            backend.rename_pane(&session, pane, name)
         })
         .await
     }
@@ -142,24 +151,26 @@ impl MuxrService {
             .ok_or_else(|| Status::invalid_argument("ResizePane: target is required"))?;
         let (session, pane) = resolve_pane_target(&target)?;
 
-        use zellij_utils::data::{Direction, Resize};
-        let resize = match ResizeKind::try_from(req.resize) {
-            Ok(ResizeKind::Decrease) => Resize::Decrease,
-            _ => Resize::Increase,
+        // Convert proto ResizeKind → neutral ResizeKind.
+        let resize_kind = match ResizeKind::try_from(req.resize) {
+            Ok(ResizeKind::Decrease) => NeutralResizeKind::Decrease,
+            _ => NeutralResizeKind::Increase,
         };
         // ResizeDirection: 0 = UNSPECIFIED → None (uniform resize).
-        let direction = match req.direction {
-            1 => Some(Direction::Left),
-            2 => Some(Direction::Right),
-            3 => Some(Direction::Up),
-            4 => Some(Direction::Down),
+        let resize_dir: Option<ResizeDir> = match req.direction {
+            1 => Some(ResizeDir::Left),
+            2 => Some(ResizeDir::Right),
+            3 => Some(ResizeDir::Up),
+            4 => Some(ResizeDir::Down),
             _ => None,
         };
         log::info!(
-            "ResizePane: session='{session}' pane={pane:?} resize={resize:?} dir={direction:?}"
+            "ResizePane: session='{session}' pane={pane:?} resize={resize_kind:?} \
+             dir={resize_dir:?}"
         );
+        let backend = self.backend.clone();
         run_action("ResizePane", move || {
-            actions::resize_pane(&session, pane, resize, direction)
+            backend.resize_pane(&session, pane, resize_kind, resize_dir)
         })
         .await
     }
@@ -173,8 +184,9 @@ impl MuxrService {
         let target = request.into_inner();
         let (session, pane) = resolve_pane_target(&target)?;
         log::info!("TogglePaneFloating: session='{session}' pane={pane:?}");
+        let backend = self.backend.clone();
         run_action("TogglePaneFloating", move || {
-            actions::toggle_pane_floating(&session, pane)
+            backend.toggle_pane_floating(&session, pane)
         })
         .await
     }
@@ -215,17 +227,25 @@ impl MuxrService {
         // Route through the live relay client if attached so the fullscreen
         // toggle applies to the *rendering* client (is_cli_client:false).
         // connection_id targets the exact relay that sent the request.
+        //
+        // RelayControl::ToggleFullscreen still takes zellij PaneId (changed in
+        // P1.03); convert PaneRef → PaneId locally.
+        let pane_id_for_relay = crate::actions::pane_id_from_target(pane.id, pane.is_plugin);
         if let Some(resp) = try_route_control(
             &self.control,
             &session,
             &connection_id,
-            crate::relay::RelayControl::ToggleFullscreen { pane, hint },
+            crate::relay::RelayControl::ToggleFullscreen {
+                pane: pane_id_for_relay,
+                hint,
+            },
         ) {
             log::info!("TogglePaneFullscreen: routed via relay client (session='{session}')");
             return Ok(resp);
         }
+        let backend = self.backend.clone();
         run_action("TogglePaneFullscreen", move || {
-            actions::toggle_pane_fullscreen(&session, pane)
+            backend.toggle_pane_fullscreen(&session, pane)
         })
         .await
     }
@@ -255,8 +275,9 @@ impl MuxrService {
             _ => ScrollDir::Up,
         };
         log::info!("ScrollPane: session='{session}' pane={pane:?} dir={dir:?}");
+        let backend = self.backend.clone();
         run_action("ScrollPane", move || {
-            actions::scroll_pane(&session, pane, dir)
+            backend.scroll_pane(&session, pane, dir)
         })
         .await
     }

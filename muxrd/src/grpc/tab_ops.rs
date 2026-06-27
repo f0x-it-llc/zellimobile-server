@@ -2,7 +2,6 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::actions;
 use crate::proto::{ActionAck as ProtoAck, NewTabReq, RenameTabReq, TabTarget};
 
 use super::MuxrService;
@@ -28,7 +27,8 @@ impl MuxrService {
             Some(req.tab_name)
         };
         log::info!("NewTab: session='{session}' name={tab_name:?}");
-        run_action("NewTab", move || actions::new_tab(&session, tab_name)).await
+        let backend = self.backend.clone();
+        run_action("NewTab", move || backend.new_tab(&session, tab_name)).await
     }
 
     /// Close a tab by id. MUTATING (read-only rejected).
@@ -40,7 +40,8 @@ impl MuxrService {
         let req = request.into_inner();
         let (session, tab_id) = resolve_tab_target(&req)?;
         log::info!("CloseTab: session='{session}' tab_id={tab_id}");
-        run_action("CloseTab", move || actions::close_tab(&session, tab_id)).await
+        let backend = self.backend.clone();
+        run_action("CloseTab", move || backend.close_tab(&session, tab_id)).await
     }
 
     /// Switch focus to a tab by id. MUTATING (read-only rejected).
@@ -66,7 +67,8 @@ impl MuxrService {
             log::info!("GoToTab: routed via relay client (session='{session}', tab_id={tab_id})");
             return Ok(resp);
         }
-        run_action("GoToTab", move || actions::go_to_tab(&session, tab_id)).await
+        let backend = self.backend.clone();
+        run_action("GoToTab", move || backend.go_to_tab(&session, tab_id)).await
     }
 
     /// Rename a tab by id. MUTATING (read-only rejected).
@@ -84,8 +86,9 @@ impl MuxrService {
             return Err(Status::invalid_argument("tab name must not be empty"));
         }
         log::info!("RenameTab: session='{session}' tab_id={tab_id} name='{name}'");
+        let backend = self.backend.clone();
         run_action("RenameTab", move || {
-            actions::rename_tab(&session, tab_id, name)
+            backend.rename_tab(&session, tab_id, name)
         })
         .await
     }

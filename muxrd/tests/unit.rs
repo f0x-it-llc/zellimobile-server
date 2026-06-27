@@ -267,8 +267,8 @@ fn parse_version_standard() {
 
 #[test]
 fn san_entry_parse_ipv4() {
-    use std::net::{IpAddr, Ipv4Addr};
     use muxrd::tls::SanEntry;
+    use std::net::{IpAddr, Ipv4Addr};
     let entry = SanEntry::parse("100.64.0.5");
     assert_eq!(
         entry,
@@ -278,8 +278,8 @@ fn san_entry_parse_ipv4() {
 
 #[test]
 fn san_entry_parse_ipv6() {
-    use std::net::{IpAddr, Ipv6Addr};
     use muxrd::tls::SanEntry;
+    use std::net::{IpAddr, Ipv6Addr};
     let entry = SanEntry::parse("::1");
     assert_eq!(entry, SanEntry::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
 }
@@ -293,8 +293,8 @@ fn san_entry_parse_dns() {
 
 #[test]
 fn san_entry_parse_trims_whitespace() {
-    use std::net::{IpAddr, Ipv4Addr};
     use muxrd::tls::SanEntry;
+    use std::net::{IpAddr, Ipv4Addr};
     let entry = SanEntry::parse("  10.0.0.1  ");
     assert_eq!(entry, SanEntry::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
 }
@@ -333,8 +333,8 @@ fn san_entry_from_env_parses_comma_list() {
 fn tls_generate_includes_extra_ip_san() {
     // Generate a cert with an extra IP SAN and verify the PEM contains the
     // IP bytes by searching the DER-decoded bytes.
-    use std::net::{IpAddr, Ipv4Addr};
     use muxrd::tls::{SanEntry, generate_self_signed_pem};
+    use std::net::{IpAddr, Ipv4Addr};
 
     let ip = Ipv4Addr::new(100, 64, 0, 5);
     let extra = vec![SanEntry::Ip(IpAddr::V4(ip))];
@@ -382,8 +382,8 @@ fn tls_generate_includes_dns_san() {
 
 #[test]
 fn sidecar_covers_all_requested_when_superset() {
-    use std::net::{IpAddr, Ipv4Addr};
     use muxrd::tls::SanEntry;
+    use std::net::{IpAddr, Ipv4Addr};
 
     let stored = vec![
         SanEntry::Ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5))),
@@ -396,8 +396,8 @@ fn sidecar_covers_all_requested_when_superset() {
 
 #[test]
 fn sidecar_does_not_cover_new_san() {
-    use std::net::{IpAddr, Ipv4Addr};
     use muxrd::tls::SanEntry;
+    use std::net::{IpAddr, Ipv4Addr};
 
     let stored: Vec<SanEntry> = vec![]; // empty — no extras when cert was generated
     let requested = vec![SanEntry::Ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5)))];
