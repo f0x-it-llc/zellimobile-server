@@ -1,0 +1,116 @@
+[package]
+name = "muxrd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+publish = false
+
+# ─── Binaries ────────────────────────────────────────────────────────────────
+
+[[bin]]
+name = "muxrd"
+path = "src/bin/muxrd.rs"
+
+# ─── Examples ────────────────────────────────────────────────────────────────
+
+[[example]]
+name = "grpc_client"
+path = "examples/grpc_client.rs"
+
+[[example]]
+name = "attach_client"
+path = "examples/attach_client.rs"
+
+[[example]]
+name = "make_token"
+path = "examples/make_token.rs"
+
+[[example]]
+name = "read_client"
+path = "examples/read_client.rs"
+
+[[example]]
+name = "action_client"
+path = "examples/action_client.rs"
+
+[[example]]
+name = "session_client"
+path = "examples/session_client.rs"
+
+# ─── Runtime deps ────────────────────────────────────────────────────────────
+
+[dependencies]
+# Zellij IPC / utils — exact version so structs match the running server.
+# web_server_capability enables web_authentication_tokens (bundled SQLite via rusqlite).
+zellij-client = { version = "0.44.3", default-features = false }
+zellij-utils  = { version = "0.44.3", default-features = false, features = ["web_server_capability"] }
+
+# gRPC stack — tls-ring adds rustls/ring-backed TLS support to tonic transport.
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+# tonic-prost provides ProstCodec used by generated code (tonic 0.14 split the codec out)
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+futures = "0.3"
+
+# TLS — self-signed cert generation.  The `pem` feature exposes PEM serialisation.
+rcgen = { version = "0.14", features = ["pem"] }
+
+# SHA-256 fingerprint for TLS certificates (used by muxrctl QR pairing).
+sha2 = "0.10"
+
+# PEM decoding for cert fingerprinting (already a transitive dep via tonic/rustls).
+rustls-pemfile = "2"
+
+# Tower / HTTP primitives (re-exported by tonic but must be explicit deps for
+# the BearerAuthLayer tower middleware implementation in src/auth.rs).
+http = "1"
+http-body = "1"
+tower-layer = "0.3"
+tower-service = "0.3"
+
+# Concurrent map for the per-session attached-client counter (Phase F).
+dashmap = "6"
+
+# rustls: needed to install the ring crypto provider at startup before TLS.
+# Both ring and aws-lc-rs are pulled in transitively (via zellij-utils and
+# tonic); without an explicit default provider rustls 0.23 panics.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config serialisation
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Background daemonization (fork + setsid + pidfile + stdio redirect).
+# Called BEFORE the tokio runtime is built so the runtime lives in the child.
+daemonize = "0.5"
+
+# IPC control socket (LocalSocketStream listener at data_dir()/control.sock).
+# Same crate zellij-utils uses for session sockets; pinned to match.
+interprocess = "2.3"
+
+# Utility
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+bytes = "1"
+serde_json = "1"
+libc = "0.2"
+which = "7"
+
+# ─── Dev deps ────────────────────────────────────────────────────────────────
+
+[dev-dependencies]
+# base64 for decoding PEM certificates in unit tests (already a transitive dep).
+base64 = "0.22"
+
+# ─── Build deps ──────────────────────────────────────────────────────────────
+
+[build-dependencies]
+# tonic-prost-build was split out of tonic-build at 0.14; use it directly.
+tonic-prost-build = "0.14"

@@ -1,6 +1,6 @@
-# ZelliMobile Font Catalog
+# Muxr Font Catalog
 
-This directory contains downloadable terminal fonts for the ZelliMobile app.
+This directory contains downloadable terminal fonts for the Muxr app.
 
 The app fetches `manifest.json` at startup to discover available fonts, then
 downloads individual `.ttf` files on demand when the user selects a font in
@@ -13,8 +13,8 @@ Settings. Files are cached locally on the device after the first download.
 The app fetches files from the raw GitHub URL of this directory on the `main` branch:
 
 ```
-https://raw.githubusercontent.com/f0x-it-llc/zellimobile-server/main/fonts/manifest.json
-https://raw.githubusercontent.com/f0x-it-llc/zellimobile-server/main/fonts/<path>
+https://raw.githubusercontent.com/f0x-it-llc/muxr-core/main/fonts/manifest.json
+https://raw.githubusercontent.com/f0x-it-llc/muxr-core/main/fonts/<path>
 ```
 
 where `<path>` is the `path` field from `manifest.json` (relative to this directory).
@@ -152,7 +152,7 @@ Notes:
 4. Add the corresponding license file to `licenses/`.
 5. Run the generator:
    ```bash
-   cd zellimobile-server/fonts && ./gen_manifest.sh
+   cd muxr-core/fonts && ./gen_manifest.sh
    ```
 6. Verify:
    ```bash
@@ -164,7 +164,7 @@ Notes:
 ## Regenerating manifest.json
 
 ```bash
-cd zellimobile-server/fonts && ./gen_manifest.sh
+cd muxr-core/fonts && ./gen_manifest.sh
 ```
 
 The script is idempotent and deterministic: it scans `*.ttf` in this directory,
@@ -176,4 +176,4 @@ Run it any time after adding, removing, or replacing font files.
 ## Licenses
 
 License files for bundled fonts are in `licenses/`. See that directory for the full
-texts. Font licenses apply to the `.ttf` files only — not to the ZelliMobile app code.
+texts. Font licenses apply to the `.ttf` files only — not to the Muxr app code.

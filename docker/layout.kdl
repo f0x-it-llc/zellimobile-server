@@ -1,4 +1,4 @@
-// ZelliMobile test session layout — a realistic multi-tab / multi-pane setup so
+// Muxr test session layout — a realistic multi-tab / multi-pane setup so
 // the mobile client's session list and pane picker have interesting content.
 layout {
     tab name="editor" focus=true {

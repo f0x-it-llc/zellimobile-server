@@ -1,4 +1,4 @@
-# ZelliMobile — dev rig: zellimserver + zellimctl over SSH.
+# Muxr — dev rig: muxrd + muxrctl over SSH.
 #
 # Loopback (default — safe, nothing exposed):
 #   docker compose -f docker/compose.yaml up --build
@@ -23,25 +23,25 @@
 # Or use the helper wrapper:
 #   ./docker/run.sh --host <lan-ip>
 #
-# Then SSH in and drive it with zellimctl (a TTY is required — note the -t):
+# Then SSH in and drive it with muxrctl (a TTY is required — note the -t):
 #   ssh -t root@<host> -p 2222     # no password
-#   zellimctl                      # Configure → Cert → Tokens → Server → Pair
+#   muxrctl                      # Configure → Cert → Tokens → Server → Pair
 #
-# zellimctl starts the gRPC server on :50051; the cert is self-signed (pair by
+# muxrctl starts the gRPC server on :50051; the cert is self-signed (pair by
 # scanning the QR, or trust the PEM / use the app's insecure-dev mode).
 services:
-  zellimserver:
+  muxrd:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: zellimobile-grpc-rig
-    container_name: zellimobile-grpc-rig
+    image: muxr-grpc-rig
+    container_name: muxr-grpc-rig
     # BIND_ADDR controls which host interface the ports are published on.
     # Default 127.0.0.1 → loopback only (nothing leaves the host).
     # Set to a LAN IP to publish on the network.
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${GRPC_PORT:-50051}:50051"
-      # SSH — attach and drive zellimctl.
+      # SSH — attach and drive muxrctl.
       - "${BIND_ADDR:-127.0.0.1}:${SSH_PORT:-2222}:22"
     environment:
       SESSION: "${SESSION:-backend-dev}"
@@ -53,7 +53,7 @@ services:
       ZELLIMSERVER_SAN: "${ZELLIMSERVER_SAN:-${BIND_ADDR:-}}"
     volumes:
       # Persist token DB, cert, session state, and zellij config across restarts.
-      # zellimserver data lives under zellij's XDG share dir.
+      # muxrd data lives under zellij's XDG share dir.
       # docker compose down -v resets everything.
       - zellij-data:/root/.local/share/zellij
       - zellij-config:/root/.config/zellij

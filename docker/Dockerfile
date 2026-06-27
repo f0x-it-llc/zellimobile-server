@@ -1,17 +1,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# ZelliMobile — zellimserver gRPC backend rig
+# Muxr — muxrd gRPC backend rig
 #
 # Multi-stage build:
-#   builder  — rust:1.92-alpine, static musl binaries (zellimserver + zellimctl)
+#   builder  — rust:1.92-alpine, static musl binaries (muxrd + muxrctl)
 #   runtime  — debian:trixie-slim with full terminal tooling + zellij 0.44.3,
-#              an SSH server, and zellimctl to configure/start the server
+#              an SSH server, and muxrctl to configure/start the server
 #
 # Build context: repo root  (compose sets context: ..)
 #   docker compose -f docker/compose.yaml up --build
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 1 — builder: compile the workspace (zellimserver + zellimctl) as musl
+# Stage 1 — builder: compile the workspace (muxrd + muxrctl) as musl
 # ══════════════════════════════════════════════════════════════════════════════
 FROM rust:1.92-alpine AS builder
 
@@ -50,13 +50,13 @@ RUN apk add --no-cache \
 
 WORKDIR /build
 
-# Copy the whole Cargo workspace (zellimctl path-depends on zellimserver) so
+# Copy the whole Cargo workspace (muxrctl path-depends on muxrd) so
 # both binaries build from the same locked dependency set.
 COPY Cargo.toml Cargo.lock ./
-COPY zellimserver/ ./zellimserver/
-COPY zellimctl/ ./zellimctl/
+COPY muxrd/ ./muxrd/
+COPY muxrctl/ ./muxrctl/
 
-# Build both static release binaries (zellimserver + zellimctl).
+# Build both static release binaries (muxrd + muxrctl).
 # On rust:alpine the native target IS musl — no --target flag needed.
 # OPENSSL_STATIC=1  → openssl-sys links statically
 # PKG_CONFIG_ALL_STATIC=1 → all pkg-config deps linked statically
@@ -92,8 +92,8 @@ RUN apt-get install -y --no-install-recommends \
       cmatrix sl cowsay fortune-mod fastfetch ; \
     rm -rf /var/lib/apt/lists/*
 
-# ── Zellij PINNED v0.44.3 (the version zellimserver is compiled against) ──────
-# zellimserver refuses to start on any other version — do NOT change this.
+# ── Zellij PINNED v0.44.3 (the version muxrd is compiled against) ──────
+# muxrd refuses to start on any other version — do NOT change this.
 RUN curl -fsSL \
       https://github.com/zellij-org/zellij/releases/download/v0.44.3/zellij-x86_64-unknown-linux-musl.tar.gz \
       | tar -xz -C /usr/local/bin \
@@ -123,14 +123,14 @@ RUN mkdir -p /root/projects/api/src \
     && git -C /root/projects/api add -A \
     && git -C /root/projects/api -c user.email=test@example.com -c user.name=test commit -qm "init" || true
 
-# ── zellimserver + zellimctl binaries (static musl, from builder stage) ──────
-COPY --from=builder /build/target/release/zellimserver /usr/local/bin/zellimserver
-COPY --from=builder /build/target/release/zellimctl /usr/local/bin/zellimctl
-RUN chmod +x /usr/local/bin/zellimserver /usr/local/bin/zellimctl
+# ── muxrd + muxrctl binaries (static musl, from builder stage) ──────
+COPY --from=builder /build/target/release/muxrd /usr/local/bin/muxrd
+COPY --from=builder /build/target/release/muxrctl /usr/local/bin/muxrctl
+RUN chmod +x /usr/local/bin/muxrd /usr/local/bin/muxrctl
 
 # Bind on all interfaces by default so the gRPC server is reachable through the
 # published port. The Docker port mapping (compose) still gates host exposure;
-# override per-run via zellimctl's Configure screen or ZELLIMSERVER_BIND.
+# override per-run via muxrctl's Configure screen or ZELLIMSERVER_BIND.
 #
 # ZELLIMSERVER_SAN — comma-separated extra SANs to include in the self-signed
 # TLS cert (e.g. a tailnet or LAN IP that is not a local interface inside the
@@ -139,7 +139,7 @@ RUN chmod +x /usr/local/bin/zellimserver /usr/local/bin/zellimctl
 ENV ZELLIMSERVER_BIND=0.0.0.0:50051
 
 # ── SSH access (dev rig) ─────────────────────────────────────────────────────
-# Passwordless root login over SSH so you can attach and drive zellimctl. Host
+# Passwordless root login over SSH so you can attach and drive muxrctl. Host
 # keys are generated at build time; the entrypoint clears root's password so no
 # credential is needed. This is a dev/test affordance — see the security note.
 RUN ssh-keygen -A \
@@ -150,10 +150,10 @@ RUN ssh-keygen -A \
 
 WORKDIR /root
 
-COPY docker/layout.kdl /root/.config/zellij/layouts/zellimobile.kdl
+COPY docker/layout.kdl /root/.config/zellij/layouts/muxr.kdl
 # Managed zellij config (disables the zellij:link background plugin). Staged at an
 # image path; entrypoint.sh installs it into the persisted config volume on boot.
-COPY docker/config.kdl /usr/local/share/zellimobile/config.kdl
+COPY docker/config.kdl /usr/local/share/muxr/config.kdl
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
