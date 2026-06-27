@@ -7,10 +7,11 @@ use crate::proto::{
     SessionRef,
 };
 
+use crate::multiplexer::{make_id, validate_session};
+
 use super::MuxrService;
 use super::helpers::{
-    kind_from_proto, make_id, proto_backend, reject_if_read_only, run_action, validate_layout_name,
-    validate_session,
+    kind_from_proto, proto_backend, reject_if_read_only, run_action, validate_layout_name,
 };
 
 impl MuxrService {
@@ -216,9 +217,12 @@ impl MuxrService {
                 sole.expect("BackendSet invariant: at least one backend")
             }
         };
+        // Error-code mapping (matches `resolve_session` — see `multiplexer::routing`):
+        //   recognised kind but not running on this server → NotFound (client re-lists).
         let backend = self.backends.get(kind).cloned().ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "CreateSession: backend '{kind}' is not running on this server"
+            Status::not_found(format!(
+                "CreateSession: backend '{kind}' is recognised but not running on this \
+                 server — re-list to see available backends"
             ))
         })?;
 

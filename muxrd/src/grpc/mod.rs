@@ -66,11 +66,12 @@ pub struct MuxrService {
     /// Phase 3 multi-backend). Holds **every** detected backend (zellij and/or
     /// herdr) behind the same `MuxBackend` trait, in detection order.
     ///
-    /// Session-scoped handlers route to the owning backend via
-    /// [`MuxrService::resolve_session`] (Option C id routing, T04). Only the two
-    /// not-yet-id-routed enumerating RPCs (`ListSessions`/`CreateSession`) still
-    /// use the [`MuxrService::backend`] primary shim, pending T05. Cheap to clone
-    /// (`Arc`s).
+    /// Session-scoped RPCs resolve the owning backend via
+    /// [`MuxrService::resolve_session`] (Option C id routing, `multiplexer::routing`).
+    /// `ListSessions` fans out to all backends in iteration order; `CreateSession`
+    /// selects the backend directly from the proto `backend` field (or defaults to
+    /// the sole backend when `BACKEND_UNSPECIFIED`). No `backend()` shim exists.
+    /// Cheap to clone (`Arc`s).
     backends: crate::multiplexer::BackendSet,
 }
 
@@ -137,13 +138,13 @@ impl MuxrService {
     /// Every **session-scoped** RPC routes through this: it replaces the old
     /// blanket `backend()` (primary) shim so a request lands on the backend that
     /// actually owns the session, in a simultaneous multi-backend deploy. See
-    /// [`helpers::resolve_session`] for the wire format, error mapping, back-compat
-    /// (legacy bare-name) fallback, and the bare-name validation invariant.
+    /// [`crate::multiplexer::resolve_session`] for the wire format, error mapping,
+    /// back-compat (legacy bare-name) fallback, and the bare-name validation invariant.
     fn resolve_session(
         &self,
         id: &str,
     ) -> Result<(std::sync::Arc<dyn crate::multiplexer::MuxBackend>, String), Status> {
-        helpers::resolve_session(&self.backends, id)
+        crate::multiplexer::resolve_session(&self.backends, id)
     }
 
     /// Returns a clone of the per-session attached-client registry.

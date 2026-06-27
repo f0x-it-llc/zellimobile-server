@@ -192,7 +192,7 @@ pub async fn attach_relay(
     // unvalidated — this tightens it).
     let id = attach.session.clone();
     let (backend_kind, backend, session) =
-        crate::grpc::helpers::resolve_session_kind(&backends, &id)?;
+        crate::multiplexer::resolve_session_kind(&backends, &id)?;
 
     // ── Carried T04 fix: backend-qualified client-count key ──────────────────
     // The relay's connected-client count must bucket by the SAME opaque id that
@@ -202,7 +202,7 @@ pub async fn attach_relay(
     // Canonicalize here (rather than reusing the raw client-sent `id`) so a legacy
     // bare-name attach on a single-backend server still lands in the same bucket
     // the canonical `make_id`-keyed `ListSessions` reads.
-    let count_key = crate::grpc::helpers::make_id(backend_kind, &session);
+    let count_key = crate::multiplexer::make_id(backend_kind, &session);
 
     // ── 1b. Major A (round-2): read-only attaches must NOT drive geometry ────
     //
