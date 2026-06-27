@@ -6,7 +6,6 @@ use crate::multiplexer::{LayoutSnapshot, MuxBackend};
 use crate::proto::{Layout, PaneMsg, SessionRef, TabMsg};
 
 use super::MuxrService;
-use super::helpers::validate_session;
 
 /// Timeout for the oneshot reply when routing a `QueryLayout` through the relay.
 ///
@@ -26,9 +25,13 @@ impl MuxrService {
         request: Request<SessionRef>,
     ) -> Result<Response<Layout>, Status> {
         let req = request.into_inner();
+        // Option C: `session` is the opaque routing id the client echoes — used as
+        // the relay-registry lookup key (`entry.session == session`). `resolve_session`
+        // strips it to the owning backend + bare name (validated) for the ephemeral
+        // query path.
         let session = req.session;
         let connection_id = req.connection_id;
-        validate_session(&session)?;
+        let (backend, bare) = self.resolve_session(&session)?;
         log::info!("GetLayout: session='{session}' connection_id='{connection_id}'");
 
         // ── B-QUERY: route through relay if one is attached ─────────────────
@@ -108,7 +111,7 @@ impl MuxrService {
                                 "GetLayout: relay query/parse failed for '{session}', \
                                  falling back to ephemeral: {e:#}"
                             );
-                            let snap = backend_query_layout(self.backend(), &session).await?;
+                            let snap = backend_query_layout(&backend, &bare).await?;
                             (snap, false, String::new())
                         }
                         Ok(Err(_cancelled)) => {
@@ -116,7 +119,7 @@ impl MuxrService {
                                 "GetLayout: relay query oneshot cancelled for '{session}', \
                                  falling back to ephemeral"
                             );
-                            let snap = backend_query_layout(self.backend(), &session).await?;
+                            let snap = backend_query_layout(&backend, &bare).await?;
                             (snap, false, String::new())
                         }
                         Err(_elapsed) => {
@@ -124,7 +127,7 @@ impl MuxrService {
                                 "GetLayout: relay query timed out for '{session}' \
                                  after {RELAY_QUERY_TIMEOUT:?}, falling back to ephemeral"
                             );
-                            let snap = backend_query_layout(self.backend(), &session).await?;
+                            let snap = backend_query_layout(&backend, &bare).await?;
                             (snap, false, String::new())
                         }
                     }
@@ -134,13 +137,13 @@ impl MuxrService {
                         "GetLayout: relay sender closed for '{session}', \
                          falling back to ephemeral"
                     );
-                    let snap = backend_query_layout(self.backend(), &session).await?;
+                    let snap = backend_query_layout(&backend, &bare).await?;
                     (snap, false, String::new())
                 }
             } else {
                 // No relay attached for this session — use the ephemeral backend path.
                 log::debug!("GetLayout: no relay for '{session}', using ephemeral query");
-                let snap = backend_query_layout(self.backend(), &session).await?;
+                let snap = backend_query_layout(&backend, &bare).await?;
                 (snap, false, String::new())
             }
         };

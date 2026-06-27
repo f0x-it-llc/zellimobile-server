@@ -123,7 +123,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Status, Streaming};
 
-use crate::multiplexer::MuxBackend;
+use crate::multiplexer::BackendSet;
 use crate::proto::{ClientFrame, ServerFrame, client_frame};
 
 mod helpers;
@@ -161,7 +161,7 @@ pub async fn attach_relay(
     clients: crate::client_count::SessionClients,
     control: ControlRegistry,
     view_state: ViewStateRegistry,
-    backend: Arc<dyn MuxBackend>,
+    backends: BackendSet,
 ) -> Result<ServerFrameStream, Status> {
     // ── 1. First frame must be AttachReq ────────────────────────────────────
     let first = inbound
@@ -182,7 +182,16 @@ pub async fn attach_relay(
 
     let client_rows = clamp_dim(attach.rows, 24);
     let client_cols = clamp_dim(attach.cols, 80);
-    let session = attach.session.clone();
+
+    // ── 1a. Option C: resolve the opaque session id → owning backend + bare name.
+    // The id is `<backend>:<bare>` (e.g. `zellij:dev`); the client echoes the SAME
+    // id in later unary RPCs, so the *id* is what we store in the control / view-
+    // state registries (registry match stays id-vs-id), while the *bare* name is
+    // what we hand the backend for the size query / attach. `resolve_session` runs
+    // the path-traversal guard on the bare name (the attach path was previously
+    // unvalidated — this tightens it).
+    let id = attach.session.clone();
+    let (backend, session) = crate::grpc::helpers::resolve_session(&backends, &id)?;
 
     // ── 1b. Major A (round-2): read-only attaches must NOT drive geometry ────
     //
@@ -236,7 +245,7 @@ pub async fn attach_relay(
 
     // ── 2. Open the attach via the backend (blocking but cheap: connect +
     //       handshake), yielding a neutral DualHandle of boxed sender/receiver. ─
-    let attach_session = attach.session.clone();
+    let attach_session = session.clone();
     let open_backend = backend.clone();
     let handle = tokio::task::spawn_blocking(move || {
         open_backend.open_attach(&attach_session, rows, cols, read_only)
@@ -347,7 +356,9 @@ pub async fn attach_relay(
         let init_session = session_name.clone();
         let view_state_init = view_state.clone();
         let conn_id = connection_id.clone();
-        let session_for_entry = session_name.clone();
+        // Option C: the registry stores the opaque *id* the client echoes (not the
+        // bare name) so `entry.session == req.session` stays an id-vs-id match.
+        let session_for_entry = id.clone();
         let init_backend = backend.clone();
         let init_result = tokio::task::spawn_blocking(move || {
             helpers::init_relay_view_state(&init_backend, &init_session)
@@ -393,7 +404,9 @@ pub async fn attach_relay(
     control.insert(
         connection_id.clone(),
         ControlEntry {
-            session: session_name.clone(),
+            // Option C: store the opaque id the client echoes (registry match stays
+            // id-vs-id); the bare `session_name` is only for backend calls / counts.
+            session: id.clone(),
             sender: ctrl_tx.clone(),
             read_only,
         },

@@ -66,10 +66,11 @@ pub struct MuxrService {
     /// Phase 3 multi-backend). Holds **every** detected backend (zellij and/or
     /// herdr) behind the same `MuxBackend` trait, in detection order.
     ///
-    /// Used by all ephemeral gRPC handlers (P1.02) and the relay (P1.03) via the
-    /// [`MuxrService::backend`] shim, which routes through
-    /// [`BackendSet::primary`](crate::multiplexer::BackendSet::primary) for now.
-    /// T04 replaces the shim with per-session id routing. Cheap to clone (`Arc`s).
+    /// Session-scoped handlers route to the owning backend via
+    /// [`MuxrService::resolve_session`] (Option C id routing, T04). Only the two
+    /// not-yet-id-routed enumerating RPCs (`ListSessions`/`CreateSession`) still
+    /// use the [`MuxrService::backend`] primary shim, pending T05. Cheap to clone
+    /// (`Arc`s).
     backends: crate::multiplexer::BackendSet,
 }
 
@@ -130,12 +131,29 @@ impl MuxrService {
         }
     }
 
-    /// Temporary single-backend accessor: returns the set's
-    /// [`primary`](crate::multiplexer::BackendSet::primary) backend.
+    /// Resolve an opaque session `id` (`"<backend>:<bare>"`) to the backend that
+    /// owns it plus the bare session name to pass that backend (Option C routing).
     ///
-    // TODO(T04): replace with `resolve_session(id)` routing so each handler
-    // targets the backend that actually owns the session, instead of always the
-    // primary. The ephemeral handlers + relay call this until then.
+    /// Every **session-scoped** RPC routes through this: it replaces the old
+    /// blanket `backend()` (primary) shim so a request lands on the backend that
+    /// actually owns the session, in a simultaneous multi-backend deploy. See
+    /// [`helpers::resolve_session`] for the wire format, error mapping, back-compat
+    /// (legacy bare-name) fallback, and the bare-name validation invariant.
+    fn resolve_session(
+        &self,
+        id: &str,
+    ) -> Result<(std::sync::Arc<dyn crate::multiplexer::MuxBackend>, String), Status> {
+        helpers::resolve_session(&self.backends, id)
+    }
+
+    /// Primary-backend accessor for the two **not-yet-id-routed** session-enumerating
+    /// RPCs only: `ListSessions` and `CreateSession`.
+    ///
+    /// These are not session-scoped (no incoming `id` to route on): `ListSessions`
+    /// will fan out across **all** backends and `CreateSession` will pick a target
+    /// backend — both are T05's job. Until then they run against
+    /// [`primary`](crate::multiplexer::BackendSet::primary). Every other handler
+    /// routes through [`MuxrService::resolve_session`]; do not add new callers here.
     fn backend(&self) -> &std::sync::Arc<dyn crate::multiplexer::MuxBackend> {
         self.backends.primary()
     }

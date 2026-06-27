@@ -92,6 +92,10 @@ impl MuxrService {
             .map(|t| t.0.clone());
 
         let inbound = request.into_inner();
+        // Option C: the relay resolves the opaque session id in the first
+        // `AttachReq` frame against the whole backend set (the id isn't known
+        // until that frame is read), so pass the full set rather than a single
+        // primary backend.
         let stream = crate::relay::attach_relay(
             inbound,
             read_only,
@@ -99,7 +103,7 @@ impl MuxrService {
             self.clients.clone(),
             self.control.clone(),
             self.view_state.clone(),
-            self.backend().clone(),
+            self.backends.clone(),
         )
         .await?;
         Ok(Response::new(stream))
@@ -114,13 +118,13 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "RenameSession")?;
         let req = request.into_inner();
-        validate_session(&req.session)?;
+        let (backend, session) = self.resolve_session(&req.session)?;
         // The new name becomes a session name too — validate it the same way.
+        // (It is a bare name, not an opaque id: the renamed session stays on the
+        // same backend, so only the bare name is supplied/validated here.)
         validate_session(&req.name)?;
-        let session = req.session;
         let new_name = req.name;
         log::info!("RenameSession: session='{session}' → '{new_name}'");
-        let backend = self.backend().clone();
         run_action("RenameSession", move || {
             backend.rename_session(&session, new_name)
         })
@@ -137,10 +141,8 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "KillSession")?;
         let req = request.into_inner();
-        validate_session(&req.session)?;
-        let session = req.session;
+        let (backend, session) = self.resolve_session(&req.session)?;
         log::info!("KillSession: session='{session}'");
-        let backend = self.backend().clone();
         tokio::task::spawn_blocking(move || backend.kill_session(&session))
             .await
             .map_err(|e| Status::internal(format!("KillSession task panicked: {e}")))?
