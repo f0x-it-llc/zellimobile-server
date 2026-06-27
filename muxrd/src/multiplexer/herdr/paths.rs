@@ -84,15 +84,15 @@ pub fn derive_wire_socket_path(api: &Path) -> PathBuf {
 /// herdr's default config directory for the **release** binary (`herdr`, not the
 /// `herdr-dev` debug variant): `$XDG_CONFIG_HOME/herdr` or `$HOME/.config/herdr`.
 fn default_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir).join("herdr");
-        }
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("herdr");
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".config").join("herdr");
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home).join(".config").join("herdr");
     }
     std::env::temp_dir().join("herdr")
 }

@@ -126,15 +126,32 @@ impl HerdrBackend {
     }
 
     /// Resolve a neutral session **name** to its herdr `workspace_id` by matching
-    /// the workspace **label** (the name muxrd shows). Errors when no live
-    /// workspace carries that label.
+    /// the workspace **label** (the name muxrd shows).
+    ///
+    /// herdr `label` is a *display name*, not a unique key (`workspace_id` is) — so
+    /// the match may be zero, one, or many. Exactly-one is the only safe case:
+    /// - zero matches → `Err` (no such session);
+    /// - **more than one** match → `Err` rather than silently binding to whichever
+    ///   is first (M1: that risked wrong-workspace targeting / destruction).
+    ///
+    /// muxrd's own [`create_session`](MuxBackend::create_session) refuses to
+    /// manufacture a duplicate label, so the ambiguous case only arises from
+    /// out-of-band herdr usage; we fail closed when it does.
     fn workspace_id_for(&self, session: &str) -> Result<String> {
-        self.control
+        let mut matching = self
+            .control
             .list_workspaces()?
             .into_iter()
-            .find(|w| w.label == session)
-            .map(|w| w.workspace_id)
-            .ok_or_else(|| anyhow!("herdr: no workspace with label '{session}'"))
+            .filter(|w| w.label == session);
+        let first = matching
+            .next()
+            .ok_or_else(|| anyhow!("herdr: no workspace with label '{session}'"))?;
+        if matching.next().is_some() {
+            return Err(anyhow!(
+                "herdr: ambiguous session: multiple herdr workspaces labeled '{session}'"
+            ));
+        }
+        Ok(first.workspace_id)
     }
 }
 
@@ -210,6 +227,23 @@ impl MuxBackend for HerdrBackend {
         // The name becomes the workspace label.
         if let Some(layout) = layout {
             log::debug!("HerdrBackend::create_session: ignoring layout '{layout}' (unsupported)");
+        }
+        // M1: refuse to manufacture a duplicate label. herdr labels are not unique,
+        // and `workspace_id_for` resolves a session by label — so creating a second
+        // workspace with an existing label would make every later
+        // kill/rename/attach/query for that name ambiguous (and fail closed). Block
+        // it here so muxrd never creates the ambiguous condition in the first place.
+        if self
+            .control
+            .list_workspaces()?
+            .iter()
+            .any(|w| w.label == name)
+        {
+            return Ok(ActionAck {
+                ok: false,
+                error: Some(format!("session '{name}' already exists")),
+                info: None,
+            });
         }
         self.control.create_workspace(Some(name.to_string()))
     }
@@ -328,8 +362,9 @@ impl MuxBackend for HerdrBackend {
     fn query_session_size(&self, session: &str) -> Result<(u16, u16)> {
         // Derive from the workspace's focused-tab layout `area`. Pick the focused
         // pane (or the first listed) as the `pane.layout` addressing handle, then
-        // read `area.width`/`area.height` → `(cols, rows)`. Fall back to a sane
-        // default when the workspace has no panes / no usable area.
+        // read `area.height`/`area.width` → `(rows, cols)` (the order
+        // `session_size_from_area` returns). Fall back to a sane default when the
+        // workspace has no panes / no usable area.
         let workspace_id = self.workspace_id_for(session)?;
         let panes = self.control.list_panes(&workspace_id)?;
         let representative = panes.iter().find(|p| p.focused).or_else(|| panes.first());

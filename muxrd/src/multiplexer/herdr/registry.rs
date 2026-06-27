@@ -81,15 +81,21 @@ impl HerdrPaneRegistry {
     pub fn assign_or_get(&self, herdr_pane_id: &str, terminal_id: &str) -> u32 {
         let mut inner = lock(&self.inner);
         if let Some(&id) = inner.by_herdr.get(herdr_pane_id) {
-            if let Some(entry) = inner.by_id.get_mut(&id) {
-                if entry.terminal_id != terminal_id {
-                    entry.terminal_id = terminal_id.to_string();
-                }
+            if let Some(entry) = inner.by_id.get_mut(&id)
+                && entry.terminal_id != terminal_id
+            {
+                entry.terminal_id = terminal_id.to_string();
             }
             return id;
         }
         let id = inner.next_id;
-        inner.next_id = inner.next_id.saturating_add(1);
+        match inner.next_id.checked_add(1) {
+            Some(next) => inner.next_id = next,
+            // u32 pane-id space is astronomically large in practice; if it is ever
+            // exhausted, log and leave `next_id` pinned at u32::MAX rather than
+            // panic in the relay/gRPC path. Subsequent assigns reuse that id.
+            None => log::error!("herdr pane registry id space exhausted (u32)"),
+        }
         inner.by_herdr.insert(herdr_pane_id.to_string(), id);
         inner.by_id.insert(
             id,
@@ -159,7 +165,12 @@ impl HerdrTabRegistry {
             return id;
         }
         let id = inner.next_id;
-        inner.next_id = inner.next_id.saturating_add(1);
+        match inner.next_id.checked_add(1) {
+            Some(next) => inner.next_id = next,
+            // See the pane registry: u64 tab-id space is unreachable in practice;
+            // log and pin rather than panic.
+            None => log::error!("herdr tab registry id space exhausted (u64)"),
+        }
         inner.by_herdr.insert(herdr_tab_id.to_string(), id);
         inner.by_id.insert(id, herdr_tab_id.to_string());
         id

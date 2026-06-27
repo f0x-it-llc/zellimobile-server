@@ -20,13 +20,18 @@
 //! ## Usage pattern (P2.02 control client)
 //!
 //! ```ignore
-//! let req = ApiRequest::new("pane.layout", serde_json::to_value(PaneLayoutParams { pane_id: None })?);
+//! let req = ApiRequest::new("req-1", "pane.layout", serde_json::to_value(PaneLayoutParams { pane_id: None })?);
 //! // write req serialized as JSON + "\n"
 //! // read response line
-//! let resp: ApiResponse = serde_json::from_str(&line)?;
-//! let result: ApiResult = resp.into_ok()?.into_result()?;
-//! if let ApiResult::PaneLayout { layout } = result { /* use layout */ }
+//! let raw: ApiRawResponse = serde_json::from_str(&line)?;
+//! match raw.body {
+//!     ApiResponseBody::Ok { result } => { /* serde_json::from_value::<ApiResult>(result)? */ }
+//!     ApiResponseBody::Err { error } => { /* handle herdr API error */ }
+//! }
 //! ```
+//!
+//! The control client ([`super::control::HerdrControl`]) owns the single canonical
+//! decode path (`call_typed` / `call_action`); this module only models the shapes.
 
 use std::collections::HashMap;
 
@@ -67,26 +72,17 @@ impl ApiRequest {
 /// A raw JSON-API response from herdr, before result-type dispatch.
 ///
 /// Parses both success (`{"id","result":{…}}`) and error (`{"id","error":{…}}`)
-/// shapes.  Use [`ApiRawResponse::into_result`] to decode the typed result.
+/// shapes.  The control client matches on [`ApiRawResponse::body`] directly — see
+/// [`super::control::HerdrControl`]'s `call_typed` / `call_action` for the single
+/// canonical decode path.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiRawResponse {
-    /// Echoes the request `id`.
+    /// Echoes the request `id`. Retained for protocol fidelity / debugging; muxrd
+    /// uses one connection per request so it does not correlate by id.
+    #[allow(dead_code)]
     pub id: String,
     #[serde(flatten)]
     pub body: ApiResponseBody,
-}
-
-impl ApiRawResponse {
-    /// Convert to a typed [`ApiResult`], returning `Err` on API error or
-    /// on unknown / mismatched result type.
-    pub fn into_result(self) -> Result<ApiResult, ApiResponseError> {
-        match self.body {
-            ApiResponseBody::Ok { result } => {
-                serde_json::from_value(result).map_err(ApiResponseError::Deserialize)
-            }
-            ApiResponseBody::Err { error } => Err(ApiResponseError::Api(error)),
-        }
-    }
 }
 
 /// Untagged body — distinguished by presence of `result` vs `error` key.
@@ -104,33 +100,6 @@ pub struct ApiErrorBody {
     pub message: String,
 }
 
-/// Error variants when processing an [`ApiRawResponse`].
-#[derive(Debug)]
-pub enum ApiResponseError {
-    /// herdr returned an API-level error.
-    Api(ApiErrorBody),
-    /// The result JSON did not match the expected [`ApiResult`] variant.
-    Deserialize(serde_json::Error),
-}
-
-impl std::fmt::Display for ApiResponseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Api(e) => write!(f, "herdr API error {}: {}", e.code, e.message),
-            Self::Deserialize(e) => write!(f, "result deserialize error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ApiResponseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Deserialize(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
 // ─── Typed result enum ────────────────────────────────────────────────────────
 
 /// Typed result variants for the methods muxrd calls.
@@ -145,30 +114,38 @@ impl std::error::Error for ApiResponseError {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Phase 3: muxrd currently consumes only the list / layout / ok variants (via
+// `call_typed`) and routes action responses through `call_action` (payload
+// ignored). The create / single-info / focus / zoom / export variants are decoded
+// for protocol completeness but their payloads are not yet read — kept as forward
+// work rather than deleted. Large payloads (`PaneInfo` ≈ 700 B and the
+// layout-bearing result structs) are `Box`ed to keep the enum small
+// (clippy::large_enum_variant).
+#[allow(dead_code)] // Phase 3: typed create/info/focus/zoom/export payloads not yet consumed
 pub enum ApiResult {
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
     },
     WorkspaceCreated {
-        workspace: WorkspaceInfo,
-        tab: TabInfo,
-        root_pane: PaneInfo,
+        workspace: Box<WorkspaceInfo>,
+        tab: Box<TabInfo>,
+        root_pane: Box<PaneInfo>,
     },
     WorkspaceInfo {
-        workspace: WorkspaceInfo,
+        workspace: Box<WorkspaceInfo>,
     },
     TabCreated {
-        tab: TabInfo,
-        root_pane: PaneInfo,
+        tab: Box<TabInfo>,
+        root_pane: Box<PaneInfo>,
     },
     TabInfo {
-        tab: TabInfo,
+        tab: Box<TabInfo>,
     },
     TabList {
         tabs: Vec<TabInfo>,
     },
     PaneInfo {
-        pane: PaneInfo,
+        pane: Box<PaneInfo>,
     },
     PaneList {
         panes: Vec<PaneInfo>,
@@ -177,13 +154,13 @@ pub enum ApiResult {
         layout: PaneLayoutSnapshot,
     },
     PaneFocusDirection {
-        focus: PaneFocusDirectionResult,
+        focus: Box<PaneFocusDirectionResult>,
     },
     PaneZoom {
-        zoom: PaneZoomResult,
+        zoom: Box<PaneZoomResult>,
     },
     LayoutExport {
-        layout: LayoutDescription,
+        layout: Box<LayoutDescription>,
     },
     /// Generic success with no payload.
     Ok {},
@@ -291,6 +268,7 @@ pub struct PaneRenameParams {
 }
 
 /// `pane.focus_direction`
+#[allow(dead_code)] // Phase 3: paired with HerdrControl::focus_pane_direction
 #[derive(Debug, Serialize)]
 pub struct PaneFocusDirectionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -315,6 +293,7 @@ pub struct PaneLayoutParams {
 }
 
 /// `layout.export`
+#[allow(dead_code)] // Phase 3: paired with HerdrControl::layout_export
 #[derive(Debug, Default, Serialize)]
 pub struct LayoutExportParams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -334,6 +313,7 @@ pub enum SplitDirection {
 }
 
 /// Directional focus / resize target.  Matches herdr's `PaneDirection`.
+#[allow(dead_code)] // Phase 3: consumed by PaneFocusDirectionParams / focus_pane_direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneDirection {
@@ -735,7 +715,8 @@ mod tests {
         assert!(matches!(result, ApiResult::Ok {}));
     }
 
-    /// Verify `ApiRawResponse` parses the success shape and routes into `ApiResult`.
+    /// Verify `ApiRawResponse` parses the success shape and exposes the result body
+    /// for typed decode (the path `HerdrControl::call_typed` takes).
     #[test]
     fn api_raw_response_success_round_trip() {
         let json = r#"{
@@ -748,8 +729,14 @@ mod tests {
 
         let raw: ApiRawResponse = serde_json::from_str(json).expect("ApiRawResponse must parse");
         assert_eq!(raw.id, "req-42");
-        let result = raw.into_result().expect("into_result must succeed");
-        assert!(matches!(result, ApiResult::WorkspaceList { workspaces } if workspaces.is_empty()));
+        let ApiResponseBody::Ok { result } = raw.body else {
+            panic!("expected a success body");
+        };
+        let decoded: ApiResult =
+            serde_json::from_value(result).expect("result must decode to ApiResult");
+        assert!(
+            matches!(decoded, ApiResult::WorkspaceList { workspaces } if workspaces.is_empty())
+        );
     }
 
     /// Verify `ApiRawResponse` parses the error shape correctly.
@@ -761,12 +748,11 @@ mod tests {
         }"#;
 
         let raw: ApiRawResponse = serde_json::from_str(json).expect("ApiRawResponse must parse");
-        let err = raw.into_result().unwrap_err();
-        if let ApiResponseError::Api(body) = err {
-            assert_eq!(body.code, "not_found");
-        } else {
-            panic!("expected ApiResponseError::Api");
-        }
+        let ApiResponseBody::Err { error } = raw.body else {
+            panic!("expected an error body");
+        };
+        assert_eq!(error.code, "not_found");
+        assert_eq!(error.message, "workspace not found");
     }
 
     /// Verify request serialization produces the correct JSON shape.

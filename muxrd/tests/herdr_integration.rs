@@ -27,6 +27,7 @@
 //! (the JSON-API control socket and the binary wire relay socket).  herdr runs
 //! as a separate, unmodified, user-installed binary; no herdr source is linked.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use muxrd::multiplexer::{HerdrBackend, MuxBackend, MuxServerMsg};
@@ -42,15 +43,19 @@ fn backend() -> HerdrBackend {
     HerdrBackend::from_env()
 }
 
-/// A unique-ish session name for tests that create a workspace.
+/// A unique session name for tests that create a workspace.
+///
+/// `subsec_millis()` wraps every 1000 ms, so two creations within the same second
+/// could collide; combine the full epoch-millis with a process-wide atomic counter
+/// so every call is distinct regardless of timing.
 fn test_session_name() -> String {
-    format!(
-        "muxrd-smoke-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_millis()
-    )
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("muxrd-smoke-{millis}-{seq}")
 }
 
 // ─── smoke_list_sessions ──────────────────────────────────────────────────────

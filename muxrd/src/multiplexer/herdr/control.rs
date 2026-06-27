@@ -30,7 +30,7 @@
 //! backend's `ActionAck` failure surface.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +56,21 @@ use super::registry::{HerdrPaneRegistry, HerdrTabRegistry};
 /// bounded I/O. It is well below zellij's 18 s relay query timeout that motivated
 /// the synchronous herdr layout path (P2.00).
 pub const READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Hard ceiling on a single JSON-API response line, mirroring the wire path's
+/// pre-allocation guard ([`wire::MAX_FRAME_SIZE`](super::wire::MAX_FRAME_SIZE)).
+///
+/// The [`READ_TIMEOUT`] only fires on an *idle* gap, so a peer streaming bytes
+/// continuously without a newline could grow the response `String` unbounded and
+/// OOM muxrd. We bound the read with [`Read::take`] at this ceiling and reject a
+/// response that hits it without a line terminator (S1, defence-in-depth).
+///
+/// 8 MiB is deliberately generous — well above any realistic layout/export
+/// response (largest legitimate payload is a `layout.export` tree, kilobytes even
+/// for huge workspaces) — while still bounding a hostile stream. It is 4× the
+/// wire `MAX_FRAME_SIZE` because the control plane carries whole-workspace JSON
+/// snapshots rather than single per-frame terminal output.
+pub const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// herdr JSON-API control client. Cheap to construct; holds no live connection.
 #[derive(Debug)]
@@ -95,6 +110,7 @@ impl HerdrControl {
     }
 
     /// The shared tab registry.
+    #[allow(dead_code)] // Phase 3: paired with pane_registry once tab-scoped wire ops land
     pub fn tab_registry(&self) -> &Arc<HerdrTabRegistry> {
         &self.tabs
     }
@@ -132,7 +148,11 @@ impl HerdrControl {
             .write_all(line.as_bytes())
             .with_context(|| format!("write herdr {method} request"))?;
 
-        let mut reader = BufReader::new(&stream);
+        // S1: bound the response read. `read_line` would otherwise grow `resp`
+        // without limit, and the read timeout only trips on an idle gap — a peer
+        // trickling bytes forever could OOM muxrd. Cap at MAX_RESPONSE_BYTES via
+        // `Read::take` (the control-plane analogue of the wire MAX_FRAME_SIZE guard).
+        let mut reader = BufReader::new((&stream).take(MAX_RESPONSE_BYTES));
         let mut resp = String::new();
         let read = reader
             .read_line(&mut resp)
@@ -140,6 +160,14 @@ impl HerdrControl {
         if read == 0 {
             return Err(anyhow!(
                 "herdr closed the JSON-API connection without responding to {method}"
+            ));
+        }
+        // If we filled the cap without reaching a newline, the response is either
+        // hostile or malformed — refuse it rather than parse a truncated line.
+        if read as u64 >= MAX_RESPONSE_BYTES && !resp.ends_with('\n') {
+            return Err(anyhow!(
+                "herdr {method} response exceeded the {MAX_RESPONSE_BYTES}-byte \
+                 limit without a newline"
             ));
         }
 
@@ -326,6 +354,7 @@ impl HerdrControl {
     }
 
     /// `pane.focus_direction` — directional focus from `pane` (or the focused pane).
+    #[allow(dead_code)] // Phase 3: directional pane focus not yet wired to a trait method
     pub fn focus_pane_direction(
         &self,
         pane: Option<u32>,
@@ -399,6 +428,7 @@ impl HerdrControl {
     }
 
     /// `layout.export` — recursive layout description for a tab/pane.
+    #[allow(dead_code)] // Phase 3: full layout-tree export not yet surfaced to the gRPC layer
     pub fn layout_export(
         &self,
         tab_id: Option<&str>,
@@ -412,7 +442,7 @@ impl HerdrControl {
             },
         )?;
         match self.call_typed("layout.export", params)? {
-            ApiResult::LayoutExport { layout } => Ok(layout),
+            ApiResult::LayoutExport { layout } => Ok(*layout),
             other => Err(unexpected("layout.export", &other)),
         }
     }
@@ -423,6 +453,20 @@ impl HerdrControl {
     /// (`pane.list`), and one absolute-cell layout per tab (`pane.layout`),
     /// populating the shared registries and transcoding into the neutral shape.
     pub fn query_layout(&self, workspace_id: &str) -> Result<LayoutSnapshot> {
+        // M2: the per-session active tab comes from the workspace's own
+        // `WorkspaceInfo.active_tab_id`, NOT from `TabInfo.focused`. herdr's
+        // `TabInfo.focused` is *globally* unique — true only for the one tab of
+        // herdr's currently-active workspace — so for any other workspace every
+        // tab would report `focused=false`, leaving the snapshot with no active
+        // tab. Resolve the workspace's own active tab id here (one extra
+        // `workspace.list` round-trip; cheap over the local socket).
+        let active_tab_id = self
+            .list_workspaces()?
+            .into_iter()
+            .find(|w| w.workspace_id == workspace_id)
+            .map(|w| w.active_tab_id)
+            .unwrap_or_default();
+
         let tabs = self.list_tabs(workspace_id)?;
         let panes = self.list_panes(workspace_id)?;
 
@@ -450,6 +494,7 @@ impl HerdrControl {
             &tabs,
             &panes,
             &tab_layouts,
+            &active_tab_id,
             &self.panes,
             &self.tabs,
         ))
@@ -497,7 +542,7 @@ struct WorkspaceScopedParams<'a> {
 /// | `tab_id` | tab registry id for `TabInfo.tab_id` |
 /// | `position` | `TabInfo.number` |
 /// | `name` | `TabInfo.label` |
-/// | `active` | `TabInfo.focused` |
+/// | `active` | `TabInfo.tab_id == WorkspaceInfo.active_tab_id` (per-workspace; **not** the global `TabInfo.focused`) |
 /// | `fullscreen_active` | tab layout `zoomed` |
 /// | `has_bell` / `panes_to_hide` / `floating_panes_visible` | `false` / `0` / `false` (herdr lacks) |
 ///
@@ -516,6 +561,7 @@ fn transcode_layout(
     tabs: &[TabInfo],
     panes: &[PaneInfo],
     tab_layouts: &HashMap<String, PaneLayoutSnapshot>,
+    active_tab_id: &str,
     pane_reg: &HerdrPaneRegistry,
     tab_reg: &HerdrTabRegistry,
 ) -> LayoutSnapshot {
@@ -570,7 +616,8 @@ fn transcode_layout(
                 tab_id,
                 position: tab.number as u32,
                 name: tab.label.clone(),
-                active: tab.focused,
+                // M2: per-workspace active tab, not herdr's global `TabInfo.focused`.
+                active: tab.tab_id == active_tab_id,
                 has_bell: false,
                 panes_to_hide: 0,
                 fullscreen_active: zoomed,
@@ -721,7 +768,7 @@ mod tests {
             ),
         );
 
-        let snap = transcode_layout(&tabs, &panes, &tab_layouts, &pane_reg, &tab_reg);
+        let snap = transcode_layout(&tabs, &panes, &tab_layouts, "tab-1", &pane_reg, &tab_reg);
 
         assert_eq!(snap.tabs.len(), 1);
         let t = &snap.tabs[0];
@@ -784,9 +831,55 @@ mod tests {
             ),
         );
 
-        let snap = transcode_layout(&tabs, &panes, &tab_layouts, &pane_reg, &tab_reg);
+        let snap = transcode_layout(&tabs, &panes, &tab_layouts, "tab-z", &pane_reg, &tab_reg);
         assert!(snap.tabs[0].fullscreen_active);
         assert!(snap.tabs[0].panes[0].is_fullscreen);
+    }
+
+    #[test]
+    fn transcode_active_tab_uses_workspace_active_tab_id_not_global_focus() {
+        // M2 regression: this workspace is NOT herdr's globally-active one, so every
+        // `TabInfo.focused` is false (herdr's single global focus lives on a
+        // different workspace). The workspace's own `active_tab_id` still names its
+        // active tab — and that, not `TabInfo.focused`, must drive `active`.
+        let pane_reg = HerdrPaneRegistry::new();
+        let tab_reg = HerdrTabRegistry::new();
+        let tabs = vec![
+            tab("tab-1", 0, "one", false), // focused == false (global focus elsewhere)
+            tab("tab-2", 1, "two", false), // focused == false too
+        ];
+        let panes = vec![
+            pane("pane-1", "term-1", "tab-1", None),
+            pane("pane-2", "term-2", "tab-2", None),
+        ];
+        let rect = PaneLayoutRect {
+            x: 0,
+            y: 0,
+            width: 220,
+            height: 50,
+        };
+        let mut tab_layouts = HashMap::new();
+        tab_layouts.insert(
+            "tab-1".to_string(),
+            layout("tab-1", false, vec![lp("pane-1", true, rect)]),
+        );
+        tab_layouts.insert(
+            "tab-2".to_string(),
+            layout("tab-2", false, vec![lp("pane-2", true, rect)]),
+        );
+
+        // The workspace reports `active_tab_id == "tab-2"`.
+        let snap = transcode_layout(&tabs, &panes, &tab_layouts, "tab-2", &pane_reg, &tab_reg);
+
+        assert_eq!(snap.tabs.len(), 2);
+        assert!(
+            !snap.tabs[0].active,
+            "tab-1 is not the workspace's active tab"
+        );
+        assert!(
+            snap.tabs[1].active,
+            "tab-2 == WorkspaceInfo.active_tab_id → exactly this tab is active despite focused=false"
+        );
     }
 
     #[test]
@@ -818,7 +911,7 @@ mod tests {
             ),
         );
 
-        let snap = transcode_layout(&tabs, &panes, &tab_layouts, &pane_reg, &tab_reg);
+        let snap = transcode_layout(&tabs, &panes, &tab_layouts, "tab-1", &pane_reg, &tab_reg);
         assert_eq!(snap.tabs.len(), 2);
         assert_eq!(snap.tabs[0].panes.len(), 1);
         assert!(snap.tabs[1].panes.is_empty());
