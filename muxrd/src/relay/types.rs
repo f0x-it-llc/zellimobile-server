@@ -110,6 +110,17 @@ pub struct RelayViewState {
     /// The focused pane for this relay client.
     /// `None` when unknown (e.g. just after a bare tab switch or on init failure).
     pub focused_pane: Option<PaneRef>,
+    /// The space (herdr workspace) this relay client is currently viewing
+    /// (herdr Spaces, Option A — per-connection view).
+    ///
+    /// `None` until this relay performs its first `SwitchSpace`: at attach time the
+    /// relay views the daemon's focused workspace, so the backend-reported
+    /// `SpaceSnapshot.active` is correct and no per-connection override is needed.
+    /// After a `SwitchSpace` (which deliberately does NOT move the daemon-global
+    /// focus), this holds the relay's chosen `workspace_id` so the gRPC `GetSpaces`
+    /// handler can mark the connection-active space independently of the daemon's
+    /// reported active one. zellij relays never set this (no space concept).
+    pub current_space: Option<String>,
 }
 
 /// A registry entry pairing a relay's owning session name with its control sender.

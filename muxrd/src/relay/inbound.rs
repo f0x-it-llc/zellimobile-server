@@ -162,9 +162,15 @@ pub(crate) async fn inbound_loop(
                                 // focused pane are now unknown until the next
                                 // GetLayout/FocusPane. Reset both so get_layout does
                                 // not apply a stale override from the old space.
+                                // Record the new workspace_id as this relay's current
+                                // space so the gRPC GetSpaces handler can mark it
+                                // connection-active (the daemon-global focus is left
+                                // untouched, so the backend-reported active won't
+                                // reflect this per-connection switch).
                                 if let Some(mut entry) = view_state.get_mut(&connection_id) {
                                     entry.state.active_tab = None;
                                     entry.state.focused_pane = None;
+                                    entry.state.current_space = Some(workspace_id.clone());
                                 }
                             }
                             Err(e) => log::warn!(

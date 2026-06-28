@@ -27,6 +27,7 @@ pub mod helpers;
 mod layout;
 mod pane_ops;
 mod session_ops;
+mod space_ops;
 mod tab_ops;
 mod token_ops;
 
@@ -398,50 +399,51 @@ impl Muxr for MuxrService {
         self.revoke_token_impl(request).await
     }
 
-    // ── Spaces (herdr workspaces) — T03 fills these ───────────────────────────
+    // ── Spaces (herdr workspaces) ─────────────────────────────────────────────
     //
-    // These five stubs satisfy the tonic-generated `Muxr` trait after the proto
-    // added GetSpaces/SwitchSpace/CreateSpace/RenameSpace/CloseSpace in T01.
-    // Each returns `unimplemented` so the server builds and existing RPCs stay
-    // fully functional.  T03 replaces every stub with real herdr logic.
+    // Spaces are a herdr-only navigation axis (its workspaces). zellij sessions
+    // return an empty list (GetSpaces) / a graceful failure ack (the mutating
+    // ops). See [`space_ops`] for the routing details. GetSpaces marks the
+    // connection-active space from the relay's tracked `current_space`; SwitchSpace
+    // is relay-routed; create/rename/close are control-plane (daemon-global).
 
-    // TODO(T03): implement GetSpaces via HerdrBackend::list_spaces.
+    /// List the spaces (herdr workspaces) for a session. Read-only allowed.
     async fn get_spaces(
         &self,
-        _request: Request<SessionRef>,
+        request: Request<SessionRef>,
     ) -> Result<Response<SpaceList>, Status> {
-        Err(Status::unimplemented("spaces: implemented in T03"))
+        self.get_spaces_impl(request).await
     }
 
-    // TODO(T03): implement SwitchSpace via HerdrBackend::switch_space.
+    /// Switch the connection's relay to a different space. MUTATING (read-only rejected).
     async fn switch_space(
         &self,
-        _request: Request<SwitchSpaceReq>,
+        request: Request<SwitchSpaceReq>,
     ) -> Result<Response<ProtoAck>, Status> {
-        Err(Status::unimplemented("spaces: implemented in T03"))
+        self.switch_space_impl(request).await
     }
 
-    // TODO(T03): implement CreateSpace via HerdrBackend::create_space.
+    /// Create a new space (herdr workspace). MUTATING (read-only rejected).
     async fn create_space(
         &self,
-        _request: Request<CreateSpaceReq>,
+        request: Request<CreateSpaceReq>,
     ) -> Result<Response<ProtoAck>, Status> {
-        Err(Status::unimplemented("spaces: implemented in T03"))
+        self.create_space_impl(request).await
     }
 
-    // TODO(T03): implement RenameSpace via HerdrBackend::rename_space.
+    /// Rename an existing space. MUTATING (read-only rejected).
     async fn rename_space(
         &self,
-        _request: Request<RenameSpaceReq>,
+        request: Request<RenameSpaceReq>,
     ) -> Result<Response<ProtoAck>, Status> {
-        Err(Status::unimplemented("spaces: implemented in T03"))
+        self.rename_space_impl(request).await
     }
 
-    // TODO(T03): implement CloseSpace via HerdrBackend::close_space.
+    /// Close (delete) a space. MUTATING (read-only rejected).
     async fn close_space(
         &self,
-        _request: Request<CloseSpaceReq>,
+        request: Request<CloseSpaceReq>,
     ) -> Result<Response<ProtoAck>, Status> {
-        Err(Status::unimplemented("spaces: implemented in T03"))
+        self.close_space_impl(request).await
     }
 }

@@ -44,5 +44,9 @@ pub(super) fn init_relay_view_state(
     Ok(RelayViewState {
         active_tab,
         focused_pane,
+        // At attach time the relay views the daemon's focused workspace; the
+        // backend-reported active space is correct, so no per-connection override
+        // is needed until the first SwitchSpace.
+        current_space: None,
     })
 }
