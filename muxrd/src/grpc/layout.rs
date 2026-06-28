@@ -6,6 +6,7 @@ use crate::multiplexer::{LayoutSnapshot, MuxBackend};
 use crate::proto::{Layout, PaneMsg, SessionRef, TabMsg};
 
 use super::MuxrService;
+use super::helpers::short_conn;
 
 /// Timeout for the oneshot reply when routing a `QueryLayout` through the relay.
 ///
@@ -32,7 +33,12 @@ impl MuxrService {
         let session = req.session;
         let connection_id = req.connection_id;
         let (backend, bare) = self.resolve_session(&session)?;
-        log::info!("GetLayout: session='{session}' connection_id='{connection_id}'");
+        // FS3: full connection_id must not appear in info/warn logs.
+        log::info!(
+            "GetLayout: session='{session}' connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!("GetLayout: session='{session}' connection_id='{connection_id}'");
 
         // ── B-QUERY: route through relay if one is attached ─────────────────
         // Routing priority:
@@ -296,7 +302,17 @@ impl MuxrService {
             })
             .collect();
 
+        // FS3: relay_conn_id is the matched relay's connection_id (same 32-char secret);
+        // redact to the 8-char prefix at info, keep the full value at debug only.
         log::info!(
+            "GetLayout: session='{}' relay_conn={}… → {} tab(s), \
+             {} total pane group(s), via_relay={via_relay}",
+            session,
+            short_conn(&relay_conn_id),
+            tab_msgs.len(),
+            tab_msgs.iter().map(|t| t.panes.len()).sum::<usize>()
+        );
+        log::debug!(
             "GetLayout: session='{}' relay_conn='{relay_conn_id}' → {} tab(s), \
              {} total pane group(s), via_relay={via_relay}",
             session,

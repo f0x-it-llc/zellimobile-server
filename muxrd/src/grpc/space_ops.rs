@@ -37,7 +37,7 @@ use crate::proto::{
 use crate::relay::RelayControl;
 
 use super::MuxrService;
-use super::helpers::reject_if_read_only;
+use super::helpers::{reject_if_read_only, short_conn};
 
 /// Max length (bytes) accepted for a user-supplied space label.
 const MAX_SPACE_LABEL_LEN: usize = 64;
@@ -67,7 +67,12 @@ impl MuxrService {
         let session = req.session;
         let connection_id = req.connection_id;
         let (backend, bare) = self.resolve_session(&session)?;
-        log::info!("GetSpaces: session='{session}' connection_id='{connection_id}'");
+        // FS3: full connection_id must not appear in info/warn logs.
+        log::info!(
+            "GetSpaces: session='{session}' connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!("GetSpaces: session='{session}' connection_id='{connection_id}'");
 
         // Blocking IPC (herdr `workspace.list`) → spawn_blocking.
         let snapshots = {
@@ -131,8 +136,15 @@ impl MuxrService {
         // Resolve to validate the session id / owning backend exists (the actual
         // switch is relay-routed, but a bad id must still be a clean error).
         let _ = self.resolve_session(&session)?;
+        // FS3: full connection_id must not appear in info/warn logs.
         log::info!(
-            "SwitchSpace: session='{session}' space_id='{space_id}' connection_id='{connection_id}'"
+            "SwitchSpace: session='{session}' space_id='{space_id}' \
+             connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!(
+            "SwitchSpace: session='{session}' space_id='{space_id}' \
+             connection_id='{connection_id}'"
         );
 
         // Locate the connection's relay control sender by an EXACT connection_id
@@ -143,7 +155,15 @@ impl MuxrService {
         let sender = match self.resolve_space_relay(&session, &connection_id) {
             Some(s) => s,
             None => {
+                // FS3: the submitted connection_id may be a guessed/arbitrary value;
+                // omit it from info entirely and keep only the 8-char prefix for
+                // operational correlation.
                 log::info!(
+                    "SwitchSpace: no matching connection for '{session}' \
+                     (connection_id={}…) — fail-closed",
+                    short_conn(&connection_id)
+                );
+                log::debug!(
                     "SwitchSpace: no matching connection for '{session}' \
                      (connection_id='{connection_id}') — fail-closed"
                 );

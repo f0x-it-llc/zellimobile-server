@@ -224,6 +224,23 @@ pub(super) fn pane_ref(target: &PaneTarget) -> PaneRef {
     }
 }
 
+/// Return the first 8 bytes of a connection-id as a log-safe breadcrumb.
+///
+/// **FS3 invariant:** `connection_id` is the sole per-connection isolation
+/// discriminator (a CSPRNG 128-bit hex string in the relay, but CLIENT-supplied
+/// in every subsequent handler RPC). The full value MUST NOT appear in info/warn
+/// logs — use this helper for all gRPC handler breadcrumbs.
+///
+/// The slice length is clamped with `.min(id.len())` so that empty or short
+/// client-supplied ids (which may be 0–7 chars) never panic.
+///
+/// Caller combines the return value with a trailing `…` suffix in the log
+/// format string to visually indicate truncation, e.g.
+/// `"connection_id={}…", short_conn(&connection_id)`.
+pub(super) fn short_conn(id: &str) -> &str {
+    &id[..8.min(id.len())]
+}
+
 // ─── Proto ↔ BackendKind conversions ─────────────────────────────────────────
 
 /// Map a [`BackendKind`] to its proto [`crate::proto::Backend`] tag.
@@ -628,6 +645,35 @@ mod tests {
             rx_ro.try_recv().is_err(),
             "read-only relay must not receive the command"
         );
+    }
+
+    // ─── short_conn helper tests ─────────────────────────────────────────────
+
+    #[test]
+    fn short_conn_empty_does_not_panic() {
+        // Client-supplied ids may be empty; must not panic (length guard).
+        assert_eq!(super::short_conn(""), "");
+    }
+
+    #[test]
+    fn short_conn_shorter_than_8_returns_whole_string() {
+        // Short ids (3 chars) must return the full string, not panic.
+        assert_eq!(super::short_conn("abc"), "abc");
+    }
+
+    #[test]
+    fn short_conn_32_char_returns_8_chars() {
+        // A normal CSPRNG hex id (32 chars) must be truncated to exactly 8.
+        let id = "abcdef0123456789abcdef0123456789";
+        assert_eq!(id.len(), 32);
+        let prefix = super::short_conn(id);
+        assert_eq!(prefix, "abcdef01");
+        assert_eq!(prefix.len(), 8);
+    }
+
+    #[test]
+    fn short_conn_exactly_8_returns_all_8() {
+        assert_eq!(super::short_conn("12345678"), "12345678");
     }
 
     // ─── reject_if_read_only tests ───────────────────────────────────────────

@@ -5,7 +5,7 @@ use tonic::{Request, Response, Status};
 use crate::proto::{ActionAck as ProtoAck, NewTabReq, RenameTabReq, TabTarget};
 
 use super::MuxrService;
-use super::helpers::{reject_if_read_only, run_action, try_route_control};
+use super::helpers::{reject_if_read_only, run_action, short_conn, try_route_control};
 
 impl MuxrService {
     // ── Tab ops (D2) ──────────────────────────────────────────────────────────
@@ -50,7 +50,12 @@ impl MuxrService {
         let connection_id = req.connection_id.clone();
         let tab_id = req.tab_id;
         let (backend, session) = self.resolve_session(&req.session)?;
-        log::info!("GoToTab: session='{session}' tab_id={tab_id} connection_id='{connection_id}'");
+        // FS3: full connection_id must not appear in info/warn logs.
+        log::info!(
+            "GoToTab: session='{session}' tab_id={tab_id} connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!("GoToTab: session='{session}' tab_id={tab_id} connection_id='{connection_id}'");
         // Route through the live relay client if attached, so the tab switch
         // applies to the *rendering* client (deterministic, no ephemeral).
         // connection_id targets the exact relay that sent the request; falls

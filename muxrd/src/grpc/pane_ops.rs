@@ -10,7 +10,7 @@ use crate::proto::{
 };
 
 use super::MuxrService;
-use super::helpers::{pane_ref, reject_if_read_only, run_action, try_route_control};
+use super::helpers::{pane_ref, reject_if_read_only, run_action, short_conn, try_route_control};
 
 /// Upper bound on a single `WriteToPane` payload (1 MiB).  Guards against a
 /// client pushing an unbounded write into the session IPC channel.
@@ -61,7 +61,12 @@ impl MuxrService {
         let connection_id = target.connection_id.clone();
         let pane = pane_ref(&target);
         let (backend, session) = self.resolve_session(&target.session)?;
-        log::info!("FocusPane: session='{session}' pane={pane:?} connection_id='{connection_id}'");
+        // FS3: full connection_id must not appear in info/warn logs.
+        log::info!(
+            "FocusPane: session='{session}' pane={pane:?} connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!("FocusPane: session='{session}' pane={pane:?} connection_id='{connection_id}'");
         // Route through the live relay client if attached, so focus applies to
         // the rendering client (and re-points the single-pane sub).
         // connection_id targets the exact relay that sent the request.
@@ -216,7 +221,13 @@ impl MuxrService {
         } else {
             None
         };
+        // FS3: full connection_id must not appear in info/warn logs.
         log::info!(
+            "TogglePaneFullscreen: session='{session}' pane={pane:?} hint={hint:?} \
+             connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!(
             "TogglePaneFullscreen: session='{session}' pane={pane:?} hint={hint:?} \
              connection_id='{connection_id}'"
         );
