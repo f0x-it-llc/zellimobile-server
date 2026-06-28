@@ -215,6 +215,18 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "KillSession")?;
         let req = request.into_inner();
+        // Decision 5 (S-M3): the herdr session is singular and collapsed — it has no
+        // killable session object (manage its workspaces via CloseSpace). Reject
+        // cleanly with `invalid_argument` BEFORE resolving, so the client sees a
+        // meaningful error instead of the backend's opaque "no workspace with label
+        // 'herdr'" internal error. zellij sessions are never collapsed, so this never
+        // affects a zellij KillSession (e.g. a zellij session literally named
+        // "herdr" resolves as `zellij:herdr`, which is not a collapsed id).
+        if crate::multiplexer::is_collapsed_backend_session(&req.session) {
+            return Err(Status::invalid_argument(
+                "the herdr session cannot be killed — manage its workspaces via CloseSpace",
+            ));
+        }
         let (backend, session) = self.resolve_session(&req.session)?;
         log::info!("KillSession: session='{session}'");
         tokio::task::spawn_blocking(move || backend.kill_session(&session))

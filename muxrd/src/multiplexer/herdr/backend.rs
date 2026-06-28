@@ -91,6 +91,19 @@ const DEFAULT_SPLIT_DIRECTION: SplitDirection = SplitDirection::Right;
 /// [`ListSessions`]: MuxBackend::list_sessions
 pub(crate) const HERDR_SESSION: &str = "herdr";
 
+/// Rejection message for an attempt to kill or rename the singular herdr session.
+///
+/// **Decision 5 (the herdr session is singular):** a herdr daemon has no session
+/// container — muxrd presents the whole daemon as ONE non-killable/renamable
+/// session ([`HERDR_SESSION`]). Its *workspaces* are the managed unit (close via
+/// `CloseSpace`, rename via `RenameSpace`), never the session itself. So
+/// [`kill_session`](HerdrBackend::kill_session) /
+/// [`rename_session`](HerdrBackend::rename_session) reject the sentinel cleanly
+/// instead of resolving it to a workspace and surfacing the opaque
+/// `internal("no workspace with label 'herdr'")` (S-M3).
+pub(crate) const HERDR_SESSION_IMMUTABLE_MSG: &str =
+    "the herdr session cannot be killed or renamed — manage workspaces via CloseSpace/RenameSpace";
+
 /// The herdr-backed [`MuxBackend`].
 ///
 /// Holds the control client and the two id registries (shared behind `Arc` with
@@ -323,6 +336,16 @@ impl MuxBackend for HerdrBackend {
     }
 
     fn kill_session(&self, session: &str) -> Result<()> {
+        // Decision 5 (S-M3): the singular herdr session is not killable — there is
+        // no session object to destroy (its workspaces are the managed unit, closed
+        // via CloseSpace). Reject cleanly rather than resolving the sentinel to a
+        // workspace and returning the opaque "no workspace with label 'herdr'".
+        // The gRPC handler additionally short-circuits this to `invalid_argument`
+        // before reaching the backend; this guard is defence-in-depth (and covers
+        // the legacy bare-name path that the handler's collapsed-session check misses).
+        if session == HERDR_SESSION {
+            return Err(anyhow!(HERDR_SESSION_IMMUTABLE_MSG));
+        }
         let workspace_id = self.workspace_id_for(session)?;
         let ack = self.control.close_workspace(&workspace_id)?;
         if ack.ok {
@@ -336,6 +359,17 @@ impl MuxBackend for HerdrBackend {
     }
 
     fn rename_session(&self, session: &str, new_name: String) -> Result<ActionAck> {
+        // Decision 5 (S-M3): the singular herdr session is not renamable — rename a
+        // *workspace* via RenameSpace instead. A clean `ok:false` ack beats the
+        // opaque "no workspace with label 'herdr'" internal error that resolving
+        // the sentinel through `workspace_id_for` would otherwise produce.
+        if session == HERDR_SESSION {
+            return Ok(ActionAck {
+                ok: false,
+                error: Some(HERDR_SESSION_IMMUTABLE_MSG.to_owned()),
+                info: None,
+            });
+        }
         let workspace_id = self.workspace_id_for(session)?;
         self.control.rename_workspace(&workspace_id, &new_name)
     }
@@ -719,6 +753,37 @@ mod tests {
             "unreachable daemon must error, not advertise a session"
         );
         assert!(b.list_sessions_with_resurrectables().is_err());
+    }
+
+    // ── Decision 5 / S-M3: sentinel session is not killable/renamable ─────────
+
+    #[test]
+    fn kill_session_rejects_the_sentinel_cleanly() {
+        // The backend (nonexistent socket) must reject the sentinel WITHOUT any
+        // I/O — no workspace.list round-trip — and with a clean message, not the
+        // opaque "no workspace with label 'herdr'" that workspace_id_for produces.
+        let b = backend();
+        let err = b
+            .kill_session(HERDR_SESSION)
+            .expect_err("the herdr session must not be killable");
+        let msg = format!("{err:#}");
+        assert_eq!(msg, HERDR_SESSION_IMMUTABLE_MSG);
+        assert!(
+            !msg.contains("no workspace with label"),
+            "must not leak the opaque workspace-not-found error: {msg}"
+        );
+    }
+
+    #[test]
+    fn rename_session_rejects_the_sentinel_as_clean_ok_false() {
+        // rename_session returns Result<ActionAck>, so the sentinel rejection is a
+        // clean ok:false ack (not an Err / internal). No I/O is performed.
+        let b = backend();
+        let ack = b
+            .rename_session(HERDR_SESSION, "whatever".to_owned())
+            .expect("sentinel rename must be Ok(ack), not Err");
+        assert!(!ack.ok, "renaming the herdr session must report ok:false");
+        assert_eq!(ack.error.as_deref(), Some(HERDR_SESSION_IMMUTABLE_MSG));
     }
 
     // ── shared registries are the same Arcs the control client holds ──────────
