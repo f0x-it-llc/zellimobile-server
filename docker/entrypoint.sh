@@ -87,8 +87,8 @@ start_zellij() {
 start_herdr() {
   # herdr: a SEPARATE, UNMODIFIED, user-installed binary (AGPL-3.0). muxrd drives
   # it only over its public 0600 sockets; muxrd stays the TLS/bearer boundary.
-  # Start a headless herdr server and seed a demo workspace so the app has a
-  # session to attach to.
+  # Start a headless herdr server and seed 3 demo workspaces (spaces) so the
+  # spaces menu is exercisable on device.
   export HERDR_SOCKET_PATH
   echo "[rig] starting headless herdr server…"
   herdr server > /var/log/herdr-server.log 2>&1 &
@@ -96,12 +96,22 @@ start_herdr() {
   for _ in $(seq 1 50); do [ -S "${HERDR_SOCKET_PATH}" ] && break; sleep 0.1; done
   if [ -S "${HERDR_SOCKET_PATH}" ]; then
     herdr status server 2>&1 | sed 's/^/[rig][herdr] /' || true
-    # Seed one demo workspace (idempotent across restarts: skip if the label
-    # already exists — muxrd treats duplicate workspace labels as ambiguous).
-    if ! herdr workspace list 2>/dev/null | grep -q "${SESSION}"; then
-      echo "[rig] seeding herdr workspace '${SESSION}'…"
-      herdr workspace create --label "${SESSION}" --cwd /root/projects/api --focus 2>/dev/null || true
-      herdr tab create --label logs --no-focus 2>/dev/null || true
+    # Seed 3 demo workspaces idempotently (skip a label that already exists —
+    # muxrd treats duplicate workspace labels as ambiguous).
+    _existing="$(herdr workspace list 2>/dev/null || true)"
+    if ! printf '%s\n' "${_existing}" | grep -q "main"; then
+      echo "[rig] seeding herdr workspace 'main' (initial/focused)…"
+      herdr workspace create --label main --cwd /root/projects/api --focus 2>/dev/null || true
+      # Add a 2nd tab so tab-switching within a space is also demoable.
+      herdr tab create --label editor --no-focus 2>/dev/null || true
+    fi
+    if ! printf '%s\n' "${_existing}" | grep -q "logs"; then
+      echo "[rig] seeding herdr workspace 'logs'…"
+      herdr workspace create --label logs --cwd /root/projects/api 2>/dev/null || true
+    fi
+    if ! printf '%s\n' "${_existing}" | grep -q "api"; then
+      echo "[rig] seeding herdr workspace 'api'…"
+      herdr workspace create --label api --cwd /root/projects/api 2>/dev/null || true
     fi
   else
     echo "[rig] WARNING: herdr socket ${HERDR_SOCKET_PATH} did not appear — see /var/log/herdr-server.log" >&2
@@ -114,10 +124,10 @@ start_herdr() {
 # ── 3. Connection banner ─────────────────────────────────────────────────────
 if [ "${BACKEND}" = "both" ]; then
   backend_line="both (zellij + herdr, wire protocol 14) — muxrd auto-detects & serves ALL (MUXRD_BACKEND unset)"
-  session_line="${SESSION}  (exposed on BOTH backends — verify cross-backend routing; badge: zellij=green, herdr=blue)"
+  session_line="${SESSION} (zellij) · herdr spaces: main*, logs, api"
 elif [ "${BACKEND}" = "herdr" ]; then
   backend_line="herdr  (wire protocol 14; muxrd restricted via MUXRD_BACKEND=herdr)"
-  session_line="${SESSION}"
+  session_line="spaces: main*, logs, api"
 else
   backend_line="zellij"
   session_line="${SESSION}"
