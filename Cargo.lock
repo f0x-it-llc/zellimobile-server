@@ -2405,6 +2405,7 @@ dependencies = [
  "libc",
  "log",
  "prost 0.14.4",
+ "rand",
  "rcgen",
  "rustls",
  "rustls-pemfile",

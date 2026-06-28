@@ -48,7 +48,9 @@ pub use zellij::ZellijBackend;
 // import them as `crate::multiplexer::{make_id, resolve_session, …}` — the
 // correct layer (relay depends on multiplexer, grpc depends on multiplexer;
 // neither needs to reach into each other). S-M1 fix.
-pub(crate) use routing::{make_id, resolve_session, resolve_session_kind, validate_session};
+pub(crate) use routing::{
+    is_collapsed_backend_session, make_id, resolve_session, resolve_session_kind, validate_session,
+};
 
 /// Re-exported for the P2.05 backend selector in `bin/muxrd.rs` and the
 /// integration test harness.  The herdr sub-module remains `pub(crate)` to keep

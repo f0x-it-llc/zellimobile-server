@@ -105,8 +105,9 @@ impl MuxrService {
 
     /// Switch the connection's relay to a different space. MUTATING.
     ///
-    /// Routed through the connection's live relay (per-connection, then writable
-    /// session-scoped fallback). With no relay attached, returns `ActionAck{ok:false}`.
+    /// Routed through the connection's live relay by an **exact** connection_id match
+    /// (fail-closed — no session-scoped fallback; see `resolve_space_relay`). With no
+    /// matching connection, returns `ActionAck{ok:false, "reattach required …"}`.
     pub(super) async fn switch_space_impl(
         &self,
         request: Request<SwitchSpaceReq>,
@@ -126,19 +127,21 @@ impl MuxrService {
             "SwitchSpace: session='{session}' space_id='{space_id}' connection_id='{connection_id}'"
         );
 
-        // Locate the connection's relay control sender (per-connection, then any
-        // WRITABLE relay for the session). A read-only relay's inbound task would
-        // drop the SwitchSpace at its own guard, so the fallback skips read-only
-        // entries to avoid a false success.
+        // Locate the connection's relay control sender by an EXACT connection_id
+        // match (fail-closed; see `resolve_space_relay`). No session-scoped fallback:
+        // on a collapsed herdr session that would re-point a co-attached client's
+        // stream (S-M2/S-M4). On no match return ok:false — never steer an arbitrary
+        // relay.
         let sender = match self.resolve_space_relay(&session, &connection_id) {
             Some(s) => s,
             None => {
-                log::info!("SwitchSpace: no live relay for '{session}' — not attached");
+                log::info!(
+                    "SwitchSpace: no matching connection for '{session}' \
+                     (connection_id='{connection_id}') — fail-closed"
+                );
                 return Ok(Response::new(ProtoAck {
                     ok: false,
-                    error: "SwitchSpace: no live attach for this session — \
-                            attach the session before switching spaces"
-                        .to_owned(),
+                    error: "reattach required (no matching connection)".to_owned(),
                     info: String::new(),
                 }));
             }
@@ -269,55 +272,50 @@ impl MuxrService {
     // ── Private routing helpers ─────────────────────────────────────────────────
 
     /// The space (herdr workspace) the connection's relay is currently viewing, if
-    /// any. Looks up the per-connection [`RelayViewState`] the same way
-    /// `get_layout_impl` does: exact `connection_id` (validated against `session`)
-    /// first, then a session-scoped fallback. Returns `None` when no relay is
-    /// attached or it has not switched spaces yet (caller falls back to the
-    /// backend-reported active).
+    /// any. Looks up the per-connection [`RelayViewState`] by an **exact**
+    /// `connection_id` match (validated against `session`).
+    ///
+    /// S-M2/S-M4: spaces are herdr-only, and herdr collapses every connection onto
+    /// the single `herdr:herdr` session — so a session-scoped fallback here would
+    /// read **another** connection's `current_space` and mark the wrong space active
+    /// for this caller. We therefore drop the fallback: on an absent/mismatched
+    /// connection_id we return `None`, and `get_spaces_impl` falls back to the
+    /// backend-reported active (GetSpaces) rather than a sibling relay's view-state.
     ///
     /// [`RelayViewState`]: crate::relay::RelayViewState
     fn connection_current_space(&self, session: &str, connection_id: &str) -> Option<String> {
-        // Per-connection lookup (clone out of the DashMap guard — never held across
-        // an `.await`; this is a sync helper anyway).
-        if !connection_id.is_empty()
-            && let Some(space) = self
-                .view_state
-                .get(connection_id)
-                .filter(|entry| entry.session == session)
-                .map(|entry| entry.state.current_space.clone())
-        {
-            return space;
+        // Exact per-connection lookup only (clone out of the DashMap guard — never
+        // held across an `.await`; this is a sync helper anyway). No session-scoped
+        // fallback: it would leak a sibling connection's current_space.
+        if connection_id.is_empty() {
+            return None;
         }
-        // Session-scoped fallback: any relay attached to this session.
         self.view_state
-            .iter()
-            .find(|entry| entry.session == session)
+            .get(connection_id)
+            .filter(|entry| entry.session == session)
             .and_then(|entry| entry.state.current_space.clone())
     }
 
     /// Resolve the control sender for the connection's relay for a SwitchSpace.
     ///
-    /// Per-connection (validated `connection_id` + session match) first, then a
-    /// **writable** session-scoped fallback. Read-only relays are skipped in the
-    /// fallback: their inbound task drops `SwitchSpace`, which would otherwise yield
-    /// a false success. Returns `None` when no suitable relay is attached.
+    /// SwitchSpace is herdr-only and MUTATING, and herdr collapses every connection
+    /// onto the single `herdr:herdr` session. A session-scoped fallback would
+    /// re-point a **co-attached** connection's wire stream when this caller's
+    /// connection_id is empty/stale (the S-M2/S-M4 isolation violation). So this is
+    /// **fail-closed**: an exact `connection_id` match (validated against `session`)
+    /// is required, with no fallback. Returns `None` when connection_id is empty or
+    /// does not match a live relay (caller returns `ActionAck{ok:false}`).
     fn resolve_space_relay(
         &self,
         session: &str,
         connection_id: &str,
     ) -> Option<tokio::sync::mpsc::UnboundedSender<RelayControl>> {
-        if !connection_id.is_empty()
-            && let Some(sender) = self
-                .control
-                .get(connection_id)
-                .filter(|entry| entry.session == session)
-                .map(|entry| entry.sender.clone())
-        {
-            return Some(sender);
+        if connection_id.is_empty() {
+            return None;
         }
         self.control
-            .iter()
-            .find(|entry| entry.session == session && !entry.read_only)
+            .get(connection_id)
+            .filter(|entry| entry.session == session)
             .map(|entry| entry.sender.clone())
     }
 }
@@ -376,5 +374,85 @@ mod tests {
         // zellij path: list_spaces returns empty → no spaces, regardless of override.
         assert!(map_with_override(vec![], None).is_empty());
         assert!(map_with_override(vec![], Some("x")).is_empty());
+    }
+
+    // ─── S-M2/S-M4: fail-closed relay/view-state resolution ──────────────────
+
+    use crate::grpc::MuxrService;
+    use crate::relay::{ControlEntry, RelayControl, RelayViewState, ViewStateEntry};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn resolve_space_relay_requires_exact_connection_id() {
+        // SwitchSpace is herdr-only + mutating: an empty/guessed connection_id must
+        // NOT resolve to the victim's relay (no session-scoped fallback — S-M2/S-M4).
+        let service = MuxrService::new();
+        let (tx, _rx) = mpsc::unbounded_channel::<RelayControl>();
+        service.control.insert(
+            "victim-conn".to_owned(),
+            ControlEntry {
+                session: "herdr:herdr".to_owned(),
+                sender: tx,
+                read_only: false,
+            },
+        );
+        // Exact match resolves.
+        assert!(
+            service
+                .resolve_space_relay("herdr:herdr", "victim-conn")
+                .is_some(),
+            "exact connection_id must resolve"
+        );
+        // Empty connection_id → None (fail-closed; no steer onto the victim).
+        assert!(
+            service.resolve_space_relay("herdr:herdr", "").is_none(),
+            "empty connection_id must fail closed (no session fallback)"
+        );
+        // Guessed/stale connection_id → None.
+        assert!(
+            service
+                .resolve_space_relay("herdr:herdr", "guessed-1")
+                .is_none(),
+            "wrong connection_id must fail closed"
+        );
+    }
+
+    #[test]
+    fn connection_current_space_requires_exact_connection_id() {
+        // GetSpaces read fallback: an empty/wrong connection_id must NOT read the
+        // victim connection's current_space (it falls back to backend-active instead).
+        let service = MuxrService::new();
+        let state = RelayViewState {
+            current_space: Some("ws-2".to_owned()),
+            ..RelayViewState::default()
+        };
+        service.view_state.insert(
+            "victim-conn".to_owned(),
+            ViewStateEntry {
+                session: "herdr:herdr".to_owned(),
+                state,
+            },
+        );
+        // Exact match reads the connection's space.
+        assert_eq!(
+            service
+                .connection_current_space("herdr:herdr", "victim-conn")
+                .as_deref(),
+            Some("ws-2"),
+            "exact connection_id reads the connection's current_space"
+        );
+        // Empty / wrong connection_id → None (won't leak the victim's view-state).
+        assert!(
+            service
+                .connection_current_space("herdr:herdr", "")
+                .is_none(),
+            "empty connection_id must not read a sibling's current_space"
+        );
+        assert!(
+            service
+                .connection_current_space("herdr:herdr", "other-conn")
+                .is_none(),
+            "wrong connection_id must not read a sibling's current_space"
+        );
     }
 }

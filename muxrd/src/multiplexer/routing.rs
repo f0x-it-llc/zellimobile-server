@@ -55,6 +55,21 @@ pub(crate) fn validate_session(session: &str) -> Result<(), Status> {
     crate::ipc::validate_session_name(session).map_err(Status::invalid_argument)
 }
 
+/// True when `id` names a backend whose sessions **collapse to a single shared
+/// session id** — currently only herdr (Option A collapses every herdr workspace
+/// into the singular `herdr:herdr` muxr session).
+///
+/// For such ids `entry.session == session` is constant-true across *every*
+/// co-attached relay, so the `connection_id` is the SOLE per-connection
+/// discriminator. Any **mutating** per-connection control routing on a collapsed
+/// session MUST therefore require an exact `connection_id` match and drop the
+/// session-scoped fallback — otherwise an authed RW client could steer a victim
+/// connection's stream by sending an empty/guessed `connection_id`
+/// (Round-1 S-M2/S-M4). zellij sessions have distinct names and are unaffected.
+pub(crate) fn is_collapsed_backend_session(id: &str) -> bool {
+    matches!(id.split_once(':'), Some(("herdr", _)))
+}
+
 /// Mint an opaque, backend-qualified session id: `"<backend>:<bare>"`.
 ///
 /// The inverse of [`resolve_session`]. The `<backend>` token is the lowercase
@@ -185,6 +200,20 @@ mod tests {
                 Arc::new(ZellijBackend) as Arc<dyn MuxBackend>,
             ),
         ])
+    }
+
+    #[test]
+    fn is_collapsed_backend_session_is_true_only_for_herdr() {
+        // herdr collapses every workspace onto a single session id → collapsed.
+        assert!(is_collapsed_backend_session("herdr:herdr"));
+        assert!(is_collapsed_backend_session("herdr:anything"));
+        // zellij sessions have distinct names → NOT collapsed (keep session fallback).
+        assert!(!is_collapsed_backend_session("zellij:dev"));
+        assert!(!is_collapsed_backend_session("zellij:herdr"));
+        // legacy bare names / unknown prefixes are not the herdr sentinel.
+        assert!(!is_collapsed_backend_session("herdr"));
+        assert!(!is_collapsed_backend_session("dev"));
+        assert!(!is_collapsed_backend_session(""));
     }
 
     #[test]

@@ -115,7 +115,7 @@
 //! single in-flight query the first Log is tabs and the second is panes.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use futures::StreamExt;
@@ -137,12 +137,24 @@ pub use types::{
     ViewStateEntry, ViewStateRegistry,
 };
 
-// ─── Process-unique connection id counter ─────────────────────────────────────
+// ─── Unguessable per-connection id ────────────────────────────────────────────
 
-/// Monotonic counter used to mint a process-unique `connection_id` per
-/// `AttachTerminal` relay. Cheaper than a UUID and sufficient for our needs:
-/// we only need uniqueness within one server process lifetime.
-static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+/// Mint an **unguessable, non-enumerable** `connection_id` for an `AttachTerminal`
+/// relay (S-M4 security fix).
+///
+/// connection_id is the SOLE per-connection isolation discriminator on a collapsed
+/// backend session (herdr's single `herdr:herdr` session — see
+/// [`crate::multiplexer::is_collapsed_backend_session`]): every co-attached relay
+/// shares the same session id, so the routing layer relies entirely on a
+/// connection_id match. The previous monotonic `AtomicU64` counter (starting at
+/// one) was trivially guessable — an authed RW client could enumerate ids and
+/// re-point a victim connection's stream. We therefore mint a 128-bit value from a
+/// CSPRNG (`rand::thread_rng`, ChaCha-based, OS-seeded) and format it as a 32-char
+/// lowercase hex string for the proto wire. It stays stable for the connection's
+/// lifetime and a reattach mints a fresh one (as before).
+fn mint_connection_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
 
 use reader::{ShutdownGuard, render_loop};
 use types::{InFlightQuery, RENDER_CHANNEL_BOUND, RO_FALLBACK_COLS, RO_FALLBACK_ROWS};
@@ -275,13 +287,11 @@ pub async fn attach_relay(
     // and were never counted.
     let client_guard = clients.attach(&count_key);
 
-    // ── 3b. Mint a process-unique connection_id for this relay. ─────────────
-    // Monotonic AtomicU64 is cheaper than UUID and sufficient: we only need
-    // uniqueness within one server process lifetime. Format as a decimal string
-    // for easy proto transport.
-    let connection_id = NEXT_CONNECTION_ID
-        .fetch_add(1, Ordering::Relaxed)
-        .to_string();
+    // ── 3b. Mint an unguessable, non-enumerable connection_id for this relay. ─
+    // S-M4: connection_id is the sole per-connection isolation discriminator on a
+    // collapsed (herdr) session, so it must NOT be guessable/enumerable. A 128-bit
+    // CSPRNG hex string (see `mint_connection_id`).
+    let connection_id = mint_connection_id();
     log::info!(
         "relay [{session_name}]: minted connection_id={connection_id} \
          (read_only={read_only})"
@@ -455,5 +465,51 @@ pub(crate) fn clamp_dim(v: u32, default: u16) -> u16 {
         default
     } else {
         v.min(u16::MAX as u32) as u16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_id_is_32_char_lowercase_hex() {
+        let id = mint_connection_id();
+        assert_eq!(id.len(), 32, "connection_id must be 32 hex chars (128-bit)");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "connection_id must be lowercase hex: {id}"
+        );
+    }
+
+    #[test]
+    fn connection_ids_are_random_not_sequential() {
+        // S-M4: the old mint was a monotonic AtomicU64 (adjacent ids differed by 1
+        // and were trivially enumerable). The CSPRNG mint must produce values that
+        // are neither equal nor adjacent across a batch of mints.
+        let mut ids = Vec::new();
+        for _ in 0..64 {
+            ids.push(u128::from_str_radix(&mint_connection_id(), 16).expect("valid hex"));
+        }
+        // All distinct (collision probability for 64 draws from 2^128 is ~0).
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ids.len(),
+            "minted connection_ids must be unique"
+        );
+
+        // No two consecutive mints differ by exactly 1 (the monotonic-counter
+        // signature). With random 128-bit values this is astronomically unlikely.
+        for pair in ids.windows(2) {
+            let delta = pair[0].abs_diff(pair[1]);
+            assert_ne!(
+                delta, 1,
+                "consecutive mints must not be adjacent (not a counter)"
+            );
+        }
     }
 }
