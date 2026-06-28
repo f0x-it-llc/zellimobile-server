@@ -16,10 +16,11 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::muxr_server::Muxr;
 use crate::proto::{
-    ActionAck as ProtoAck, ClientFrame, CreateSessionReq, Empty, Layout, LoginRequest,
-    LoginResponse, NewPaneReq, NewTabReq, PaneTarget, RenamePaneReq, RenameSessionReq,
-    RenameTabReq, ResizePaneReq, ScrollReq, SessionList, SessionRef, TabTarget,
-    ToggleFullscreenReq, VersionInfo, WriteToPaneReq,
+    ActionAck as ProtoAck, ClientFrame, CloseSpaceReq, CreateSessionReq, CreateSpaceReq, Empty,
+    Layout, LoginRequest, LoginResponse, NewPaneReq, NewTabReq, PaneTarget, RenamePaneReq,
+    RenameSessionReq, RenameSpaceReq, RenameTabReq, ResizePaneReq, ScrollReq, SessionList,
+    SessionRef, SpaceList, SwitchSpaceReq, TabTarget, ToggleFullscreenReq, VersionInfo,
+    WriteToPaneReq,
 };
 
 pub mod helpers;
@@ -395,5 +396,52 @@ impl Muxr for MuxrService {
         request: Request<crate::proto::RevokeTokenReq>,
     ) -> Result<Response<ProtoAck>, Status> {
         self.revoke_token_impl(request).await
+    }
+
+    // ── Spaces (herdr workspaces) — T03 fills these ───────────────────────────
+    //
+    // These five stubs satisfy the tonic-generated `Muxr` trait after the proto
+    // added GetSpaces/SwitchSpace/CreateSpace/RenameSpace/CloseSpace in T01.
+    // Each returns `unimplemented` so the server builds and existing RPCs stay
+    // fully functional.  T03 replaces every stub with real herdr logic.
+
+    // TODO(T03): implement GetSpaces via HerdrBackend::list_spaces.
+    async fn get_spaces(
+        &self,
+        _request: Request<SessionRef>,
+    ) -> Result<Response<SpaceList>, Status> {
+        Err(Status::unimplemented("spaces: implemented in T03"))
+    }
+
+    // TODO(T03): implement SwitchSpace via HerdrBackend::switch_space.
+    async fn switch_space(
+        &self,
+        _request: Request<SwitchSpaceReq>,
+    ) -> Result<Response<ProtoAck>, Status> {
+        Err(Status::unimplemented("spaces: implemented in T03"))
+    }
+
+    // TODO(T03): implement CreateSpace via HerdrBackend::create_space.
+    async fn create_space(
+        &self,
+        _request: Request<CreateSpaceReq>,
+    ) -> Result<Response<ProtoAck>, Status> {
+        Err(Status::unimplemented("spaces: implemented in T03"))
+    }
+
+    // TODO(T03): implement RenameSpace via HerdrBackend::rename_space.
+    async fn rename_space(
+        &self,
+        _request: Request<RenameSpaceReq>,
+    ) -> Result<Response<ProtoAck>, Status> {
+        Err(Status::unimplemented("spaces: implemented in T03"))
+    }
+
+    // TODO(T03): implement CloseSpace via HerdrBackend::close_space.
+    async fn close_space(
+        &self,
+        _request: Request<CloseSpaceReq>,
+    ) -> Result<Response<ProtoAck>, Status> {
+        Err(Status::unimplemented("spaces: implemented in T03"))
     }
 }

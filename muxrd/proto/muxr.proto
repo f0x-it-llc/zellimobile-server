@@ -80,6 +80,21 @@ service Muxr {
   // Create a new detached session by name. MUTATING.
   rpc CreateSession(CreateSessionReq) returns (ActionAck);
 
+  // ─── Spaces (herdr workspaces) ────────────────────────────────────────────
+  // Herdr maps workspaces to spaces; zellij returns an empty SpaceList.
+  // All require bearer auth.  MUTATING ops reject read-only tokens.
+
+  // List all spaces (herdr workspaces) for a session. Zellij returns empty.
+  rpc GetSpaces(SessionRef)       returns (SpaceList);
+  // Switch the active space. MUTATING.
+  rpc SwitchSpace(SwitchSpaceReq) returns (ActionAck);
+  // Create a new space with an optional label. MUTATING.
+  rpc CreateSpace(CreateSpaceReq) returns (ActionAck);
+  // Rename an existing space. MUTATING.
+  rpc RenameSpace(RenameSpaceReq) returns (ActionAck);
+  // Close (delete) a space. MUTATING.
+  rpc CloseSpace(CloseSpaceReq)   returns (ActionAck);
+
   // ─── Phase F: token management ─────────────────────────────────────────────
   // Wraps the same zellij `web_authentication_tokens` ops the CLI uses. All
   // require bearer auth and are ADMIN-gated: read-only session tokens are
@@ -460,4 +475,64 @@ message CreateSessionReq {
   string layout = 2;
   // Which backend to create the session on (required when >1 backend available).
   Backend backend = 3;
+}
+
+// ─── Spaces (herdr workspaces) ────────────────────────────────────────────────
+// A Space is a herdr workspace.  Zellij sessions always return an empty list.
+
+// One herdr workspace / space.
+message Space {
+  // Opaque herdr workspace id.
+  string id     = 1;
+  // Display name of the workspace.
+  string name   = 2;
+  // Whether this is the currently-active workspace.
+  bool   active = 3;
+}
+
+// List of spaces returned by GetSpaces.
+message SpaceList {
+  repeated Space spaces = 1;
+}
+
+// SwitchSpace request — activate a different space.
+message SwitchSpaceReq {
+  // Backend-qualified session id (echoed verbatim from SessionInfo.id).
+  string session       = 1;
+  // Opaque space id to switch to.
+  string space_id      = 2;
+  // optional; per-connection routing (echoed from AttachTerminal connection_id).
+  string connection_id = 3;
+}
+
+// CreateSpace request — create a new herdr workspace.
+message CreateSpaceReq {
+  // Backend-qualified session id.
+  string session       = 1;
+  // Human-readable label for the new space (may be empty).
+  string label         = 2;
+  // optional; per-connection routing.
+  string connection_id = 3;
+}
+
+// RenameSpace request — rename an existing space.
+message RenameSpaceReq {
+  // Backend-qualified session id.
+  string session       = 1;
+  // Opaque space id to rename.
+  string space_id      = 2;
+  // New display label.
+  string label         = 3;
+  // optional; per-connection routing.
+  string connection_id = 4;
+}
+
+// CloseSpace request — close (delete) a space.
+message CloseSpaceReq {
+  // Backend-qualified session id.
+  string session       = 1;
+  // Opaque space id to close.
+  string space_id      = 2;
+  // optional; per-connection routing.
+  string connection_id = 3;
 }
