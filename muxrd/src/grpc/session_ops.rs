@@ -61,6 +61,8 @@ impl MuxrService {
         // Build concurrent futures — one per backend, timeout-wrapped. The
         // `spawn_blocking` keeps the blocking IPC call off the async executor
         // (CODE_STANDARDS: never `.await` blocking IPC directly).
+        // The backend Arc is carried through in the result tuple so it can be
+        // used in the merge phase for the herdr space_count pre-fetch.
         let backend_futures: Vec<_> = self
             .backends
             .iter()
@@ -69,12 +71,13 @@ impl MuxrService {
                 async move {
                     let result = tokio::time::timeout(
                         LIST_SESSIONS_BACKEND_TIMEOUT,
-                        tokio::task::spawn_blocking(move || {
-                            backend.list_sessions_with_resurrectables()
+                        tokio::task::spawn_blocking({
+                            let backend = backend.clone();
+                            move || backend.list_sessions_with_resurrectables()
                         }),
                     )
                     .await;
-                    (kind, result)
+                    (kind, backend, result)
                 }
             })
             .collect();
@@ -84,7 +87,7 @@ impl MuxrService {
 
         // Merge sessions from all backends that succeeded within the timeout.
         let mut proto_sessions: Vec<crate::proto::SessionInfo> = Vec::new();
-        for (kind, result) in backend_results {
+        for (kind, backend, result) in backend_results {
             let sessions = match result {
                 // S-M3: timeout — warn + skip, return whatever other backends had.
                 Err(_elapsed) => {
@@ -111,10 +114,50 @@ impl MuxrService {
                 Ok(Ok(Ok(sessions))) => sessions,
             };
 
+            // For herdr, pre-fetch the space count in a single spawn_blocking
+            // call (herdr collapses to one session, so at most one IPC round-trip
+            // per ListSessions). For every other backend the default is 0.
+            // Degrade gracefully: any error → warn + 0, never abort the whole RPC.
+            let herdr_space_count: u32 = if kind == crate::cli::BackendKind::Herdr {
+                // herdr ignores the session argument (single daemon), but we pass
+                // the canonical sentinel name for clarity.
+                let b = backend.clone();
+                match tokio::task::spawn_blocking(move || {
+                    b.list_spaces(crate::multiplexer::herdr::backend::HERDR_SESSION)
+                })
+                .await
+                {
+                    Ok(Ok(spaces)) => spaces.len() as u32,
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            "ListSessions: list_spaces failed for herdr, \
+                             defaulting space_count to 0: {e:#}"
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "ListSessions: list_spaces task panicked for herdr, \
+                             defaulting space_count to 0: {e}"
+                        );
+                        0
+                    }
+                }
+            } else {
+                0
+            };
+
             let proto_kind = proto_backend(kind) as i32;
             for (name, age_secs, resurrectable) in sessions {
                 let id = make_id(kind, &name);
                 let connected_clients = clients.count(&id);
+                // space_count is per-backend (not per-session): herdr exposes its
+                // workspace count on the single collapsed session; zellij = 0.
+                let space_count = if kind == crate::cli::BackendKind::Herdr {
+                    herdr_space_count
+                } else {
+                    0
+                };
                 proto_sessions.push(crate::proto::SessionInfo {
                     name,
                     age_secs,
@@ -126,6 +169,7 @@ impl MuxrService {
                     connected_clients,
                     backend: proto_kind,
                     id,
+                    space_count,
                 });
             }
         }

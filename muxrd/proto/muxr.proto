@@ -261,6 +261,11 @@ message SessionInfo {
   Backend backend           = 9;
   // Opaque backend-qualified routing key (e.g. "zellij:dev").
   string  id                = 10;
+  // Number of spaces (herdr workspaces) for this session; 0 for backends
+  // without a space layer (e.g. zellij). Populated by ListSessions so the
+  // client can show a space count on herdr session cards without a separate
+  // GetSpaces call.
+  uint32 space_count        = 11;
 }
 
 // Full tab/pane layout for a session (returned by GetLayout).
