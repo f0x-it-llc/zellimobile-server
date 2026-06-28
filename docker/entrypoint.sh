@@ -1,55 +1,94 @@
 #!/usr/bin/env bash
 # Entrypoint for the Muxr dev rig.
 #
-# Boots the selected multiplexer backend + an SSH server, then waits. You SSH in
-# (no password) and run `muxrctl` to configure the cert + tokens and start the
+# Boots the selected multiplexer backend(s) + an SSH server, then waits. You SSH
+# in (no password) and run `muxrctl` to configure the cert + tokens and start the
 # gRPC server:
 #
 #   ssh -t root@<host> -p <ssh-port>      # no password
 #   muxrctl                             # Configure → Cert → Tokens → Server → Pair
 #
 # Environment variables:
-#   BACKEND  — multiplexer backend: `zellij` (default) | `herdr`
-#   SESSION  — session / herdr-workspace name  (default: backend-dev)
+#   BACKEND  — multiplexer backend(s) to boot:
+#                `zellij` (default) | `herdr` | `both`
+#              • zellij / herdr → muxrd is restricted to that ONE backend
+#                (MUXRD_BACKEND is exported so the muxrctl-spawned daemon selects it).
+#              • both           → start zellij AND a headless herdr server, and
+#                leave MUXRD_BACKEND UNSET so muxrd auto-detects and serves BOTH
+#                simultaneously (Phase 3 serve-all default). This is the on-device
+#                multi-backend test rig.
+#   SESSION  — session / herdr-workspace name  (default: backend-dev). In `both`
+#              mode BOTH backends expose a session with this same name on purpose,
+#              so you can verify same-name cross-backend routing (the app tells
+#              them apart by the backend badge: zellij = green, herdr = blue).
 set -euo pipefail
 
 BACKEND="${BACKEND:-zellij}"
 SESSION="${SESSION:-backend-dev}"
 HERDR_SOCKET_PATH="${HERDR_SOCKET_PATH:-/root/.config/herdr/herdr.sock}"
 
+case "${BACKEND}" in
+  zellij|herdr|both) ;;
+  *) echo "[rig] ERROR: BACKEND must be one of: zellij | herdr | both (got '${BACKEND}')" >&2; exit 1 ;;
+esac
+
+# Which backend(s) does this run drive?
+want_zellij=0; want_herdr=0
+[ "${BACKEND}" = "zellij" ] && want_zellij=1
+[ "${BACKEND}" = "herdr" ]  && want_herdr=1
+[ "${BACKEND}" = "both" ]   && { want_zellij=1; want_herdr=1; }
+
 # ── 0. Propagate the rig env to SSH login shells ─────────────────────────────
 # sshd does NOT pass the container's docker `ENV` to interactive sessions, so
 # `muxrctl` run over SSH would not see them — and the muxrctl-spawned `muxrd`
-# daemon inherits muxrctl's env, so for the herdr backend MUXRD_BACKEND +
-# HERDR_SOCKET_PATH must land here too or the daemon would default to zellij.
-# The entrypoint runs WITH the container env, so mirror the relevant vars where
-# SSH logins pick them up: /etc/environment (read by PAM for every session) and
-# /etc/profile.d (sourced by login shells).
+# daemon inherits muxrctl's env. Mirror the relevant vars where SSH logins pick
+# them up: /etc/environment (read by PAM for every session) and /etc/profile.d
+# (sourced by login shells).
+#
+# Backend-selection rule (muxrd: CLI --backend > MUXRD_BACKEND env > serve-all):
+#   • single backend (zellij/herdr) → export MUXRD_BACKEND to RESTRICT to it.
+#   • both                          → DO NOT export MUXRD_BACKEND, so muxrd
+#                                     auto-detects every available backend and
+#                                     serves them all simultaneously.
+# HERDR_SOCKET_PATH is exported whenever herdr is in play (herdr/both) so muxrd's
+# herdr probe + the headless herdr server agree on the socket location.
+restrict_backend=""
+[ "${BACKEND}" = "zellij" ] && restrict_backend="zellij"
+[ "${BACKEND}" = "herdr" ]  && restrict_backend="herdr"
+
 {
   printf 'ZELLIMSERVER_BIND=%s\nZELLIMSERVER_SAN=%s\n' \
     "${ZELLIMSERVER_BIND:-}" "${ZELLIMSERVER_SAN:-}"
-  if [ "${BACKEND}" = "herdr" ]; then
-    printf 'MUXRD_BACKEND=herdr\nHERDR_SOCKET_PATH=%s\n' "${HERDR_SOCKET_PATH}"
-  fi
+  [ -n "${restrict_backend}" ] && printf 'MUXRD_BACKEND=%s\n' "${restrict_backend}"
+  [ "${want_herdr}" -eq 1 ] && printf 'HERDR_SOCKET_PATH=%s\n' "${HERDR_SOCKET_PATH}"
 } > /etc/environment
 {
   printf "export ZELLIMSERVER_BIND='%s'\nexport ZELLIMSERVER_SAN='%s'\n" \
     "${ZELLIMSERVER_BIND:-}" "${ZELLIMSERVER_SAN:-}"
-  if [ "${BACKEND}" = "herdr" ]; then
-    printf "export MUXRD_BACKEND='herdr'\nexport HERDR_SOCKET_PATH='%s'\n" "${HERDR_SOCKET_PATH}"
-  fi
+  [ -n "${restrict_backend}" ] && printf "export MUXRD_BACKEND='%s'\n" "${restrict_backend}"
+  [ "${want_herdr}" -eq 1 ] && printf "export HERDR_SOCKET_PATH='%s'\n" "${HERDR_SOCKET_PATH}"
 } > /etc/profile.d/zellim-env.sh
 chmod 0644 /etc/profile.d/zellim-env.sh
 
 # ── 1. Clear root's password so SSH login needs no credential (dev rig) ──────
 passwd -d root
 
-# ── 2. Start the selected backend ────────────────────────────────────────────
-if [ "${BACKEND}" = "herdr" ]; then
-  # ── herdr: a SEPARATE, UNMODIFIED, user-installed binary (AGPL-3.0). muxrd
-  # drives it only over its public 0600 sockets; muxrd stays the TLS/bearer
-  # boundary. Start a headless herdr server and seed a demo workspace so the app
-  # has a session to attach to. muxrd selects herdr via MUXRD_BACKEND (above).
+# ── 2. Backend boot helpers ──────────────────────────────────────────────────
+start_zellij() {
+  # zellij: install the managed config (empty load_plugins so the zellij:link
+  # background plugin never loads) into the persisted config volume, then start a
+  # backgrounded session muxrd attaches to once started from muxrctl.
+  mkdir -p /root/.config/zellij
+  cp /usr/local/share/muxr/config.kdl /root/.config/zellij/config.kdl
+  echo "[rig] starting zellij session '${SESSION}'…"
+  zellij --layout muxr attach --create-background "${SESSION}" || true
+}
+
+start_herdr() {
+  # herdr: a SEPARATE, UNMODIFIED, user-installed binary (AGPL-3.0). muxrd drives
+  # it only over its public 0600 sockets; muxrd stays the TLS/bearer boundary.
+  # Start a headless herdr server and seed a demo workspace so the app has a
+  # session to attach to.
   export HERDR_SOCKET_PATH
   echo "[rig] starting headless herdr server…"
   herdr server > /var/log/herdr-server.log 2>&1 &
@@ -67,17 +106,23 @@ if [ "${BACKEND}" = "herdr" ]; then
   else
     echo "[rig] WARNING: herdr socket ${HERDR_SOCKET_PATH} did not appear — see /var/log/herdr-server.log" >&2
   fi
-else
-  # ── zellij (default): install the managed config (empty load_plugins so the
-  # zellij:link background plugin never loads) into the persisted config volume,
-  # then start a backgrounded session muxrd attaches to once started from muxrctl.
-  mkdir -p /root/.config/zellij
-  cp /usr/local/share/muxr/config.kdl /root/.config/zellij/config.kdl
-  echo "[rig] starting zellij session '${SESSION}'…"
-  zellij --layout muxr attach --create-background "${SESSION}" || true
-fi
+}
+
+[ "${want_zellij}" -eq 1 ] && start_zellij
+[ "${want_herdr}" -eq 1 ] && start_herdr
 
 # ── 3. Connection banner ─────────────────────────────────────────────────────
+if [ "${BACKEND}" = "both" ]; then
+  backend_line="both (zellij + herdr, wire protocol 14) — muxrd auto-detects & serves ALL (MUXRD_BACKEND unset)"
+  session_line="${SESSION}  (exposed on BOTH backends — verify cross-backend routing; badge: zellij=green, herdr=blue)"
+elif [ "${BACKEND}" = "herdr" ]; then
+  backend_line="herdr  (wire protocol 14; muxrd restricted via MUXRD_BACKEND=herdr)"
+  session_line="${SESSION}"
+else
+  backend_line="zellij"
+  session_line="${SESSION}"
+fi
+
 cat <<BANNER
 
 ╔══════════════════════════════════════════════════════════════════╗
@@ -90,8 +135,8 @@ cat <<BANNER
        muxrctl
      → Configure → Cert → Tokens → Server (start) → Pair (scan the QR)
 
-  backend        : ${BACKEND}$([ "${BACKEND}" = "herdr" ] && printf '  (wire protocol 14; muxrd auto-selects via MUXRD_BACKEND)')
-  session/space  : ${SESSION}
+  backend        : ${backend_line}
+  session/space  : ${session_line}
   gRPC port      : 50051 (published once you start the server)
 ╚══════════════════════════════════════════════════════════════════╝
 

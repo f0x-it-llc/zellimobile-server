@@ -5,15 +5,22 @@
 #   builder        — rust:1.92-alpine, static musl binaries (muxrd + muxrctl)
 #   runtime        — debian:trixie-slim with full terminal tooling + zellij 0.44.3,
 #                    an SSH server, and muxrctl to configure/start the server
-#                    (the DEFAULT image — `--backend zellij`)
-#   runtime-herdr  — runtime + a pinned, UNMODIFIED upstream herdr binary, for
-#                    exercising muxrd's herdr backend (`--backend herdr`). Built
-#                    ONLY when the `herdr` compose profile is selected, so the
-#                    default rig never pulls herdr.
+#                    (the DEFAULT image — zellij only)
+#   runtime-herdr  — runtime + a pinned, UNMODIFIED upstream herdr binary, so the
+#                    image carries BOTH backends (zellij AND herdr). Built ONLY
+#                    when a herdr-bearing compose profile is selected, so the
+#                    default rig never pulls herdr. The entrypoint's BACKEND env
+#                    picks what this image actually runs:
+#                      BACKEND=herdr → muxrd restricted to herdr
+#                      BACKEND=both  → start zellij + herdr; muxrd auto-detects &
+#                                      serves BOTH simultaneously (Phase 3
+#                                      serve-all default — the on-device multi-
+#                                      backend test rig)
 #
 # Build context: repo root  (compose sets context: ..)
-#   docker compose -f docker/compose.yaml up --build                 # zellij (default)
-#   docker compose -f docker/compose.yaml --profile herdr up --build muxrd-herdr   # herdr
+#   docker compose -f docker/compose.yaml up --build                              # zellij (default)
+#   docker compose -f docker/compose.yaml --profile herdr up --build muxrd-herdr  # herdr only
+#   docker compose -f docker/compose.yaml --profile both  up --build muxrd-both   # BOTH backends
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -173,11 +180,16 @@ EXPOSE 50051 22
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 3 — runtime-herdr: the runtime image + a pinned, UNMODIFIED herdr binary
+# Stage 3 — runtime-herdr: the runtime image (zellij) + a pinned, UNMODIFIED herdr
+#           binary → an image carrying BOTH backends
 # ══════════════════════════════════════════════════════════════════════════════
-# Opt-in variant for exercising muxrd's herdr backend (`muxrd --backend herdr`).
-# Built ONLY when the `herdr` compose profile / `runtime-herdr` target is selected,
-# so the DEFAULT zellij rig (`target: runtime`) never pulls herdr.
+# Opt-in variant. Because it extends `runtime` (which already has zellij 0.44.3)
+# and adds the herdr binary, this single image can run muxrd against herdr alone
+# (`BACKEND=herdr`) OR against zellij AND herdr simultaneously (`BACKEND=both`,
+# Phase 3 serve-all — the on-device multi-backend test rig). The entrypoint
+# branches on BACKEND. Built ONLY when a herdr-bearing compose profile selects
+# `target: runtime-herdr`, so the DEFAULT zellij rig (`target: runtime`) never
+# pulls herdr.
 #
 # AGPL-3.0 discipline: herdr is a SEPARATE, UNMODIFIED, user-installed binary that
 # muxrd drives only over its public Unix sockets. We download the official upstream
@@ -198,9 +210,12 @@ RUN set -eux; \
     head -c 64 /usr/local/bin/herdr | grep -q ELF; \
     echo "herdr ${HERDR_VERSION} installed (wire protocol 14)"
 
-# This image drives the herdr backend. The entrypoint propagates MUXRD_BACKEND +
-# HERDR_SOCKET_PATH to SSH login sessions so the muxrctl-spawned daemon selects
-# herdr automatically (muxrd: CLI --backend > MUXRD_BACKEND env > zellij default).
+# Default this image to the herdr-only backend; compose overrides BACKEND per
+# service (`herdr` or `both`). The entrypoint propagates HERDR_SOCKET_PATH to SSH
+# login sessions (and MUXRD_BACKEND only in single-backend mode) so the muxrctl-
+# spawned daemon resolves the right backend(s):
+#   muxrd selection = CLI --backend > MUXRD_BACKEND env > serve-all (Phase 3).
+#   BACKEND=herdr → MUXRD_BACKEND=herdr (restrict);  BACKEND=both → unset (serve all).
 ENV BACKEND=herdr
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
