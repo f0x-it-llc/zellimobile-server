@@ -286,6 +286,21 @@ impl MuxSender for HerdrMuxSender {
         self.reattach(terminal_id)
     }
 
+    fn switch_space(&mut self, space_id: &str) -> Result<()> {
+        // Space switch IS re-attach (Option A; Decision 2 — per-connection view):
+        // resolve the target workspace's focused pane, re-point THIS connection's
+        // wire stream at it, and record the new workspace as current — so the next
+        // `query_layout_result()` (which reads `self.workspace_id`) returns the new
+        // space's tabs. We deliberately do NOT call herdr's daemon-global
+        // `workspace.focus`: that would yank every co-attached desktop client. The
+        // wire is workspace-agnostic (terminal_ids are globally unique), so this
+        // reuses the shared pane/tab registries safely across workspaces.
+        let (_pane_id, terminal_id) = resolve_focused_terminal(&self.control, space_id)?;
+        self.reattach(terminal_id)?;
+        self.workspace_id = space_id.to_string();
+        Ok(())
+    }
+
     fn toggle_fullscreen(&mut self, pane: PaneRef, hint: FullscreenHint) -> Result<()> {
         // herdr has no floating layer; the FullscreenHint floating fields are
         // ignored. Zoom maps to herdr's pane.zoom toggle (JSON-API).

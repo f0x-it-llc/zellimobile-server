@@ -170,6 +170,32 @@ pub struct PaneSnapshot {
     pub is_fullscreen: bool,
 }
 
+// ─── Space snapshot ─────────────────────────────────────────────────────────────
+
+/// A neutral snapshot of one "space" — a switchable in-place sub-navigation unit
+/// within a single muxr session.
+///
+/// Spaces are a herdr-only axis: a herdr daemon is collapsed to ONE muxr session
+/// (the `"herdr"` sentinel; see [`HerdrBackend`](super::HerdrBackend)) whose
+/// **workspaces** become switchable spaces. zellij has no spaces — its
+/// [`MuxBackend::list_spaces`](super::MuxBackend::list_spaces) returns the empty
+/// default.
+///
+/// `id` is the backend's opaque space id (herdr's `workspace_id`); `name` is the
+/// display label (herdr's `WorkspaceInfo.label`); `active` reflects the backend's
+/// own reported focused/active space (herdr's `WorkspaceInfo.focused`). The
+/// *connection's* current space is a per-relay concern marked at the gRPC layer
+/// (T03), not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpaceSnapshot {
+    /// Opaque backend space id (herdr `workspace_id`).
+    pub id: String,
+    /// Display label.
+    pub name: String,
+    /// The backend's reported active/focused space.
+    pub active: bool,
+}
+
 // ─── Attach-stream messages ─────────────────────────────────────────────────────
 
 /// A neutral message yielded by [`MuxReceiver::recv`] — the backend-agnostic

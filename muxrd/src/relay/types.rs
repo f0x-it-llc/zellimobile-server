@@ -41,6 +41,19 @@ pub enum RelayControl {
     /// Focus a specific pane (and, in single-pane mode, re-point the display
     /// subscription to it).
     FocusPane(PaneRef),
+    /// Switch this relay client's view to the space (herdr workspace) `workspace_id`
+    /// **in place** (herdr Spaces, Option A — per-connection view).
+    ///
+    /// Mutating like [`SwitchTab`](Self::SwitchTab) (dropped for read-only relays)
+    /// AND replied like [`QueryLayout`](Self::QueryLayout): the inbound arm calls
+    /// [`MuxSender::switch_space`](crate::multiplexer::MuxSender::switch_space)
+    /// (re-points the wire stream at the target space's focused pane, with no
+    /// daemon-global focus change) and fulfills `reply` so the gRPC SwitchSpace
+    /// handler (T03) knows the re-attach succeeded before refreshing the layout.
+    SwitchSpace {
+        workspace_id: String,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
     /// Toggle fullscreen (or floating-fill) for a specific pane.
     ///
     /// The relay resolves the floating context (from `hint` or a live

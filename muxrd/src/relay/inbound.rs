@@ -139,6 +139,42 @@ pub(crate) async fn inbound_loop(
                         }
                     }
                 }
+                Some(RelayControl::SwitchSpace { workspace_id, reply }) => {
+                    // herdr Spaces (Option A; Decision 2 — per-connection view).
+                    // Mutating like SwitchTab (read-only drops it) + replied like
+                    // QueryLayout (the gRPC handler awaits the ack before refreshing
+                    // layout). switch_space re-points THIS relay's wire stream at the
+                    // target space's focused pane via the same blocking control path
+                    // go_to_tab uses (bounded by HerdrControl's 3 s per-call timeout),
+                    // with NO daemon-global workspace.focus.
+                    if read_only {
+                        log::trace!(
+                            "relay inbound [{session}]: dropping SwitchSpace (read-only token)"
+                        );
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "read-only token: SwitchSpace is not allowed"
+                        )));
+                    } else {
+                        let result = sender.switch_space(&workspace_id);
+                        match &result {
+                            Ok(()) => {
+                                // New space → this relay's tracked active tab and
+                                // focused pane are now unknown until the next
+                                // GetLayout/FocusPane. Reset both so get_layout does
+                                // not apply a stale override from the old space.
+                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                                    entry.state.active_tab = None;
+                                    entry.state.focused_pane = None;
+                                }
+                            }
+                            Err(e) => log::warn!(
+                                "relay inbound [{session}]: SwitchSpace('{workspace_id}') \
+                                 failed: {e:#}"
+                            ),
+                        }
+                        let _ = reply.send(result);
+                    }
+                }
                 Some(RelayControl::ToggleFullscreen { pane, hint }) => {
                     if read_only {
                         log::trace!(

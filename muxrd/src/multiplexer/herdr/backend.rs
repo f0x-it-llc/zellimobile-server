@@ -14,12 +14,21 @@
 //!   wire relay, and this backend so a `PaneRef`/`tab_id` round-trips identically
 //!   across layout polls and actions.
 //!
-//! ## session ↔ workspace
+//! ## session ↔ daemon, workspaces ↔ spaces (Option A — herdr Spaces)
 //!
-//! muxrd's "session" is herdr's **workspace** (see `research/RESEARCH.md` §2 — both
-//! are the top-level container the Sessions screen lists; they align 1:1). The
-//! neutral session *name* is the workspace **label**; [`HerdrBackend::workspace_id_for`]
-//! resolves a name → herdr `workspace_id` by matching `WorkspaceInfo.label`.
+//! A herdr daemon is a flat **daemon → workspaces → tabs → panes** (there is no
+//! session container above workspaces). muxrd collapses the whole daemon to **one**
+//! muxr session — the bare-name sentinel [`HERDR_SESSION`] (`"herdr"`) — and
+//! surfaces its **workspaces as switchable "spaces"** ([`MuxBackend::list_spaces`],
+//! [`MuxSender::switch_space`](crate::multiplexer::MuxSender::switch_space)).
+//!
+//! So [`list_sessions`](MuxBackend::list_sessions) returns exactly one entry, and
+//! every session-scoped backend op resolves the sentinel to the daemon's
+//! **active-or-first** workspace via [`HerdrBackend::resolve_workspace`]
+//! ([`active_or_first_workspace_id`](HerdrBackend::active_or_first_workspace_id)).
+//! [`workspace_id_for`](HerdrBackend::workspace_id_for) (label match) is retained
+//! for any non-sentinel name (out-of-band safety) and the space-lifecycle ops
+//! address workspaces by their opaque `workspace_id` (= the neutral `space_id`).
 //!
 //! ## Capability gaps (herdr has no equivalent)
 //!
@@ -48,11 +57,11 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 
 use crate::multiplexer::types::{
-    ActionAck, LayoutSnapshot, PaneRef, ResizeDir, ResizeKind, ScrollDir,
+    ActionAck, LayoutSnapshot, PaneRef, ResizeDir, ResizeKind, ScrollDir, SpaceSnapshot,
 };
 use crate::multiplexer::{DualHandle, MuxBackend};
 
-use super::api::{PaneLayoutRect, PaneZoomMode, SplitDirection};
+use super::api::{PaneLayoutRect, PaneZoomMode, SplitDirection, WorkspaceInfo};
 use super::control::HerdrControl;
 use super::paths::HerdrSocketPaths;
 use super::registry::{HerdrPaneRegistry, HerdrTabRegistry};
@@ -67,6 +76,20 @@ const DEFAULT_SESSION_SIZE: (u16, u16) = (24, 80);
 /// Default split direction for [`MuxBackend::new_pane`]. herdr only models
 /// `Right` / `Down`; `Right` mirrors zellij's default "split vertically".
 const DEFAULT_SPLIT_DIRECTION: SplitDirection = SplitDirection::Right;
+
+/// Bare-name sentinel for herdr's single collapsed muxr session (Option A —
+/// herdr Spaces). A herdr daemon has no session container; muxrd presents the
+/// whole daemon as ONE session under this stable bare name (display name also
+/// `"herdr"`) whose workspaces are switchable "spaces".
+///
+/// It is a fixed string (not a workspace label) so [`ListSessions`] is a cheap
+/// constant entry and `resolve_session` round-trips it through muxrd's strict
+/// `[A-Za-z0-9_-]` ipc guard (`"herdr"` passes). All session-scoped herdr ops
+/// recognise it via [`HerdrBackend::resolve_workspace`] and bind to the daemon's
+/// active-or-first workspace.
+///
+/// [`ListSessions`]: MuxBackend::list_sessions
+pub(crate) const HERDR_SESSION: &str = "herdr";
 
 /// The herdr-backed [`MuxBackend`].
 ///
@@ -153,6 +176,35 @@ impl HerdrBackend {
         }
         Ok(first.workspace_id)
     }
+
+    /// The daemon's **active (focused)** workspace id, falling back to the **first
+    /// listed** when herdr reports no focused workspace. Errors only when the
+    /// daemon has no workspaces at all.
+    ///
+    /// This is what the [`HERDR_SESSION`] sentinel binds to: on attach (and for
+    /// every session-scoped op that does not carry a per-connection space) muxrd
+    /// targets the workspace the user would land on. The per-connection current
+    /// space — once switched — is tracked by the relay's `workspace_id`, not here.
+    fn active_or_first_workspace_id(&self) -> Result<String> {
+        let workspaces = self.control.list_workspaces()?;
+        pick_active_or_first(&workspaces)
+            .map(|w| w.workspace_id.clone())
+            .ok_or_else(|| anyhow!("herdr: daemon has no workspaces to attach"))
+    }
+
+    /// Resolve a neutral muxr session name to a herdr `workspace_id`.
+    ///
+    /// Under Option A the herdr session is the singular [`HERDR_SESSION`] sentinel
+    /// → resolve to the daemon's [`active-or-first`](Self::active_or_first_workspace_id)
+    /// workspace. Any other name is matched by workspace **label** via
+    /// [`workspace_id_for`](Self::workspace_id_for) (out-of-band / legacy safety).
+    fn resolve_workspace(&self, session: &str) -> Result<String> {
+        if session == HERDR_SESSION {
+            self.active_or_first_workspace_id()
+        } else {
+            self.workspace_id_for(session)
+        }
+    }
 }
 
 /// Derive a `(rows, cols)` session size from a herdr layout `area` rectangle,
@@ -170,6 +222,28 @@ fn session_size_from_area(area: PaneLayoutRect) -> (u16, u16) {
         area.width
     };
     (rows, cols)
+}
+
+/// Map one herdr [`WorkspaceInfo`] to the neutral [`SpaceSnapshot`]. Pure (no
+/// I/O) so the workspace→space mapping is unit-testable from a fixture. `active`
+/// reflects herdr's daemon-reported focused workspace; the per-connection current
+/// space is marked elsewhere (gRPC layer, T03).
+fn space_from_workspace(w: WorkspaceInfo) -> SpaceSnapshot {
+    SpaceSnapshot {
+        id: w.workspace_id,
+        name: w.label,
+        active: w.focused,
+    }
+}
+
+/// Pick the daemon's **active (focused)** workspace, falling back to the **first
+/// listed**. Pure so the [`HERDR_SESSION`]-binding rule is unit-testable without a
+/// live daemon. `None` only when the daemon has no workspaces.
+fn pick_active_or_first(workspaces: &[WorkspaceInfo]) -> Option<&WorkspaceInfo> {
+    workspaces
+        .iter()
+        .find(|w| w.focused)
+        .or_else(|| workspaces.first())
 }
 
 /// A benign no-op acknowledgement for an operation that is meaningless on herdr
@@ -195,24 +269,24 @@ impl MuxBackend for HerdrBackend {
     // ── Session lifecycle ───────────────────────────────────────────────────
 
     fn list_sessions(&self) -> Result<Vec<(String, Duration)>> {
-        // herdr exposes no workspace age/uptime → Duration::ZERO for every entry.
-        Ok(self
-            .control
-            .list_workspaces()?
-            .into_iter()
-            .map(|w| (w.label, Duration::ZERO))
-            .collect())
+        // Option A: a herdr daemon is ONE muxr session (its workspaces are
+        // "spaces"). Return exactly the [`HERDR_SESSION`] sentinel. We still probe
+        // `workspace.list` so an unreachable daemon errors here (and is skipped by
+        // the gRPC fan-out) rather than advertising a phantom session.
+        // herdr exposes no daemon uptime → Duration::ZERO.
+        self.control.list_workspaces()?;
+        Ok(vec![(HERDR_SESSION.to_string(), Duration::ZERO)])
     }
 
     fn list_sessions_with_resurrectables(&self) -> Result<Vec<(String, u64, bool)>> {
-        // herdr has no resurrectable/dead-session concept → resurrectable=false,
-        // age=0 (no uptime exposed).
-        Ok(self
-            .control
-            .list_workspaces()?
-            .into_iter()
-            .map(|w| (w.label, 0u64, false))
-            .collect())
+        // Option A: ONE daemon session (the [`HERDR_SESSION`] sentinel). herdr has
+        // no resurrectable/dead-session concept → resurrectable=false; no uptime →
+        // age=0. tab/pane counts are not carried by this trait return (the gRPC
+        // layer fills SessionInfo.{tab,pane}_count with 0 for every backend today),
+        // so the collapse needs no count query. We still probe `workspace.list` so
+        // an unreachable daemon errors rather than advertising a phantom session.
+        self.control.list_workspaces()?;
+        Ok(vec![(HERDR_SESSION.to_string(), 0u64, false)])
     }
 
     fn validate_session_name(&self, name: &str) -> std::result::Result<(), String> {
@@ -266,6 +340,38 @@ impl MuxBackend for HerdrBackend {
         self.control.rename_workspace(&workspace_id, &new_name)
     }
 
+    // ── Spaces (herdr workspaces) ────────────────────────────────────────────
+    //
+    // Option A: the daemon's workspaces ARE the spaces. These pass through to the
+    // existing `workspace.*` control ops; the neutral `space_id` is herdr's opaque
+    // `workspace_id` verbatim. T03 wires the gRPC GetSpaces/CreateSpace/RenameSpace/
+    // CloseSpace handlers to these. `_session` is ignored — herdr has one daemon.
+
+    fn list_spaces(&self, _session: &str) -> Result<Vec<SpaceSnapshot>> {
+        // `WorkspaceInfo.focused` (carried into SpaceSnapshot.active by
+        // `space_from_workspace`) is the daemon's reported active workspace. The
+        // *connection's* current space is marked per-relay at the gRPC layer (T03)
+        // using the relay's tracked workspace_id.
+        Ok(self
+            .control
+            .list_workspaces()?
+            .into_iter()
+            .map(space_from_workspace)
+            .collect())
+    }
+
+    fn create_space(&self, label: Option<String>) -> Result<ActionAck> {
+        self.control.create_workspace(label)
+    }
+
+    fn rename_space(&self, space_id: &str, label: &str) -> Result<ActionAck> {
+        self.control.rename_workspace(space_id, label)
+    }
+
+    fn close_space(&self, space_id: &str) -> Result<ActionAck> {
+        self.control.close_workspace(space_id)
+    }
+
     // ── Ephemeral control actions ───────────────────────────────────────────
 
     fn write_to_pane(&self, _session: &str, _pane: PaneRef, _bytes: Vec<u8>) -> Result<ActionAck> {
@@ -294,7 +400,7 @@ impl MuxBackend for HerdrBackend {
         if let Some(name) = &name {
             log::debug!("HerdrBackend::new_pane: ignoring name '{name}' (pane.split has no label)");
         }
-        let workspace_id = self.workspace_id_for(session)?;
+        let workspace_id = self.resolve_workspace(session)?;
         self.control.split_pane(
             Some(&workspace_id),
             None, // split the focused pane
@@ -336,7 +442,7 @@ impl MuxBackend for HerdrBackend {
     }
 
     fn new_tab(&self, session: &str, name: Option<String>) -> Result<ActionAck> {
-        let workspace_id = self.workspace_id_for(session)?;
+        let workspace_id = self.resolve_workspace(session)?;
         self.control.create_tab(Some(&workspace_id), name)
     }
 
@@ -355,7 +461,7 @@ impl MuxBackend for HerdrBackend {
     // ── Read-only queries ───────────────────────────────────────────────────
 
     fn query_layout(&self, session: &str) -> Result<LayoutSnapshot> {
-        let workspace_id = self.workspace_id_for(session)?;
+        let workspace_id = self.resolve_workspace(session)?;
         self.control.query_layout(&workspace_id)
     }
 
@@ -365,7 +471,7 @@ impl MuxBackend for HerdrBackend {
         // read `area.height`/`area.width` → `(rows, cols)` (the order
         // `session_size_from_area` returns). Fall back to a sane default when the
         // workspace has no panes / no usable area.
-        let workspace_id = self.workspace_id_for(session)?;
+        let workspace_id = self.resolve_workspace(session)?;
         let panes = self.control.list_panes(&workspace_id)?;
         let representative = panes.iter().find(|p| p.focused).or_else(|| panes.first());
         match representative {
@@ -396,7 +502,11 @@ impl MuxBackend for HerdrBackend {
         cols: u16,
         read_only: bool,
     ) -> Result<DualHandle> {
-        let workspace_id = self.workspace_id_for(session)?;
+        // Option A: `session` is the daemon sentinel, not a workspace label —
+        // resolve the daemon's active-or-first workspace and attach its focused
+        // pane (relay::open_attach calls resolve_focused_terminal). The relay then
+        // holds this workspace_id and re-points it on switch_space (per-connection).
+        let workspace_id = self.resolve_workspace(session)?;
         relay::open_attach(
             Arc::clone(&self.control),
             self.paths.wire.clone(),
@@ -529,6 +639,86 @@ mod tests {
         assert!(b.validate_session_name("foo/bar").is_err());
         assert!(b.validate_session_name("").is_err());
         assert!(b.validate_session_name("with space").is_err());
+    }
+
+    // ── Spaces: workspace→space mapping + active-or-first resolution ───────────
+
+    fn workspace(workspace_id: &str, label: &str, focused: bool) -> WorkspaceInfo {
+        serde_json::from_value(serde_json::json!({
+            "workspace_id": workspace_id,
+            "number": 0,
+            "label": label,
+            "focused": focused,
+            "pane_count": 1,
+            "tab_count": 1,
+            "active_tab_id": "tab-1",
+            "agent_status": "idle",
+        }))
+        .expect("WorkspaceInfo fixture")
+    }
+
+    #[test]
+    fn space_from_workspace_maps_id_label_focused() {
+        let s = space_from_workspace(workspace("ws-7", "logs", true));
+        assert_eq!(s.id, "ws-7");
+        assert_eq!(s.name, "logs");
+        assert!(s.active, "active mirrors WorkspaceInfo.focused");
+
+        let inactive = space_from_workspace(workspace("ws-8", "api", false));
+        assert!(!inactive.active);
+    }
+
+    #[test]
+    fn pick_active_or_first_prefers_focused() {
+        let workspaces = vec![
+            workspace("ws-1", "main", false),
+            workspace("ws-2", "logs", true), // focused → chosen even though not first
+            workspace("ws-3", "api", false),
+        ];
+        assert_eq!(
+            pick_active_or_first(&workspaces).map(|w| w.workspace_id.as_str()),
+            Some("ws-2")
+        );
+    }
+
+    #[test]
+    fn pick_active_or_first_falls_back_to_first_when_none_focused() {
+        let workspaces = vec![
+            workspace("ws-1", "main", false),
+            workspace("ws-2", "logs", false),
+        ];
+        assert_eq!(
+            pick_active_or_first(&workspaces).map(|w| w.workspace_id.as_str()),
+            Some("ws-1")
+        );
+    }
+
+    #[test]
+    fn pick_active_or_first_is_none_for_empty_daemon() {
+        assert!(pick_active_or_first(&[]).is_none());
+    }
+
+    // ── Single-session collapse (Option A) ────────────────────────────────────
+
+    #[test]
+    fn herdr_session_sentinel_passes_the_strict_ipc_guard() {
+        // The sentinel must round-trip through resolve_session, which validates the
+        // bare name against the strict `[A-Za-z0-9_-]` guard.
+        assert!(crate::ipc::validate_session_name(HERDR_SESSION).is_ok());
+        assert_eq!(HERDR_SESSION, "herdr");
+    }
+
+    #[test]
+    fn list_sessions_collapses_to_one_daemon_session() {
+        // With no reachable daemon the probe errors (Err, not a phantom session);
+        // this asserts the collapse never fans out per-workspace. The happy-path
+        // single-entry shape is exercised live on the rig (no mock-socket seam).
+        let b = backend();
+        assert!(
+            b.list_sessions().is_err(),
+            "unreachable daemon must error, not advertise a session"
+        );
+        assert!(b.list_sessions_with_resurrectables().is_err());
     }
 
     // ── shared registries are the same Arcs the control client holds ──────────

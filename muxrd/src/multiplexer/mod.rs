@@ -40,7 +40,7 @@ mod zellij;
 
 pub use types::{
     ActionAck, FullscreenHint, LayoutSnapshot, MuxEvent, MuxServerMsg, PaneRef, PaneSnapshot,
-    ResizeDir, ResizeKind, ScrollDir, TabSnapshot,
+    ResizeDir, ResizeKind, ScrollDir, SpaceSnapshot, TabSnapshot,
 };
 pub use zellij::ZellijBackend;
 
@@ -223,6 +223,38 @@ pub trait MuxBackend: Send + Sync + std::fmt::Debug {
     /// Assign a display name to a tab.
     fn rename_tab(&self, session: &str, tab_id: u64, name: String) -> anyhow::Result<ActionAck>;
 
+    // ── Spaces (herdr workspaces; default: unsupported) ──────────────────────
+
+    /// List the backend's "spaces" for `session`.
+    ///
+    /// Spaces are a herdr-only axis (its workspaces, surfaced as in-place
+    /// switchable sub-navigation within the single collapsed herdr session). The
+    /// **default returns the empty vec** so zellij — and any backend without a
+    /// space concept — is untouched. herdr overrides this to map
+    /// `workspace.list` → [`SpaceSnapshot`].
+    fn list_spaces(&self, session: &str) -> anyhow::Result<Vec<SpaceSnapshot>> {
+        let _ = session;
+        Ok(vec![])
+    }
+
+    /// Create a new space with an optional label. Default: unsupported (zellij).
+    fn create_space(&self, label: Option<String>) -> anyhow::Result<ActionAck> {
+        let _ = label;
+        Ok(space_unsupported_ack("create_space"))
+    }
+
+    /// Rename the space `space_id` to `label`. Default: unsupported (zellij).
+    fn rename_space(&self, space_id: &str, label: &str) -> anyhow::Result<ActionAck> {
+        let _ = (space_id, label);
+        Ok(space_unsupported_ack("rename_space"))
+    }
+
+    /// Close the space `space_id`. Default: unsupported (zellij).
+    fn close_space(&self, space_id: &str) -> anyhow::Result<ActionAck> {
+        let _ = space_id;
+        Ok(space_unsupported_ack("close_space"))
+    }
+
     // ── Read-only queries ───────────────────────────────────────────────────
 
     /// Build a neutral [`LayoutSnapshot`] for `session` (raw queried values;
@@ -260,6 +292,17 @@ pub trait MuxBackend: Send + Sync + std::fmt::Debug {
     fn backend_version(&self) -> String;
 }
 
+/// A failed [`ActionAck`] for a space operation on a backend that has no space
+/// concept (the [`MuxBackend`] space-lifecycle defaults — zellij). Surfaced as a
+/// failure so the client reports it rather than silently dropping the request.
+fn space_unsupported_ack(op: &str) -> ActionAck {
+    ActionAck {
+        ok: false,
+        error: Some(format!("{op}: spaces are not supported on this backend")),
+        info: None,
+    }
+}
+
 // ─── DualHandle + split halves ──────────────────────────────────────────────────
 
 /// An open attach, split into a [`MuxSender`] (input/control) and a
@@ -293,6 +336,20 @@ pub trait MuxSender: Send {
 
     /// Focus a specific pane (as this rendering client).
     fn focus_pane(&mut self, pane: PaneRef) -> anyhow::Result<()>;
+
+    /// Switch this rendering client's view to the space `space_id` **in place**
+    /// (per-connection view; no daemon-global focus change).
+    ///
+    /// Spaces are a herdr-only axis: the herdr sender re-points its wire stream at
+    /// the target workspace's focused pane and records the new workspace as its
+    /// current one, so a subsequent [`Self::query_layout_result`] returns that
+    /// space's layout — all without calling herdr's daemon-global `workspace.focus`
+    /// (so co-attached desktop clients are never yanked). The **default errors**:
+    /// a backend with no space concept (zellij) cannot honour the request.
+    fn switch_space(&mut self, space_id: &str) -> anyhow::Result<()> {
+        let _ = space_id;
+        Err(anyhow::anyhow!("this backend does not support spaces"))
+    }
 
     /// Toggle fullscreen / floating-fill for `pane`, given the resolved floating
     /// context `hint`. Encapsulates the fill-vs-hide-vs-tiled action sequence the
