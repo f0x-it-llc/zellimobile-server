@@ -92,6 +92,15 @@ fi
 
 export BIND_ADDR
 
+# Use sudo ONLY if the current user can't reach the Docker daemon directly
+# (i.e. not in the `docker` group and not rootless). When `docker info` already
+# works, calling sudo is pure overhead and a needless password prompt.
+DOCKER=(docker)
+if ! docker info >/dev/null 2>&1; then
+  echo "[run.sh] no direct Docker access — falling back to 'sudo docker' (add yourself to the 'docker' group to skip this)"
+  DOCKER=(sudo docker)
+fi
+
 backend_label=zellij
 [[ "${HERDR}" -eq 1 ]] && backend_label=herdr
 [[ "${BOTH}" -eq 1 ]]  && backend_label="both (zellij+herdr)"
@@ -104,9 +113,9 @@ echo ""
 # Profile-gated services are named explicitly so the default zellij service isn't
 # also started (it would clash on the published ports).
 if [[ "${BOTH}" -eq 1 ]]; then
-  exec sudo docker compose -f "${COMPOSE_FILE}" --profile both up --build muxrd-both "${EXTRA_ARGS[@]}"
+  exec "${DOCKER[@]}" compose -f "${COMPOSE_FILE}" --profile both up --build muxrd-both "${EXTRA_ARGS[@]}"
 elif [[ "${HERDR}" -eq 1 ]]; then
-  exec sudo docker compose -f "${COMPOSE_FILE}" --profile herdr up --build muxrd-herdr "${EXTRA_ARGS[@]}"
+  exec "${DOCKER[@]}" compose -f "${COMPOSE_FILE}" --profile herdr up --build muxrd-herdr "${EXTRA_ARGS[@]}"
 else
-  exec sudo docker compose -f "${COMPOSE_FILE}" up --build "${EXTRA_ARGS[@]}"
+  exec "${DOCKER[@]}" compose -f "${COMPOSE_FILE}" up --build "${EXTRA_ARGS[@]}"
 fi
