@@ -52,6 +52,10 @@ pub(crate) use routing::{
     is_collapsed_backend_session, make_id, resolve_session, resolve_session_kind, validate_session,
 };
 
+/// The canonical herdr session sentinel, re-exported so grpc and relay can
+/// reference it as `crate::multiplexer::HERDR_SESSION` without reaching into
+/// the herdr sub-module's internals directly (architecture seam).
+pub(crate) use herdr::backend::HERDR_SESSION;
 /// Re-exported for the P2.05 backend selector in `bin/muxrd.rs` and the
 /// integration test harness.  The herdr sub-module remains `pub(crate)` to keep
 /// its wire/API internals crate-private; only the public entry point is lifted.

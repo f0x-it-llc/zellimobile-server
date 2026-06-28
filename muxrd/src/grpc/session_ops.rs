@@ -115,30 +115,55 @@ impl MuxrService {
             };
 
             // For herdr, pre-fetch the space count in a single spawn_blocking
-            // call (herdr collapses to one session, so at most one IPC round-trip
-            // per ListSessions). For every other backend the default is 0.
-            // Degrade gracefully: any error → warn + 0, never abort the whole RPC.
+            // call. herdr collapses to one session (the HERDR_SESSION sentinel),
+            // so this is at most one extra workspace.list round-trip per
+            // ListSessions — a second call on top of the list_sessions probe,
+            // intentional because list_sessions doesn't surface workspace count.
+            // The single-session assumption holds as long as herdr yields exactly
+            // one session (HERDR_SESSION); space_count is therefore per-backend,
+            // not per-session, and is meaningful only for the herdr entry.
+            // For every other backend herdr_space_count is 0 (encoded by the
+            // outer Herdr branch, so the per-session assignment below needs no
+            // redundant backend re-check).
+            //
+            // SM1 fix: the spawn_blocking is wrapped in the same
+            // LIST_SESSIONS_BACKEND_TIMEOUT budget as the session-list fan-out
+            // above (S-M3 invariant). Three degrade arms — Err (IPC error),
+            // JoinError (task panic/cancel), Elapsed (timeout) — all log a
+            // warning and fall back to 0; ListSessions must never hang or abort
+            // on this path.
             let herdr_space_count: u32 = if kind == crate::cli::BackendKind::Herdr {
                 // herdr ignores the session argument (single daemon), but we pass
                 // the canonical sentinel name for clarity.
                 let b = backend.clone();
-                match tokio::task::spawn_blocking(move || {
-                    b.list_spaces(crate::multiplexer::herdr::backend::HERDR_SESSION)
-                })
+                match tokio::time::timeout(
+                    LIST_SESSIONS_BACKEND_TIMEOUT,
+                    tokio::task::spawn_blocking(move || {
+                        b.list_spaces(crate::multiplexer::HERDR_SESSION)
+                    }),
+                )
                 .await
                 {
-                    Ok(Ok(spaces)) => spaces.len() as u32,
-                    Ok(Err(e)) => {
+                    Ok(Ok(Ok(spaces))) => u32::try_from(spaces.len()).unwrap_or(u32::MAX),
+                    Ok(Ok(Err(e))) => {
                         log::warn!(
                             "ListSessions: list_spaces failed for herdr, \
                              defaulting space_count to 0: {e:#}"
                         );
                         0
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log::warn!(
                             "ListSessions: list_spaces task panicked for herdr, \
                              defaulting space_count to 0: {e}"
+                        );
+                        0
+                    }
+                    Err(_elapsed) => {
+                        log::warn!(
+                            "ListSessions: list_spaces timed out after {:?} for herdr, \
+                             defaulting space_count to 0",
+                            LIST_SESSIONS_BACKEND_TIMEOUT
                         );
                         0
                     }
@@ -153,11 +178,9 @@ impl MuxrService {
                 let connected_clients = clients.count(&id);
                 // space_count is per-backend (not per-session): herdr exposes its
                 // workspace count on the single collapsed session; zellij = 0.
-                let space_count = if kind == crate::cli::BackendKind::Herdr {
-                    herdr_space_count
-                } else {
-                    0
-                };
+                // The 0-for-non-herdr invariant is encoded by the outer Herdr
+                // branch above (herdr_space_count is always 0 for non-herdr
+                // backends), so no redundant backend re-check is needed here.
                 proto_sessions.push(crate::proto::SessionInfo {
                     name,
                     age_secs,
@@ -169,7 +192,7 @@ impl MuxrService {
                     connected_clients,
                     backend: proto_kind,
                     id,
-                    space_count,
+                    space_count: herdr_space_count,
                 });
             }
         }
@@ -384,7 +407,7 @@ mod tests {
     use crate::grpc::MuxrService;
     use crate::multiplexer::{
         ActionAck, BackendSet, DualHandle, LayoutSnapshot, MuxBackend, PaneRef, ResizeDir,
-        ResizeKind, ScrollDir,
+        ResizeKind, ScrollDir, SpaceSnapshot,
     };
     use crate::proto::Empty;
 
@@ -778,5 +801,289 @@ mod tests {
             .sessions;
 
         assert!(sessions.is_empty(), "no reachable backends → empty list");
+    }
+
+    // ── Additional stubs for space_count tests (SM1 fix) ─────────────────────
+
+    /// A herdr-kind backend that succeeds at `list_sessions_with_resurrectables`
+    /// AND returns N `SpaceSnapshot`s from `list_spaces`. Used to verify that
+    /// `space_count` is correctly populated on the herdr session entry and that
+    /// co-listed zellij sessions remain at 0.
+    #[derive(Debug)]
+    struct HerdrSpacesBackend {
+        sessions: Vec<(String, u64, bool)>,
+        spaces: Vec<SpaceSnapshot>,
+    }
+
+    impl MuxBackend for HerdrSpacesBackend {
+        fn list_sessions(&self) -> anyhow::Result<Vec<(String, Duration)>> {
+            Ok(self
+                .sessions
+                .iter()
+                .map(|(n, a, _)| (n.clone(), Duration::from_secs(*a)))
+                .collect())
+        }
+        fn list_sessions_with_resurrectables(&self) -> anyhow::Result<Vec<(String, u64, bool)>> {
+            Ok(self.sessions.clone())
+        }
+        fn list_spaces(&self, _session: &str) -> anyhow::Result<Vec<SpaceSnapshot>> {
+            Ok(self.spaces.clone())
+        }
+        fn validate_session_name(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn create_session(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn kill_session(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn rename_session(&self, _: &str, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn write_to_pane(&self, _: &str, _: PaneRef, _: Vec<u8>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn focus_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_pane(&self, _: &str, _: bool, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_pane(&self, _: &str, _: PaneRef, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn resize_pane(
+            &self,
+            _: &str,
+            _: PaneRef,
+            _: ResizeKind,
+            _: Option<ResizeDir>,
+        ) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_floating(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_fullscreen(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn scroll_pane(&self, _: &str, _: PaneRef, _: ScrollDir) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_tab(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn go_to_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_tab(&self, _: &str, _: u64, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn query_layout(&self, _: &str) -> anyhow::Result<LayoutSnapshot> {
+            unimplemented!()
+        }
+        fn query_session_size(&self, _: &str) -> anyhow::Result<(u16, u16)> {
+            unimplemented!()
+        }
+        fn pane_is_floating_with_visibility(
+            &self,
+            _: &str,
+            _: PaneRef,
+        ) -> anyhow::Result<(bool, bool, Option<PaneRef>)> {
+            unimplemented!()
+        }
+        fn open_attach(&self, _: &str, _: u16, _: u16, _: bool) -> anyhow::Result<DualHandle> {
+            unimplemented!()
+        }
+        fn backend_version(&self) -> String {
+            "herdr-spaces-stub".to_string()
+        }
+    }
+
+    /// A backend that succeeds at `list_sessions_with_resurrectables` but returns
+    /// `Err` from `list_spaces`. Used to verify the SM1 Err degrade arm.
+    #[derive(Debug)]
+    struct ErrorSpacesBackend {
+        sessions: Vec<(String, u64, bool)>,
+    }
+
+    impl MuxBackend for ErrorSpacesBackend {
+        fn list_sessions(&self) -> anyhow::Result<Vec<(String, Duration)>> {
+            Ok(self
+                .sessions
+                .iter()
+                .map(|(n, a, _)| (n.clone(), Duration::from_secs(*a)))
+                .collect())
+        }
+        fn list_sessions_with_resurrectables(&self) -> anyhow::Result<Vec<(String, u64, bool)>> {
+            Ok(self.sessions.clone())
+        }
+        fn list_spaces(&self, _session: &str) -> anyhow::Result<Vec<SpaceSnapshot>> {
+            anyhow::bail!("herdr control socket not available")
+        }
+        fn validate_session_name(&self, _: &str) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn create_session(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn kill_session(&self, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn rename_session(&self, _: &str, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn write_to_pane(&self, _: &str, _: PaneRef, _: Vec<u8>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn focus_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_pane(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_pane(&self, _: &str, _: bool, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_pane(&self, _: &str, _: PaneRef, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn resize_pane(
+            &self,
+            _: &str,
+            _: PaneRef,
+            _: ResizeKind,
+            _: Option<ResizeDir>,
+        ) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_floating(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn toggle_pane_fullscreen(&self, _: &str, _: PaneRef) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn scroll_pane(&self, _: &str, _: PaneRef, _: ScrollDir) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn new_tab(&self, _: &str, _: Option<String>) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn close_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn go_to_tab(&self, _: &str, _: u64) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn rename_tab(&self, _: &str, _: u64, _: String) -> anyhow::Result<ActionAck> {
+            unimplemented!()
+        }
+        fn query_layout(&self, _: &str) -> anyhow::Result<LayoutSnapshot> {
+            unimplemented!()
+        }
+        fn query_session_size(&self, _: &str) -> anyhow::Result<(u16, u16)> {
+            unimplemented!()
+        }
+        fn pane_is_floating_with_visibility(
+            &self,
+            _: &str,
+            _: PaneRef,
+        ) -> anyhow::Result<(bool, bool, Option<PaneRef>)> {
+            unimplemented!()
+        }
+        fn open_attach(&self, _: &str, _: u16, _: u16, _: bool) -> anyhow::Result<DualHandle> {
+            unimplemented!()
+        }
+        fn backend_version(&self) -> String {
+            "error-spaces".to_string()
+        }
+    }
+
+    // ── SM1 fix tests ─────────────────────────────────────────────────────────
+
+    /// SM1 (happy path): a herdr backend returning N spaces yields
+    /// `space_count == N` on its session entry; a co-listed zellij session keeps
+    /// `space_count == 0`. Confirms the redundant backend re-check is gone and
+    /// herdr_space_count flows directly into the struct.
+    #[tokio::test]
+    async fn herdr_space_count_populated_and_zellij_zero() {
+        let zellij_backend: Arc<dyn MuxBackend> = Arc::new(StubBackend {
+            sessions: vec![("zellij-session".to_string(), 0, false)],
+        });
+        let herdr_backend: Arc<dyn MuxBackend> = Arc::new(HerdrSpacesBackend {
+            sessions: vec![("herdr".to_string(), 0, false)],
+            spaces: vec![
+                SpaceSnapshot {
+                    id: "ws1".to_string(),
+                    name: "Work".to_string(),
+                    active: true,
+                },
+                SpaceSnapshot {
+                    id: "ws2".to_string(),
+                    name: "Play".to_string(),
+                    active: false,
+                },
+            ],
+        });
+        let backends = BackendSet::new(vec![
+            (BackendKind::Zellij, zellij_backend),
+            (BackendKind::Herdr, herdr_backend),
+        ]);
+        let service = MuxrService::with_backends(backends);
+
+        let sessions = service
+            .list_sessions_impl(Request::new(Empty {}))
+            .await
+            .expect("RPC must succeed")
+            .into_inner()
+            .sessions;
+
+        assert_eq!(sessions.len(), 2);
+        let herdr_s = sessions
+            .iter()
+            .find(|s| s.id.starts_with("herdr:"))
+            .expect("herdr session must be present");
+        let zellij_s = sessions
+            .iter()
+            .find(|s| s.id.starts_with("zellij:"))
+            .expect("zellij session must be present");
+        assert_eq!(
+            herdr_s.space_count, 2,
+            "herdr space_count populated from list_spaces"
+        );
+        assert_eq!(zellij_s.space_count, 0, "zellij space_count is always 0");
+    }
+
+    /// SM1 (Err degrade arm): a herdr backend whose `list_spaces` returns `Err`
+    /// must not abort ListSessions; `space_count` degrades to 0.
+    /// Note: the Elapsed arm (timeout) is structurally identical — both warn-log
+    /// and return 0 — so the Err path exercises the same degrade code shape.
+    #[tokio::test]
+    async fn herdr_space_count_degrades_on_list_spaces_error() {
+        let herdr_backend: Arc<dyn MuxBackend> = Arc::new(ErrorSpacesBackend {
+            sessions: vec![("herdr".to_string(), 0, false)],
+        });
+        let backends = BackendSet::new(vec![(BackendKind::Herdr, herdr_backend)]);
+        let service = MuxrService::with_backends(backends);
+
+        let sessions = service
+            .list_sessions_impl(Request::new(Empty {}))
+            .await
+            .expect("RPC must succeed even when list_spaces errors")
+            .into_inner()
+            .sessions;
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].space_count, 0,
+            "list_spaces Err → degrade to 0, no RPC abort"
+        );
     }
 }
