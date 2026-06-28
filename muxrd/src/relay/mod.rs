@@ -292,7 +292,15 @@ pub async fn attach_relay(
     // collapsed (herdr) session, so it must NOT be guessable/enumerable. A 128-bit
     // CSPRNG hex string (see `mint_connection_id`).
     let connection_id = mint_connection_id();
+    // FS3: full connection_id must not appear in info/warn logs — it is the sole
+    // per-connection isolation discriminator and effectively a per-connection secret.
+    // Log an 8-hex-char prefix at info (enough for operational correlation) and
+    // keep the full value at debug only.
     log::info!(
+        "relay [{session_name}]: minted connection_id={}… (read_only={read_only})",
+        &connection_id[..8]
+    );
+    log::debug!(
         "relay [{session_name}]: minted connection_id={connection_id} \
          (read_only={read_only})"
     );
@@ -321,7 +329,13 @@ pub async fn attach_relay(
         // never receives its connection_id and falls back to session-scoped
         // routing for all subsequent RPCs.
         if let Err(e) = tx.try_send(Ok(conn_event)) {
+            // FS3: redact full connection_id at warn; full value logged at debug only.
             log::warn!(
+                "relay [{session_name}]: failed to send connection_id frame to client \
+                 (id={}…): {e} — client will fall back to session-scoped routing",
+                &connection_id[..8]
+            );
+            log::debug!(
                 "relay [{session_name}]: failed to send connection_id frame to client \
                  (connection_id={connection_id}): {e} — client will fall back to \
                  session-scoped routing"
