@@ -55,8 +55,9 @@ use anyhow::{Context, Result, anyhow};
 use crate::multiplexer::types::{FullscreenHint, LayoutSnapshot, MuxEvent, MuxServerMsg, PaneRef};
 use crate::multiplexer::{DualHandle, MuxReceiver, MuxSender};
 
-use super::api::PaneZoomMode;
+use super::api::{PaneInfo, PaneZoomMode};
 use super::control::HerdrControl;
+use super::registry::HerdrPaneRegistry;
 use super::wire::{
     ClientKeybindings, ClientLaunchMode, ClientMessage, FramingError, HERDR_PROTOCOL_VERSION,
     RenderEncoding, ServerMessage, read_server_message, write_message,
@@ -224,6 +225,56 @@ fn resolve_focused_terminal(control: &HerdrControl, workspace_id: &str) -> Resul
         .ok_or_else(|| anyhow!("herdr workspace '{workspace_id}' has no panes to attach"))
 }
 
+/// Pure core of [`resolve_tab_focused_pane`]: given the full workspace pane list,
+/// registers ALL panes in `reg` and returns the focused-or-first pane within
+/// `herdr_tab_id`. Registering all panes (not only those in the target tab) ensures
+/// subsequent [`HerdrMuxSender::focus_pane`] (`u32 → terminal_id`) lookups still
+/// resolve for panes on other tabs. Separated from the I/O call for
+/// unit-testability, mirroring the `transcode_layout` /
+/// [`resolve_focused_terminal`] pattern.
+fn pick_tab_pane(
+    panes: &[PaneInfo],
+    reg: &HerdrPaneRegistry,
+    workspace_id: &str,
+    herdr_tab_id: &str,
+) -> Result<(u32, String)> {
+    let mut first: Option<(u32, String)> = None;
+    let mut focused: Option<(u32, String)> = None;
+    for pane in panes {
+        // Register ALL workspace panes so subsequent focus_pane u32→terminal_id
+        // lookups still resolve even for panes on other tabs.
+        let id = reg.assign_or_get(&pane.pane_id, &pane.terminal_id);
+        if pane.tab_id == herdr_tab_id {
+            if first.is_none() {
+                first = Some((id, pane.terminal_id.clone()));
+            }
+            if pane.focused {
+                focused = Some((id, pane.terminal_id.clone()));
+            }
+        }
+    }
+    focused.or(first).ok_or_else(|| {
+        anyhow!("herdr tab '{herdr_tab_id}' (ws '{workspace_id}') has no panes to attach")
+    })
+}
+
+/// Resolve the target tab's focused-or-first pane to its `(u32 pane id, terminal_id)`
+/// for a per-connection wire re-attach — no daemon-global `tab.focus` called.
+/// Registers ALL workspace panes in the shared registry (like [`resolve_focused_terminal`])
+/// so subsequent [`HerdrMuxSender::focus_pane`] (`u32 → terminal_id`) lookups resolve
+/// for panes on other tabs. The tab-scoped analogue of [`resolve_focused_terminal`].
+fn resolve_tab_focused_pane(
+    control: &HerdrControl,
+    workspace_id: &str,
+    herdr_tab_id: &str,
+) -> Result<(u32, String)> {
+    let panes = control
+        .list_panes(workspace_id)
+        .with_context(|| format!("list herdr panes for workspace '{workspace_id}'"))?;
+    let reg = control.pane_registry();
+    pick_tab_pane(&panes, reg, workspace_id, herdr_tab_id)
+}
+
 // ─── HerdrMuxSender (write half + control plane) ──────────────────────────────
 
 /// The input/control half of a herdr [`DualHandle`]. Owns the wire **write** half
@@ -261,17 +312,20 @@ impl HerdrMuxSender {
 }
 
 impl MuxSender for HerdrMuxSender {
+    /// Re-point THIS connection's wire stream at the target tab's focused-or-first
+    /// pane WITHOUT calling herdr's daemon-global `tab.focus`. This matches the
+    /// per-connection view implemented by [`switch_space`] (Decision 2): a
+    /// co-attached desktop client must not follow the mobile client's tab switch.
+    /// The wire is pane-addressed (`terminal_id`), so re-attaching to the right
+    /// pane in a different tab is sufficient — no daemon-global focus call needed.
     fn go_to_tab(&mut self, tab_id: u64) -> Result<()> {
-        // Switch herdr's focus to the tab (JSON-API), then re-point the wire
-        // stream at that tab's now-focused pane so the render follows the switch.
-        let ack = self.control.focus_tab(tab_id)?;
-        if !ack.ok {
-            log::debug!(
-                "herdr tab.focus({tab_id}) reported failure: {:?}",
-                ack.error
-            );
-        }
-        let (_pane_id, terminal_id) = resolve_focused_terminal(&self.control, &self.workspace_id)?;
+        let herdr_tab = self
+            .control
+            .tab_registry()
+            .herdr_tab_id(tab_id)
+            .ok_or_else(|| anyhow!("herdr go_to_tab: unknown tab id {tab_id}"))?;
+        let (_pane_id, terminal_id) =
+            resolve_tab_focused_pane(&self.control, &self.workspace_id, &herdr_tab)?;
         self.reattach(terminal_id)
     }
 
@@ -657,5 +711,95 @@ mod tests {
             current_terminal_id: "term-1".into(),
         };
         assert!(sender.query_layout().is_ok());
+    }
+
+    // ── pick_tab_pane: tab-scoped pane resolution ─────────────────────────────
+
+    /// Construct a minimal [`PaneInfo`] fixture, mirroring the control.rs test helpers.
+    fn make_pane(
+        pane_id: &str,
+        terminal_id: &str,
+        tab_id: &str,
+        focused: bool,
+    ) -> crate::multiplexer::herdr::api::PaneInfo {
+        serde_json::from_value(serde_json::json!({
+            "pane_id": pane_id,
+            "terminal_id": terminal_id,
+            "workspace_id": "ws-1",
+            "tab_id": tab_id,
+            "focused": focused,
+            "agent_status": "idle",
+            "state_labels": {},
+            "revision": 1,
+        }))
+        .expect("PaneInfo fixture")
+    }
+
+    #[test]
+    fn pick_tab_pane_returns_focused_pane_of_target_tab_not_other_tab() {
+        // tab-A: one pane (not focused). tab-B: two panes (second is focused).
+        // pick_tab_pane for "tab-B" must return tab-B's focused pane, never tab-A's.
+        let reg = HerdrPaneRegistry::new();
+        let panes = vec![
+            make_pane("pane-a1", "term-a1", "tab-A", false),
+            make_pane("pane-b1", "term-b1", "tab-B", false),
+            make_pane("pane-b2", "term-b2", "tab-B", true), // focused
+        ];
+
+        let (_id, terminal_id) = pick_tab_pane(&panes, &reg, "ws-1", "tab-B").unwrap();
+        assert_eq!(
+            terminal_id, "term-b2",
+            "focused pane in tab-B must win over the first pane in tab-B"
+        );
+
+        // ALL workspace panes must be registered (focus_pane lookups across tabs must resolve).
+        assert_eq!(
+            reg.terminal_id(reg.assign_or_get("pane-a1", "term-a1"))
+                .as_deref(),
+            Some("term-a1"),
+            "tab-A pane must be registered even though it was not returned"
+        );
+        assert_eq!(
+            reg.terminal_id(reg.assign_or_get("pane-b1", "term-b1"))
+                .as_deref(),
+            Some("term-b1"),
+        );
+        assert_eq!(
+            reg.terminal_id(reg.assign_or_get("pane-b2", "term-b2"))
+                .as_deref(),
+            Some("term-b2"),
+        );
+    }
+
+    #[test]
+    fn pick_tab_pane_falls_back_to_first_when_none_focused() {
+        // tab-B has two panes, neither focused; must return the first one.
+        let reg = HerdrPaneRegistry::new();
+        let panes = vec![
+            make_pane("pane-a1", "term-a1", "tab-A", false),
+            make_pane("pane-b1", "term-b1", "tab-B", false), // first in tab-B
+            make_pane("pane-b2", "term-b2", "tab-B", false),
+        ];
+
+        let (_id, terminal_id) = pick_tab_pane(&panes, &reg, "ws-1", "tab-B").unwrap();
+        assert_eq!(
+            terminal_id, "term-b1",
+            "first pane in tab-B returned when no pane is focused"
+        );
+    }
+
+    #[test]
+    fn pick_tab_pane_errors_when_target_tab_has_no_panes() {
+        // Panes exist but none belong to the requested tab.
+        let reg = HerdrPaneRegistry::new();
+        let panes = vec![make_pane("pane-a1", "term-a1", "tab-A", false)];
+
+        let result = pick_tab_pane(&panes, &reg, "ws-1", "tab-X");
+        assert!(result.is_err(), "must error when target tab has no panes");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("tab-X"),
+            "error message must name the missing tab, got: {msg}"
+        );
     }
 }
