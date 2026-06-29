@@ -109,8 +109,9 @@ impl HerdrControl {
         &self.panes
     }
 
-    /// The shared tab registry.
-    #[allow(dead_code)] // Phase 3: paired with pane_registry once tab-scoped wire ops land
+    /// The shared tab registry. Used by the relay's per-connection tab switch
+    /// (`HerdrMuxSender::go_to_tab` → `herdr_tab_id`) to map neutral `u64` tab ids
+    /// to herdr's String ids without a daemon-global `tab.focus`.
     pub fn tab_registry(&self) -> &Arc<HerdrTabRegistry> {
         &self.tabs
     }
