@@ -1,14 +1,16 @@
 # muxr-core
 
 The open-source backend for **Muxr** — a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/workspaces.html)
-that lets a mobile client attach to and control remote [Zellij](https://zellij.dev/)
-terminal-multiplexer sessions over a TLS, bearer-authenticated gRPC API.
+that lets a mobile client attach to and control remote terminal-multiplexer sessions
+over a TLS, bearer-authenticated gRPC API. `muxrd` drives two backends behind a
+`MuxBackend` trait — [zellij](https://zellij.dev/) and [herdr](https://herdr.dev/) — and auto-detects
+whichever are available at startup.
 
 Two binaries:
 
 | Crate | Binary | What it does |
 |-------|--------|--------------|
-| [`muxrd`](muxrd/) | `muxrd` | gRPC server (protobuf package `muxr.v1`) that relays over Zellij's Unix-domain IPC. TLS (self-signed, an external CA cert, or plaintext h2c behind a proxy) + per-token auth, read-only tokens, daemonize. |
+| [`muxrd`](muxrd/) | `muxrd` | gRPC server (protobuf package `muxr.v1`) that relays over a terminal multiplexer — zellij (Unix-domain IPC) or herdr (JSON-API + binary wire sockets). TLS (self-signed, an external CA cert, or plaintext h2c behind a proxy) + per-token auth, read-only tokens, daemonize. |
 | [`muxrctl`](muxrctl/) | `muxrctl` | Terminal UI to install, configure, and pair the server: cert/SAN setup, token management, QR-code device pairing (fingerprint-pinned or system-CA), live status. Links `muxrd` as a library for its pure ops. |
 
 ## Build
@@ -34,8 +36,12 @@ cargo run -p muxrctl
 `start` opens a control socket for `status`/`stop`; add `--daemonize` to detach.
 `ZELLIMSERVER_SKIP_VERSION_CHECK=1` bypasses the Zellij version-match check.
 
-Requires the matching `zellij` binary on `PATH` (the server pins a Zellij
-version and refuses to start against a different one).
+For the **zellij** backend, requires the matching `zellij` binary on `PATH` (the
+server pins a Zellij version and refuses to start against a different one). For the
+**herdr** backend, requires a running `herdr` instance (wire protocol 14, e.g.
+v0.7.1) — a separate, unmodified, user-installed binary (AGPL-3.0). muxrd
+auto-detects which backends are available and serves all of them; pass `--backend`
+/ `MUXRD_BACKEND` to restrict to one.
 
 ## TLS modes & deployment
 
@@ -66,8 +72,9 @@ cargo fmt                # format before committing
 ## Docker dev rig
 
 `docker/` builds a self-contained container running the server against a
-pre-populated Zellij session — useful for on-device testing from a phone on the
-same network. See [`docker/README.md`](docker/README.md).
+pre-populated Zellij session — or, via the opt-in `herdr` profile, against a herdr
+workspace — useful for on-device testing from a phone on the same network. See
+[`docker/README.md`](docker/README.md).
 
 ```bash
 docker compose -f docker/compose.yaml up --build
