@@ -24,16 +24,16 @@
 //! Default addr: https://[::1]:50051 ; default session: d2demo.
 
 use anyhow::{Context, Result};
+use muxrd::proto::muxr_client::MuxrClient;
+use muxrd::proto::{
+    CreateSessionReq, Empty, LoginRequest, NewTabReq, PaneTarget, RenameSessionReq, RenameTabReq,
+    ScrollDirection, ScrollReq, SessionRef, TabTarget,
+};
 use tonic::transport::Channel;
 use tonic::{
     Request,
     metadata::MetadataValue,
     transport::{Certificate, ClientTlsConfig},
-};
-use muxrd::proto::muxr_client::MuxrClient;
-use muxrd::proto::{
-    CreateSessionReq, Empty, LoginRequest, NewTabReq, PaneTarget, RenameSessionReq, RenameTabReq,
-    ScrollDirection, ScrollReq, SessionRef, TabTarget,
 };
 
 // ─── Args ─────────────────────────────────────────────────────────────────────
@@ -353,6 +353,7 @@ async fn main() -> Result<()> {
         .create_session(CreateSessionReq {
             name: "d2new".to_owned(),
             layout: String::new(),
+            backend: 0, // BACKEND_UNSPECIFIED — server selects default
         })
         .await
         .context("CreateSession RPC failed")?
@@ -488,6 +489,7 @@ async fn main() -> Result<()> {
             .create_session(CreateSessionReq {
                 name: "ro_should_not_create".to_owned(),
                 layout: String::new(),
+                backend: 0, // BACKEND_UNSPECIFIED — server selects default
             })
             .await;
         check_permission_denied("CreateSession", ro_cs, &mut pass);

@@ -1,26 +1,33 @@
-//! relay — the blocking-IPC ↔ async-gRPC bridge for `AttachTerminal`.
+//! relay — the blocking-multiplexer ↔ async-gRPC bridge for `AttachTerminal`.
 //!
-//! This is the Phase-B hot path, extended in Phase C to also surface control
-//! events.  One [`attach_relay`] call drives a single `AttachTerminal`
+//! This is the Phase-B hot path, extended in Phase C to surface control events
+//! and generalized in P1.03 to drive a neutral [`crate::multiplexer::MuxBackend`]
+//! dual handle ([`MuxSender`]/[`MuxReceiver`]/[`MuxServerMsg`]) instead of zellij
+//! IPC types directly — so a Phase-2 herdr backend reuses this machinery
+//! verbatim. One [`attach_relay`] call drives a single `AttachTerminal`
 //! bidirectional gRPC stream:
 //!
 //! ```text
 //!                 ┌──────────────── std reader thread ───────────────┐
-//!   zellij        │  loop { AttachReceiver::recv()  (BLOCKING)        │
-//!   session ──────┼──►  Render → bounded mpsc::blocking_send ─────────┼──► ReceiverStream
-//!   (IPC socket)  │  Control events (Exit/RenamedSession/…) ──────────┼──►  (outbound ServerFrame)
+//!   backend       │  loop { MuxReceiver::recv()  (BLOCKING)           │
+//!   open_attach ──┼──►  Render → bounded mpsc::blocking_send ─────────┼──► ReceiverStream
+//!   (DualHandle)  │  Event (Exit/RenamedSession/…) ───────────────────┼──►  (outbound ServerFrame)
 //!                 │  Log (query reply) → fills in-flight query slot ───┼──► reply oneshot
 //!                 │       break on stop-flag, Exit, OR send error     │
 //!                 └───────────────────────────────────────────────────┘
 //!
 //!                 ┌──────────────── tokio inbound task ──────────────┐
 //!   gRPC client   │  Streaming<ClientFrame>::next()                   │
-//!   ──────────────┼──►  input → AttachSender::send_chars/send_bytes   │
-//!                 │     resize → AttachSender::send_resize            │
-//!                 │     QueryLayout → send actions + HAND query to    │
-//!                 │                   render thread (no await!)       │
+//!   ──────────────┼──►  input → MuxSender::send_input_chars/bytes     │
+//!                 │     resize → MuxSender::send_resize               │
+//!                 │     QueryLayout → MuxSender::query_layout + HAND   │
+//!                 │                   query to render thread (no await)│
 //!                 └───────────────────────────────────────────────────┘
 //! ```
+//!
+//! [`MuxSender`]: crate::multiplexer::MuxSender
+//! [`MuxReceiver`]: crate::multiplexer::MuxReceiver
+//! [`MuxServerMsg`]: crate::multiplexer::MuxServerMsg
 //!
 //! ## Lifecycle / clean shutdown
 //!
@@ -74,7 +81,7 @@
 //!   inbound task (QueryLayout arm — NEVER awaits):
 //!     1. bump a monotonic `seq`
 //!     2. hand InFlightQuery { seq, reply, tabs:None } → query_tx
-//!     3. send Action::ListTabs THEN Action::ListPanes via AttachSender
+//!     3. MuxSender::query_layout() (fires ListTabs THEN ListPanes)
 //!     4. return immediately (no await, no per-arm timeout)
 //!
 //!   reader thread (render_loop) owns Option<InFlightQuery>:
@@ -84,7 +91,8 @@
 //!       receiver) → discard the slot so its stray Logs are dropped, not
 //!       misattributed
 //!     - on Log WITH an in-flight query: fill tabs (1st) then panes (2nd); when
-//!       both present, `reply.send(Ok((tabs, panes)))` and clear the slot
+//!       both present, parse into a `LayoutSnapshot` and `reply.send(Ok(snapshot))`,
+//!       then clear the slot (P2.00 A-2 — the parse moved here from `grpc/layout.rs`)
 //!     - on Log with NO in-flight query: discard it (drains a stale Log from a
 //!       previous, already-retired query)
 //!     - every Render is still forwarded unconditionally
@@ -107,7 +115,7 @@
 //! single in-flight query the first Log is tabs and the second is panes.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use futures::StreamExt;
@@ -115,7 +123,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Status, Streaming};
 
-use crate::ipc::AttachHandle;
+use crate::multiplexer::BackendSet;
 use crate::proto::{ClientFrame, ServerFrame, client_frame};
 
 mod helpers;
@@ -129,12 +137,24 @@ pub use types::{
     ViewStateEntry, ViewStateRegistry,
 };
 
-// ─── Process-unique connection id counter ─────────────────────────────────────
+// ─── Unguessable per-connection id ────────────────────────────────────────────
 
-/// Monotonic counter used to mint a process-unique `connection_id` per
-/// `AttachTerminal` relay. Cheaper than a UUID and sufficient for our needs:
-/// we only need uniqueness within one server process lifetime.
-static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+/// Mint an **unguessable, non-enumerable** `connection_id` for an `AttachTerminal`
+/// relay (S-M4 security fix).
+///
+/// connection_id is the SOLE per-connection isolation discriminator on a collapsed
+/// backend session (herdr's single `herdr:herdr` session — see
+/// [`crate::multiplexer::is_collapsed_backend_session`]): every co-attached relay
+/// shares the same session id, so the routing layer relies entirely on a
+/// connection_id match. The previous monotonic `AtomicU64` counter (starting at
+/// one) was trivially guessable — an authed RW client could enumerate ids and
+/// re-point a victim connection's stream. We therefore mint a 128-bit value from a
+/// CSPRNG (`rand::thread_rng`, ChaCha-based, OS-seeded) and format it as a 32-char
+/// lowercase hex string for the proto wire. It stays stable for the connection's
+/// lifetime and a reattach mints a fresh one (as before).
+fn mint_connection_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
 
 use reader::{ShutdownGuard, render_loop};
 use types::{InFlightQuery, RENDER_CHANNEL_BOUND, RO_FALLBACK_COLS, RO_FALLBACK_ROWS};
@@ -145,6 +165,7 @@ use types::{InFlightQuery, RENDER_CHANNEL_BOUND, RO_FALLBACK_COLS, RO_FALLBACK_R
 ///
 /// Reads the first inbound frame (must be `AttachReq`), opens the IPC attach,
 /// spawns the relay tasks/thread, and returns the outbound render stream.
+#[allow(clippy::too_many_arguments)]
 pub async fn attach_relay(
     mut inbound: Streaming<ClientFrame>,
     read_only: bool,
@@ -152,6 +173,7 @@ pub async fn attach_relay(
     clients: crate::client_count::SessionClients,
     control: ControlRegistry,
     view_state: ViewStateRegistry,
+    backends: BackendSet,
 ) -> Result<ServerFrameStream, Status> {
     // ── 1. First frame must be AttachReq ────────────────────────────────────
     let first = inbound
@@ -172,7 +194,27 @@ pub async fn attach_relay(
 
     let client_rows = clamp_dim(attach.rows, 24);
     let client_cols = clamp_dim(attach.cols, 80);
-    let session = attach.session.clone();
+
+    // ── 1a. Option C: resolve the opaque session id → owning backend + bare name.
+    // The id is `<backend>:<bare>` (e.g. `zellij:dev`); the client echoes the SAME
+    // id in later unary RPCs, so the *id* is what we store in the control / view-
+    // state registries (registry match stays id-vs-id), while the *bare* name is
+    // what we hand the backend for the size query / attach. `resolve_session` runs
+    // the path-traversal guard on the bare name (the attach path was previously
+    // unvalidated — this tightens it).
+    let id = attach.session.clone();
+    let (backend_kind, backend, session) =
+        crate::multiplexer::resolve_session_kind(&backends, &id)?;
+
+    // ── Carried T04 fix: backend-qualified client-count key ──────────────────
+    // The relay's connected-client count must bucket by the SAME opaque id that
+    // `ListSessions` reads (`make_id(kind, bare)`), NOT by the bare session name.
+    // Keying by the bare name would make two same-name sessions on different
+    // backends (`zellij:dev` + `herdr:dev`) share one bucket and double-count.
+    // Canonicalize here (rather than reusing the raw client-sent `id`) so a legacy
+    // bare-name attach on a single-backend server still lands in the same bucket
+    // the canonical `make_id`-keyed `ListSessions` reads.
+    let count_key = crate::multiplexer::make_id(backend_kind, &session);
 
     // ── 1b. Major A (round-2): read-only attaches must NOT drive geometry ────
     //
@@ -184,7 +226,8 @@ pub async fn attach_relay(
     // client's. Writers (RW) keep driving their own size exactly as before.
     let (rows, cols) = if read_only {
         let query_session = session.clone();
-        match tokio::task::spawn_blocking(move || crate::query::query_session_size(&query_session))
+        let size_backend = backend.clone();
+        match tokio::task::spawn_blocking(move || size_backend.query_session_size(&query_session))
             .await
         {
             Ok(Ok((r, c))) => {
@@ -223,32 +266,41 @@ pub async fn attach_relay(
         attach.session
     );
 
-    // ── 2. Open the IPC attach (blocking but cheap: connect + handshake) ────
-    let attach_session = attach.session.clone();
-    let handle =
-        tokio::task::spawn_blocking(move || AttachHandle::open(&attach_session, rows, cols))
-            .await
-            .map_err(|e| Status::internal(format!("attach task panicked: {e}")))?
-            .map_err(|e| Status::not_found(format!("attach failed: {e:#}")))?;
+    // ── 2. Open the attach via the backend (blocking but cheap: connect +
+    //       handshake), yielding a neutral DualHandle of boxed sender/receiver. ─
+    let attach_session = session.clone();
+    let open_backend = backend.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        open_backend.open_attach(&attach_session, rows, cols, read_only)
+    })
+    .await
+    .map_err(|e| Status::internal(format!("attach task panicked: {e}")))?
+    .map_err(|e| Status::not_found(format!("attach failed: {e:#}")))?;
 
     let session_name = handle.session_name.clone();
-    let (sender, mut receiver) = handle.split();
+    let (sender, receiver) = handle.split();
 
     // ── Phase F: count this client against the session ──────────────────────
     // Increment now that the attach succeeded; the guard is moved into the
     // inbound task below and decrements on every stream-end path when that task
     // (and the guard with it) drops. Attach-failure paths above returned early
     // and were never counted.
-    let client_guard = clients.attach(&session_name);
+    let client_guard = clients.attach(&count_key);
 
-    // ── 3b. Mint a process-unique connection_id for this relay. ─────────────
-    // Monotonic AtomicU64 is cheaper than UUID and sufficient: we only need
-    // uniqueness within one server process lifetime. Format as a decimal string
-    // for easy proto transport.
-    let connection_id = NEXT_CONNECTION_ID
-        .fetch_add(1, Ordering::Relaxed)
-        .to_string();
+    // ── 3b. Mint an unguessable, non-enumerable connection_id for this relay. ─
+    // S-M4: connection_id is the sole per-connection isolation discriminator on a
+    // collapsed (herdr) session, so it must NOT be guessable/enumerable. A 128-bit
+    // CSPRNG hex string (see `mint_connection_id`).
+    let connection_id = mint_connection_id();
+    // FS3: full connection_id must not appear in info/warn logs — it is the sole
+    // per-connection isolation discriminator and effectively a per-connection secret.
+    // Log an 8-hex-char prefix at info (enough for operational correlation) and
+    // keep the full value at debug only.
     log::info!(
+        "relay [{session_name}]: minted connection_id={}… (read_only={read_only})",
+        &connection_id[..8]
+    );
+    log::debug!(
         "relay [{session_name}]: minted connection_id={connection_id} \
          (read_only={read_only})"
     );
@@ -277,7 +329,13 @@ pub async fn attach_relay(
         // never receives its connection_id and falls back to session-scoped
         // routing for all subsequent RPCs.
         if let Err(e) = tx.try_send(Ok(conn_event)) {
+            // FS3: redact full connection_id at warn; full value logged at debug only.
             log::warn!(
+                "relay [{session_name}]: failed to send connection_id frame to client \
+                 (id={}…): {e} — client will fall back to session-scoped routing",
+                &connection_id[..8]
+            );
+            log::debug!(
                 "relay [{session_name}]: failed to send connection_id frame to client \
                  (connection_id={connection_id}): {e} — client will fall back to \
                  session-scoped routing"
@@ -296,15 +354,15 @@ pub async fn attach_relay(
     let reader_session = session_name.clone();
     let reader: JoinHandle<u64> = std::thread::Builder::new()
         .name(format!("relay-reader-{session_name}"))
-        .spawn(move || render_loop(&mut receiver, tx, reader_stop, &reader_session, query_rx))
+        .spawn(move || render_loop(receiver, tx, reader_stop, &reader_session, query_rx))
         .expect("failed to spawn relay reader thread");
 
-    // ShutdownGuard owns the stop-flag, a cloned sender for the resize nudge,
-    // and the join handle. Dropping it (when the inbound task ends) tears the
-    // reader thread down deterministically.
+    // ShutdownGuard owns the stop-flag, an independent cloned sender for the
+    // teardown nudge, and the join handle. Dropping it (when the inbound task
+    // ends) tears the reader thread down deterministically.
     let guard = ShutdownGuard {
         stop,
-        nudge: sender.try_clone(),
+        nudge: sender.box_clone(),
         reader: Some(reader),
         rows,
         cols,
@@ -333,10 +391,14 @@ pub async fn attach_relay(
         let init_session = session_name.clone();
         let view_state_init = view_state.clone();
         let conn_id = connection_id.clone();
-        let session_for_entry = session_name.clone();
-        let init_result =
-            tokio::task::spawn_blocking(move || helpers::init_relay_view_state(&init_session))
-                .await;
+        // Option C: the registry stores the opaque *id* the client echoes (not the
+        // bare name) so `entry.session == req.session` stays an id-vs-id match.
+        let session_for_entry = id.clone();
+        let init_backend = backend.clone();
+        let init_result = tokio::task::spawn_blocking(move || {
+            helpers::init_relay_view_state(&init_backend, &init_session)
+        })
+        .await;
         let relay_vs = match init_result {
             Ok(Ok(state)) => {
                 log::info!(
@@ -377,7 +439,9 @@ pub async fn attach_relay(
     control.insert(
         connection_id.clone(),
         ControlEntry {
-            session: session_name.clone(),
+            // Option C: store the opaque id the client echoes (registry match stays
+            // id-vs-id); the bare `session_name` is only for backend calls / counts.
+            session: id.clone(),
             sender: ctrl_tx.clone(),
             read_only,
         },
@@ -387,6 +451,7 @@ pub async fn attach_relay(
     tokio::spawn(inbound::inbound_loop(
         inbound,
         sender,
+        backend,
         guard,
         session_name,
         connection_id,
@@ -414,5 +479,51 @@ pub(crate) fn clamp_dim(v: u32, default: u16) -> u16 {
         default
     } else {
         v.min(u16::MAX as u32) as u16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_id_is_32_char_lowercase_hex() {
+        let id = mint_connection_id();
+        assert_eq!(id.len(), 32, "connection_id must be 32 hex chars (128-bit)");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "connection_id must be lowercase hex: {id}"
+        );
+    }
+
+    #[test]
+    fn connection_ids_are_random_not_sequential() {
+        // S-M4: the old mint was a monotonic AtomicU64 (adjacent ids differed by 1
+        // and were trivially enumerable). The CSPRNG mint must produce values that
+        // are neither equal nor adjacent across a batch of mints.
+        let mut ids = Vec::new();
+        for _ in 0..64 {
+            ids.push(u128::from_str_radix(&mint_connection_id(), 16).expect("valid hex"));
+        }
+        // All distinct (collision probability for 64 draws from 2^128 is ~0).
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ids.len(),
+            "minted connection_ids must be unique"
+        );
+
+        // No two consecutive mints differ by exactly 1 (the monotonic-counter
+        // signature). With random 128-bit values this is astronomically unlikely.
+        for pair in ids.windows(2) {
+            let delta = pair[0].abs_diff(pair[1]);
+            assert_ne!(
+                delta, 1,
+                "consecutive mints must not be adjacent (not a counter)"
+            );
+        }
     }
 }

@@ -27,16 +27,16 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use muxrd::proto::client_frame::Kind as ClientKind;
+use muxrd::proto::muxr_client::MuxrClient;
+use muxrd::proto::server_frame::Kind as ServerKind;
+use muxrd::proto::{AttachReq, ClientFrame, LoginRequest};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
     metadata::MetadataValue,
     transport::{Certificate, Channel, ClientTlsConfig},
 };
-use muxrd::proto::client_frame::Kind as ClientKind;
-use muxrd::proto::server_frame::Kind as ServerKind;
-use muxrd::proto::muxr_client::MuxrClient;
-use muxrd::proto::{AttachReq, ClientFrame, LoginRequest};
 
 // ─── Args ─────────────────────────────────────────────────────────────────────
 

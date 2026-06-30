@@ -3,16 +3,14 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::actions::{self, ScrollDir};
+use crate::multiplexer::{ResizeDir, ResizeKind as NeutralResizeKind, ScrollDir};
 use crate::proto::{
     ActionAck as ProtoAck, NewPaneReq, PaneTarget, RenamePaneReq, ResizeKind, ResizePaneReq,
     ScrollDirection, ScrollReq, ToggleFullscreenReq, WriteToPaneReq,
 };
 
 use super::MuxrService;
-use super::helpers::{
-    reject_if_read_only, resolve_pane_target, run_action, try_route_control, validate_session,
-};
+use super::helpers::{pane_ref, reject_if_read_only, run_action, short_conn, try_route_control};
 
 /// Upper bound on a single `WriteToPane` payload (1 MiB).  Guards against a
 /// client pushing an unbounded write into the session IPC channel.
@@ -40,14 +38,15 @@ impl MuxrService {
         let target = req
             .target
             .ok_or_else(|| Status::invalid_argument("WriteToPane: target is required"))?;
-        let (session, pane) = resolve_pane_target(&target)?;
+        let pane = pane_ref(&target);
+        let (backend, session) = self.resolve_session(&target.session)?;
         log::info!(
             "WriteToPane: session='{session}' pane={pane:?} ({} bytes)",
             req.data.len()
         );
         let data = req.data;
         run_action("WriteToPane", move || {
-            actions::write_to_pane(&session, pane, data)
+            backend.write_to_pane(&session, pane, data)
         })
         .await
     }
@@ -60,21 +59,30 @@ impl MuxrService {
         // Focus is a read — no read-only gate.
         let target = request.into_inner();
         let connection_id = target.connection_id.clone();
-        let (session, pane) = resolve_pane_target(&target)?;
-        log::info!("FocusPane: session='{session}' pane={pane:?} connection_id='{connection_id}'");
+        let pane = pane_ref(&target);
+        let (backend, session) = self.resolve_session(&target.session)?;
+        // FS3: full connection_id must not appear in info/warn logs.
+        log::info!(
+            "FocusPane: session='{session}' pane={pane:?} connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!("FocusPane: session='{session}' pane={pane:?} connection_id='{connection_id}'");
         // Route through the live relay client if attached, so focus applies to
         // the rendering client (and re-points the single-pane sub).
         // connection_id targets the exact relay that sent the request.
+        // RelayControl::FocusPane carries the neutral PaneRef directly (P1.03).
+        // Option C: route with the opaque id the client echoed (target.session),
+        // which is what the control registry stores — not the stripped bare name.
         if let Some(resp) = try_route_control(
             &self.control,
-            &session,
+            &target.session,
             &connection_id,
             crate::relay::RelayControl::FocusPane(pane),
         ) {
             log::info!("FocusPane: routed via relay client (session='{session}')");
             return Ok(resp);
         }
-        run_action("FocusPane", move || actions::focus_pane(&session, pane)).await
+        run_action("FocusPane", move || backend.focus_pane(&session, pane)).await
     }
 
     /// Close a specific pane. MUTATING (read-only rejected).
@@ -84,9 +92,10 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "ClosePane")?;
         let target = request.into_inner();
-        let (session, pane) = resolve_pane_target(&target)?;
+        let pane = pane_ref(&target);
+        let (backend, session) = self.resolve_session(&target.session)?;
         log::info!("ClosePane: session='{session}' pane={pane:?}");
-        run_action("ClosePane", move || actions::close_pane(&session, pane)).await
+        run_action("ClosePane", move || backend.close_pane(&session, pane)).await
     }
 
     /// Open a new pane; the new pane id surfaces in `ActionAck.info`. MUTATING.
@@ -96,8 +105,7 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "NewPane")?;
         let req = request.into_inner();
-        validate_session(&req.session)?;
-        let session = req.session;
+        let (backend, session) = self.resolve_session(&req.session)?;
         let floating = req.floating;
         let pane_name = if req.pane_name.is_empty() {
             None
@@ -106,7 +114,7 @@ impl MuxrService {
         };
         log::info!("NewPane: session='{session}' floating={floating} name={pane_name:?}");
         run_action("NewPane", move || {
-            actions::new_pane(&session, floating, pane_name)
+            backend.new_pane(&session, floating, pane_name)
         })
         .await
     }
@@ -121,11 +129,12 @@ impl MuxrService {
         let target = req
             .target
             .ok_or_else(|| Status::invalid_argument("RenamePane: target is required"))?;
-        let (session, pane) = resolve_pane_target(&target)?;
+        let pane = pane_ref(&target);
+        let (backend, session) = self.resolve_session(&target.session)?;
         let name = req.name;
         log::info!("RenamePane: session='{session}' pane={pane:?} name='{name}'");
         run_action("RenamePane", move || {
-            actions::rename_pane(&session, pane, name)
+            backend.rename_pane(&session, pane, name)
         })
         .await
     }
@@ -140,26 +149,28 @@ impl MuxrService {
         let target = req
             .target
             .ok_or_else(|| Status::invalid_argument("ResizePane: target is required"))?;
-        let (session, pane) = resolve_pane_target(&target)?;
+        let pane = pane_ref(&target);
+        let (backend, session) = self.resolve_session(&target.session)?;
 
-        use zellij_utils::data::{Direction, Resize};
-        let resize = match ResizeKind::try_from(req.resize) {
-            Ok(ResizeKind::Decrease) => Resize::Decrease,
-            _ => Resize::Increase,
+        // Convert proto ResizeKind → neutral ResizeKind.
+        let resize_kind = match ResizeKind::try_from(req.resize) {
+            Ok(ResizeKind::Decrease) => NeutralResizeKind::Decrease,
+            _ => NeutralResizeKind::Increase,
         };
         // ResizeDirection: 0 = UNSPECIFIED → None (uniform resize).
-        let direction = match req.direction {
-            1 => Some(Direction::Left),
-            2 => Some(Direction::Right),
-            3 => Some(Direction::Up),
-            4 => Some(Direction::Down),
+        let resize_dir: Option<ResizeDir> = match req.direction {
+            1 => Some(ResizeDir::Left),
+            2 => Some(ResizeDir::Right),
+            3 => Some(ResizeDir::Up),
+            4 => Some(ResizeDir::Down),
             _ => None,
         };
         log::info!(
-            "ResizePane: session='{session}' pane={pane:?} resize={resize:?} dir={direction:?}"
+            "ResizePane: session='{session}' pane={pane:?} resize={resize_kind:?} \
+             dir={resize_dir:?}"
         );
         run_action("ResizePane", move || {
-            actions::resize_pane(&session, pane, resize, direction)
+            backend.resize_pane(&session, pane, resize_kind, resize_dir)
         })
         .await
     }
@@ -171,10 +182,11 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "TogglePaneFloating")?;
         let target = request.into_inner();
-        let (session, pane) = resolve_pane_target(&target)?;
+        let pane = pane_ref(&target);
+        let (backend, session) = self.resolve_session(&target.session)?;
         log::info!("TogglePaneFloating: session='{session}' pane={pane:?}");
         run_action("TogglePaneFloating", move || {
-            actions::toggle_pane_floating(&session, pane)
+            backend.toggle_pane_floating(&session, pane)
         })
         .await
     }
@@ -191,7 +203,8 @@ impl MuxrService {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("TogglePaneFullscreen: missing target"))?;
         let connection_id = target.connection_id.clone();
-        let (session, pane) = resolve_pane_target(target)?;
+        let pane = pane_ref(target);
+        let (backend, session) = self.resolve_session(&target.session)?;
         // Bug 2c: forward the client's floating hint so the relay can skip a
         // synchronous IPC query on its hot path. Only trust the hint when the
         // caller explicitly attests it via `has_floating_hint` — proto3 bools
@@ -208,16 +221,25 @@ impl MuxrService {
         } else {
             None
         };
+        // FS3: full connection_id must not appear in info/warn logs.
         log::info!(
+            "TogglePaneFullscreen: session='{session}' pane={pane:?} hint={hint:?} \
+             connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!(
             "TogglePaneFullscreen: session='{session}' pane={pane:?} hint={hint:?} \
              connection_id='{connection_id}'"
         );
         // Route through the live relay client if attached so the fullscreen
         // toggle applies to the *rendering* client (is_cli_client:false).
         // connection_id targets the exact relay that sent the request.
+        // RelayControl::ToggleFullscreen carries the neutral PaneRef directly (P1.03).
+        // Option C: route with the opaque id the client echoed (target.session) —
+        // what the control registry stores — not the stripped bare name.
         if let Some(resp) = try_route_control(
             &self.control,
-            &session,
+            &target.session,
             &connection_id,
             crate::relay::RelayControl::ToggleFullscreen { pane, hint },
         ) {
@@ -225,7 +247,7 @@ impl MuxrService {
             return Ok(resp);
         }
         run_action("TogglePaneFullscreen", move || {
-            actions::toggle_pane_fullscreen(&session, pane)
+            backend.toggle_pane_fullscreen(&session, pane)
         })
         .await
     }
@@ -242,7 +264,8 @@ impl MuxrService {
         let target = req
             .target
             .ok_or_else(|| Status::invalid_argument("ScrollPane: target is required"))?;
-        let (session, pane) = resolve_pane_target(&target)?;
+        let pane = pane_ref(&target);
+        let (backend, session) = self.resolve_session(&target.session)?;
         let dir = match ScrollDirection::try_from(req.direction) {
             Ok(ScrollDirection::Down) => ScrollDir::Down,
             Ok(ScrollDirection::ToTop) => ScrollDir::ToTop,
@@ -256,7 +279,7 @@ impl MuxrService {
         };
         log::info!("ScrollPane: session='{session}' pane={pane:?} dir={dir:?}");
         run_action("ScrollPane", move || {
-            actions::scroll_pane(&session, pane, dir)
+            backend.scroll_pane(&session, pane, dir)
         })
         .await
     }

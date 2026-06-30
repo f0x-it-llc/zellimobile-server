@@ -30,10 +30,14 @@
 # muxrctl starts the gRPC server on :50051; the cert is self-signed (pair by
 # scanning the QR, or trust the PEM / use the app's insecure-dev mode).
 services:
+  # ── Default rig: zellij backend ──────────────────────────────────────────────
   muxrd:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # Explicit target so `docker compose up` builds ONLY the zellij runtime and
+      # never the opt-in herdr stage (runtime-herdr).
+      target: runtime
     image: muxr-grpc-rig
     container_name: muxr-grpc-rig
     # BIND_ADDR controls which host interface the ports are published on.
@@ -44,6 +48,7 @@ services:
       # SSH — attach and drive muxrctl.
       - "${BIND_ADDR:-127.0.0.1}:${SSH_PORT:-2222}:22"
     environment:
+      BACKEND: zellij
       SESSION: "${SESSION:-backend-dev}"
       # Inject the tailnet/LAN IP into the TLS cert SANs. Inside the container
       # the host's tailnet IP is not a local interface (it's a host-side NAT
@@ -60,6 +65,84 @@ services:
     stdin_open: true
     tty: true
 
+  # ── Opt-in rig: herdr backend ────────────────────────────────────────────────
+  # Exercises muxrd's herdr backend (`muxrd --backend herdr`). Gated behind the
+  # `herdr` profile so it is built/started ONLY on demand:
+  #   docker compose -f docker/compose.yaml --profile herdr up --build muxrd-herdr
+  #   # or:  ./docker/run.sh --herdr
+  # Publishes the same host ports as the zellij rig — run ONE at a time.
+  # herdr is a separate, unmodified, user-installed binary (AGPL-3.0); muxrd drives
+  # it only over its public 0600 sockets and stays the TLS/bearer boundary.
+  muxrd-herdr:
+    profiles: ["herdr"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime-herdr
+      args:
+        HERDR_VERSION: "${HERDR_VERSION:-0.7.1}"   # wire protocol 14 — see Dockerfile
+    image: muxr-herdr-rig
+    container_name: muxr-herdr-rig
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${GRPC_PORT:-50051}:50051"
+      - "${BIND_ADDR:-127.0.0.1}:${SSH_PORT:-2222}:22"
+    environment:
+      BACKEND: herdr
+      SESSION: "${SESSION:-herdr-dev}"
+      ZELLIMSERVER_SAN: "${ZELLIMSERVER_SAN:-${BIND_ADDR:-}}"
+    volumes:
+      # muxrd's token DB + cert still live under the XDG share dir; herdr keeps its
+      # own workspace/session state under ~/.config/herdr. Separate volumes from the
+      # zellij rig so the two rigs don't share credential/session state.
+      - muxrd-herdr-data:/root/.local/share/zellij
+      - herdr-data:/root/.config/herdr
+    stdin_open: true
+    tty: true
+
+  # ── Multi-backend rig: zellij AND herdr at once (Phase 3 serve-all) ──────────
+  # The on-device test rig for simultaneous multi-backend. Uses the runtime-herdr
+  # image (both binaries) but runs the entrypoint in BACKEND=both mode: it starts a
+  # zellij session AND a headless herdr server and leaves MUXRD_BACKEND UNSET, so
+  # the muxrctl-spawned muxrd auto-detects and serves BOTH backends. Both expose a
+  # session named "${SESSION}" so you can verify same-name cross-backend routing
+  # (the app distinguishes them by the backend badge: zellij green / herdr blue).
+  # Gated behind the `both` profile; publishes the same host ports — run ONE rig at
+  # a time.
+  #   docker compose -f docker/compose.yaml --profile both up --build muxrd-both
+  #   # or:  ./docker/run.sh --both [--host <lan-ip>]
+  muxrd-both:
+    profiles: ["both"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime-herdr
+      args:
+        HERDR_VERSION: "${HERDR_VERSION:-0.7.1}"   # wire protocol 14 — see Dockerfile
+    image: muxr-both-rig
+    container_name: muxr-both-rig
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${GRPC_PORT:-50051}:50051"
+      - "${BIND_ADDR:-127.0.0.1}:${SSH_PORT:-2222}:22"
+    environment:
+      BACKEND: both
+      SESSION: "${SESSION:-backend-dev}"
+      ZELLIMSERVER_SAN: "${ZELLIMSERVER_SAN:-${BIND_ADDR:-}}"
+    volumes:
+      # Dedicated volumes so the multi-backend rig doesn't share credential/session
+      # state with the zellij-only or herdr-only rigs. muxrd's token DB + cert live
+      # under the XDG share dir; herdr keeps its workspace state under ~/.config/herdr;
+      # zellij config (managed, plugin-disabled) under ~/.config/zellij.
+      - muxrd-both-data:/root/.local/share/zellij
+      - zellij-both-config:/root/.config/zellij
+      - herdr-both-data:/root/.config/herdr
+    stdin_open: true
+    tty: true
+
 volumes:
   zellij-data:
   zellij-config:
+  muxrd-herdr-data:
+  herdr-data:
+  muxrd-both-data:
+  zellij-both-config:
+  herdr-both-data:

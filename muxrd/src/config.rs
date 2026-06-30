@@ -511,7 +511,11 @@ mod tests {
         let _key_guard = EnvGuard::remove(&["ZELLIMSERVER_TLS_CERT", "ZELLIMSERVER_TLS_KEY"]);
 
         let src = resolve_cert_source(None, None, false).expect("should succeed");
-        assert_eq!(src, CertSource::SelfSigned, "H2C=<empty> should not activate h2c");
+        assert_eq!(
+            src,
+            CertSource::SelfSigned,
+            "H2C=<empty> should not activate h2c"
+        );
     }
 
     #[test]
@@ -677,7 +681,10 @@ mod tests {
             );
             assert!(
                 check_h2c_bind_safety(
-                    &CertSource::External { cert: "/c.pem".into(), key: "/k.pem".into() },
+                    &CertSource::External {
+                        cert: "/c.pem".into(),
+                        key: "/k.pem".into()
+                    },
                     addr,
                     false
                 )

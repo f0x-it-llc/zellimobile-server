@@ -16,12 +16,12 @@
 //! Default addr: https://[::1]:50051 ; default session: c1demo.
 
 use anyhow::{Context, Result};
+use muxrd::proto::muxr_client::MuxrClient;
+use muxrd::proto::{Empty, LoginRequest, SessionRef};
 use tonic::{
     metadata::MetadataValue,
     transport::{Certificate, Channel, ClientTlsConfig},
 };
-use muxrd::proto::muxr_client::MuxrClient;
-use muxrd::proto::{Empty, LoginRequest, SessionRef};
 
 // ─── Args ─────────────────────────────────────────────────────────────────────
 

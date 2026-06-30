@@ -16,16 +16,18 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::muxr_server::Muxr;
 use crate::proto::{
-    ActionAck as ProtoAck, ClientFrame, CreateSessionReq, Empty, Layout, LoginRequest,
-    LoginResponse, NewPaneReq, NewTabReq, PaneTarget, RenamePaneReq, RenameSessionReq,
-    RenameTabReq, ResizePaneReq, ScrollReq, SessionList, SessionRef, TabTarget,
-    ToggleFullscreenReq, VersionInfo, WriteToPaneReq,
+    ActionAck as ProtoAck, ClientFrame, CloseSpaceReq, CreateSessionReq, CreateSpaceReq, Empty,
+    Layout, LoginRequest, LoginResponse, NewPaneReq, NewTabReq, PaneTarget, RenamePaneReq,
+    RenameSessionReq, RenameSpaceReq, RenameTabReq, ResizePaneReq, ScrollReq, SessionList,
+    SessionRef, SpaceList, SwitchSpaceReq, TabTarget, ToggleFullscreenReq, VersionInfo,
+    WriteToPaneReq,
 };
 
 pub mod helpers;
 mod layout;
 mod pane_ops;
 mod session_ops;
+mod space_ops;
 mod tab_ops;
 mod token_ops;
 
@@ -40,7 +42,12 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 // ─── Service ─────────────────────────────────────────────────────────────────
 
 /// Tonic service implementing the `Muxr` gRPC service.
-#[derive(Debug, Default, Clone)]
+///
+/// `Default` is hand-written (below) rather than derived: the `backends` field is
+/// a [`BackendSet`](crate::multiplexer::BackendSet) of `Arc<dyn MuxBackend>` trait
+/// objects, which has no `Default`. `Clone` stays derived — every backend is an
+/// `Arc`, so the clone is cheap and all relays share the same backends.
+#[derive(Debug, Clone)]
 pub struct MuxrService {
     /// Per-session count of clients attached through this server (Phase F).
     /// Shared with every relay so `ListSessions` can report `connected_clients`.
@@ -57,6 +64,23 @@ pub struct MuxrService {
     /// single-client-correct values — only when the relay that served the query
     /// is the caller's own relay (exact connection_id match).
     view_state: crate::relay::ViewStateRegistry,
+    /// The terminal-multiplexer backends this server drives (Phase 1 seam,
+    /// Phase 3 multi-backend). Holds **every** detected backend (zellij and/or
+    /// herdr) behind the same `MuxBackend` trait, in detection order.
+    ///
+    /// Session-scoped RPCs resolve the owning backend via
+    /// [`MuxrService::resolve_session`] (Option C id routing, `multiplexer::routing`).
+    /// `ListSessions` fans out to all backends in iteration order; `CreateSession`
+    /// selects the backend directly from the proto `backend` field (or defaults to
+    /// the sole backend when `BACKEND_UNSPECIFIED`). No `backend()` shim exists.
+    /// Cheap to clone (`Arc`s).
+    backends: crate::multiplexer::BackendSet,
+}
+
+impl Default for MuxrService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MuxrService {
@@ -78,7 +102,51 @@ impl MuxrService {
             clients: crate::client_count::SessionClients::new(),
             control: crate::relay::ControlRegistry::default(),
             view_state: crate::relay::ViewStateRegistry::default(),
+            backends: crate::multiplexer::BackendSet::single(
+                crate::cli::BackendKind::Zellij,
+                std::sync::Arc::new(crate::multiplexer::ZellijBackend),
+            ),
         }
+    }
+
+    /// Construct a [`MuxrService`] driving the supplied [`BackendSet`].
+    ///
+    /// Builds the service with the same shared registries as [`MuxrService::new`]
+    /// but accepts a whole set of detected backends — used by `cmd_start` in
+    /// `bin/muxrd.rs` so one server can serve `zellij` and `herdr` simultaneously
+    /// (Phase 3) instead of hard-coding `ZellijBackend`.
+    ///
+    /// # Zellij version assertion
+    ///
+    /// [`MuxrService::new`] performs an advisory zellij-contract-version check
+    /// (logged as `warn!`/`info!`).  This method intentionally **skips** that
+    /// check: it is backend-agnostic, and the zellij assertion is meaningless for
+    /// a herdr-only set.  The zellij startup path enforces a hard version gate via
+    /// `check_zellij_version()` in `cmd_start` (when zellij is among the detected
+    /// backends) before this is ever called.  Full per-backend `VersionInfo`
+    /// reporting is T05.
+    pub fn with_backends(backends: crate::multiplexer::BackendSet) -> Self {
+        Self {
+            clients: crate::client_count::SessionClients::new(),
+            control: crate::relay::ControlRegistry::default(),
+            view_state: crate::relay::ViewStateRegistry::default(),
+            backends,
+        }
+    }
+
+    /// Resolve an opaque session `id` (`"<backend>:<bare>"`) to the backend that
+    /// owns it plus the bare session name to pass that backend (Option C routing).
+    ///
+    /// Every **session-scoped** RPC routes through this: it replaces the old
+    /// blanket `backend()` (primary) shim so a request lands on the backend that
+    /// actually owns the session, in a simultaneous multi-backend deploy. See
+    /// [`crate::multiplexer::resolve_session`] for the wire format, error mapping,
+    /// back-compat (legacy bare-name) fallback, and the bare-name validation invariant.
+    fn resolve_session(
+        &self,
+        id: &str,
+    ) -> Result<(std::sync::Arc<dyn crate::multiplexer::MuxBackend>, String), Status> {
+        crate::multiplexer::resolve_session(&self.backends, id)
     }
 
     /// Returns a clone of the per-session attached-client registry.
@@ -329,5 +397,53 @@ impl Muxr for MuxrService {
         request: Request<crate::proto::RevokeTokenReq>,
     ) -> Result<Response<ProtoAck>, Status> {
         self.revoke_token_impl(request).await
+    }
+
+    // ── Spaces (herdr workspaces) ─────────────────────────────────────────────
+    //
+    // Spaces are a herdr-only navigation axis (its workspaces). zellij sessions
+    // return an empty list (GetSpaces) / a graceful failure ack (the mutating
+    // ops). See [`space_ops`] for the routing details. GetSpaces marks the
+    // connection-active space from the relay's tracked `current_space`; SwitchSpace
+    // is relay-routed; create/rename/close are control-plane (daemon-global).
+
+    /// List the spaces (herdr workspaces) for a session. Read-only allowed.
+    async fn get_spaces(
+        &self,
+        request: Request<SessionRef>,
+    ) -> Result<Response<SpaceList>, Status> {
+        self.get_spaces_impl(request).await
+    }
+
+    /// Switch the connection's relay to a different space. MUTATING (read-only rejected).
+    async fn switch_space(
+        &self,
+        request: Request<SwitchSpaceReq>,
+    ) -> Result<Response<ProtoAck>, Status> {
+        self.switch_space_impl(request).await
+    }
+
+    /// Create a new space (herdr workspace). MUTATING (read-only rejected).
+    async fn create_space(
+        &self,
+        request: Request<CreateSpaceReq>,
+    ) -> Result<Response<ProtoAck>, Status> {
+        self.create_space_impl(request).await
+    }
+
+    /// Rename an existing space. MUTATING (read-only rejected).
+    async fn rename_space(
+        &self,
+        request: Request<RenameSpaceReq>,
+    ) -> Result<Response<ProtoAck>, Status> {
+        self.rename_space_impl(request).await
+    }
+
+    /// Close (delete) a space. MUTATING (read-only rejected).
+    async fn close_space(
+        &self,
+        request: Request<CloseSpaceReq>,
+    ) -> Result<Response<ProtoAck>, Status> {
+        self.close_space_impl(request).await
     }
 }

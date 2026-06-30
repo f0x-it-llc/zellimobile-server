@@ -1,20 +1,19 @@
 //! Tokio inbound task: drives the gRPC ClientFrame stream → IPC sender.
 
+use std::sync::Arc;
+
 use futures::StreamExt;
 use tonic::Streaming;
 
-use zellij_utils::input::actions::Action;
-
 use tokio::sync::mpsc;
 
-use crate::ipc::AttachSender;
+use crate::multiplexer::{FullscreenHint, MuxBackend, MuxSender};
 use crate::proto::{ClientFrame, client_frame};
 
-use super::helpers::{fill_floating_pane, hide_floating_panes, toggle_active_fullscreen};
 use super::reader::ShutdownGuard;
 use super::types::{
-    ControlRegistry, FLOAT_QUERY_TIMEOUT, InFlightQuery, MAX_INPUT_FRAME_BYTES, QueryTx,
-    RelayControl, TOKEN_RECHECK_INTERVAL, ViewStateRegistry,
+    ControlRegistry, FLOAT_QUERY_TIMEOUT, InFlightQuery, MAX_INPUT_FRAME_BYTES, QueryReply,
+    QueryTx, RelayControl, TOKEN_RECHECK_INTERVAL, ViewStateRegistry,
 };
 
 // ─── inbound_loop ─────────────────────────────────────────────────────────────
@@ -37,7 +36,10 @@ use super::types::{
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn inbound_loop(
     mut inbound: Streaming<ClientFrame>,
-    mut sender: AttachSender,
+    mut sender: Box<dyn MuxSender>,
+    // The multiplexer backend — used for the hint-less `ToggleFullscreen`
+    // fallback query (`pane_is_floating_with_visibility`). Cheap to clone (`Arc`).
+    backend: Arc<dyn MuxBackend>,
     guard: ShutdownGuard,
     session: String,
     // Process-unique id minted at attach time; used as the registry key for
@@ -107,9 +109,7 @@ pub(crate) async fn inbound_loop(
                     // switch that never happened). B-FOCUS state is only updated
                     // on the RW path below, after the action is actually sent.
                     if !read_only {
-                        if let Err(e) =
-                            sender.send_action_as_self(Action::GoToTabById { id: tab_id })
-                        {
+                        if let Err(e) = sender.go_to_tab(tab_id) {
                             log::warn!("relay inbound [{session}]: SwitchTab send failed: {e:#}");
                         } else {
                             // Update relay view state: active tab is now tab_id.
@@ -129,9 +129,7 @@ pub(crate) async fn inbound_loop(
                         log::trace!(
                             "relay inbound [{session}]: dropping FocusPane (read-only token)"
                         );
-                    } else if let Err(e) =
-                        sender.send_action_as_self(Action::FocusPaneByPaneId { pane_id: pane })
-                    {
+                    } else if let Err(e) = sender.focus_pane(pane) {
                         log::warn!("relay inbound [{session}]: FocusPane send failed: {e:#}");
                     } else {
                         // B-FOCUS: track focused pane for this relay client.
@@ -139,6 +137,48 @@ pub(crate) async fn inbound_loop(
                         if let Some(mut entry) = view_state.get_mut(&connection_id) {
                             entry.state.focused_pane = Some(pane);
                         }
+                    }
+                }
+                Some(RelayControl::SwitchSpace { workspace_id, reply }) => {
+                    // herdr Spaces (Option A; Decision 2 — per-connection view).
+                    // Mutating like SwitchTab (read-only drops it) + replied like
+                    // QueryLayout (the gRPC handler awaits the ack before refreshing
+                    // layout). switch_space re-points THIS relay's wire stream at the
+                    // target space's focused pane via the same blocking control path
+                    // go_to_tab uses (bounded by HerdrControl's 3 s per-call timeout),
+                    // with NO daemon-global workspace.focus.
+                    if read_only {
+                        log::trace!(
+                            "relay inbound [{session}]: dropping SwitchSpace (read-only token)"
+                        );
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "read-only token: SwitchSpace is not allowed"
+                        )));
+                    } else {
+                        let result = sender.switch_space(&workspace_id);
+                        match &result {
+                            Ok(()) => {
+                                // New space → this relay's tracked active tab and
+                                // focused pane are now unknown until the next
+                                // GetLayout/FocusPane. Reset both so get_layout does
+                                // not apply a stale override from the old space.
+                                // Record the new workspace_id as this relay's current
+                                // space so the gRPC GetSpaces handler can mark it
+                                // connection-active (the daemon-global focus is left
+                                // untouched, so the backend-reported active won't
+                                // reflect this per-connection switch).
+                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                                    entry.state.active_tab = None;
+                                    entry.state.focused_pane = None;
+                                    entry.state.current_space = Some(workspace_id.clone());
+                                }
+                            }
+                            Err(e) => log::warn!(
+                                "relay inbound [{session}]: SwitchSpace('{workspace_id}') \
+                                 failed: {e:#}"
+                            ),
+                        }
+                        let _ = reply.send(result);
                     }
                 }
                 Some(RelayControl::ToggleFullscreen { pane, hint }) => {
@@ -155,33 +195,37 @@ pub(crate) async fn inbound_loop(
                         // synchronous IPC query on this select-loop hot path
                         // (the query stalled input forwarding + the bearer
                         // recheck for a whole round trip, and spawned yet another
-                        // ephemeral AttachClient on the shared session).
+                        // ephemeral client on the shared session).
                         //
                         // FALLBACK (no hint — keyboard-driven / hint-less
-                        // callers): the original live query, derived fully from
-                        // live zellij state so an out-of-band SHOW/HIDE is
-                        // reflected immediately (M4 behaviour). HANG FIX
-                        // (BE-HANG) preserved: the blocking query runs in
-                        // spawn_blocking wrapped in tokio::time::timeout so a
-                        // stalled socket can never wedge the loop; on timeout we
-                        // skip the toggle rather than hang.
-                        let (is_floating, floating_visible, is_focused_floating) = match hint {
-                            Some(h) => (
-                                h.target_is_floating,
-                                h.floating_visible,
-                                h.target_is_focused_floating,
-                            ),
+                        // callers): a live query through the backend so an
+                        // out-of-band SHOW/HIDE is reflected immediately (M4
+                        // behaviour). HANG FIX (BE-HANG) preserved: the blocking
+                        // query runs in spawn_blocking wrapped in
+                        // tokio::time::timeout so a stalled socket can never wedge
+                        // the loop; on timeout we skip the toggle rather than hang.
+                        let resolved = match hint {
+                            Some(h) => FullscreenHint {
+                                is_floating: h.target_is_floating,
+                                floating_visible: h.floating_visible,
+                                is_focused_floating: h.target_is_focused_floating,
+                            },
                             None => {
+                                let backend = backend.clone();
                                 let s = session.clone();
                                 let query_fut = tokio::task::spawn_blocking(move || {
-                                    crate::query::pane_is_floating_with_visibility(&s, pane)
+                                    backend.pane_is_floating_with_visibility(&s, pane)
                                 });
                                 match tokio::time::timeout(FLOAT_QUERY_TIMEOUT, query_fut).await {
                                     Ok(join_result) => {
                                         let (f, v, focused) = join_result
                                             .unwrap_or(Ok((false, false, None)))
                                             .unwrap_or((false, false, None));
-                                        (f, v, focused == Some(pane))
+                                        FullscreenHint {
+                                            is_floating: f,
+                                            floating_visible: v,
+                                            is_focused_floating: focused == Some(pane),
+                                        }
                                     }
                                     Err(_elapsed) => {
                                         log::warn!(
@@ -197,56 +241,25 @@ pub(crate) async fn inbound_loop(
                             }
                         };
 
-                        if is_floating {
-                            // Floating path: fill-vs-hide derived fully from
-                            // LIVE zellij state.  Hide only when floating panes
-                            // are visible AND this specific pane is the focused
-                            // floating pane (per live `is_focused` from
-                            // ListPanes).  An out-of-band SHOW or HIDE by
-                            // another client or the keyboard is reflected in
-                            // `focused_floating` immediately, so the decision
-                            // never requires a double-tap to re-sync.
-                            if floating_visible && is_focused_floating {
-                                hide_floating_panes(&mut sender, &session);
-                                // B-FOCUS: hiding the floating panes returns focus
-                                // to whatever tiled pane was focused underneath —
-                                // which we don't track here. Mark unknown (None) so
-                                // get_layout falls back to the queried is_focused
-                                // rather than asserting this now-hidden floating
-                                // pane is still focused.
-                                // Key by connection_id so concurrent relays each update their own slot.
-                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
-                                    entry.state.focused_pane = None;
-                                }
-                            } else {
-                                fill_floating_pane(&mut sender, pane, &session);
-                                // B-FOCUS: fill_floating_pane focuses `pane` (it
-                                // sends FocusPaneByPaneId), so this relay client's
-                                // focused pane is now `pane` — track it, same as
-                                // the tiled branch does (folded minor).
-                                // Key by connection_id so concurrent relays each update their own slot.
-                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
-                                    entry.state.focused_pane = Some(pane);
-                                }
-                            }
+                        // The fill-vs-hide-vs-tiled action sequence is
+                        // backend-specific and lives behind `toggle_fullscreen`
+                        // (the zellij impl in `multiplexer::zellij`). The relay
+                        // updates its OWN view state from the SAME resolved hint:
+                        //   - hide path (floating, visible, focused) → focus is
+                        //     handed back to an untracked tiled pane → None;
+                        //   - fill path / tiled path → this client now focuses
+                        //     `pane` → Some(pane).
+                        let is_hide = resolved.is_floating
+                            && resolved.floating_visible
+                            && resolved.is_focused_floating;
+                        if let Err(e) = sender.toggle_fullscreen(pane, resolved) {
+                            log::warn!(
+                                "relay inbound [{session}]: ToggleFullscreen failed: {e:#}"
+                            );
                         } else {
-                            // Tiled path: Ctrl+p,f keyboard cadence — focus then
-                            // active-pane toggle. This is always a clean parity
-                            // toggle (enter or exit on the focused pane) — no
-                            // FS_SETTLE_MS exit-then-reenter dance needed.
-                            if let Err(e) = sender.send_action_as_self(
-                                Action::FocusPaneByPaneId { pane_id: pane },
-                            ) {
-                                log::warn!(
-                                    "relay inbound [{session}]: ToggleFullscreen focus failed: {e:#}"
-                                );
-                            } else {
-                                // B-FOCUS: track the pane we just focused.
-                                // Key by connection_id so concurrent relays each update their own slot.
-                                if let Some(mut entry) = view_state.get_mut(&connection_id) {
-                                    entry.state.focused_pane = Some(pane);
-                                }
-                                toggle_active_fullscreen(&mut sender, &session, "toggle");
+                            // Key by connection_id so concurrent relays each update their own slot.
+                            if let Some(mut entry) = view_state.get_mut(&connection_id) {
+                                entry.state.focused_pane = if is_hide { None } else { Some(pane) };
                             }
                         }
                     }
@@ -275,68 +288,7 @@ pub(crate) async fn inbound_loop(
                 Some(RelayControl::QueryLayout { reply }) => {
                     let seq = next_query_seq;
                     next_query_seq = next_query_seq.wrapping_add(1);
-                    log::debug!("relay inbound [{session}]: QueryLayout seq={seq} requested");
-
-                    // Hand the query to the render thread BEFORE sending the
-                    // actions, so the first Log can't arrive before the render
-                    // thread has the slot armed. (Even if it momentarily does,
-                    // the post-recv drain in render_loop picks it up; arming
-                    // first is the simpler ordering.)
-                    let in_flight = InFlightQuery { seq, reply, tabs: None };
-                    if let Err(returned) = query_tx.send(in_flight) {
-                        // Render thread is gone; reply via the sender we get back
-                        // so grpc falls back to the ephemeral path.
-                        log::warn!(
-                            "relay inbound [{session}]: QueryLayout seq={seq}: render thread \
-                             gone (query_tx send failed)"
-                        );
-                        let _ = returned
-                            .0
-                            .reply
-                            .send(Err(anyhow::anyhow!("render thread not available")));
-                        continue;
-                    }
-
-                    // Send both query actions. The render thread retires the slot
-                    // (its receiver cancels) if a send fails to produce a Log; we
-                    // don't need to await or own that path here.
-                    let tabs_action = Action::ListTabs {
-                        show_state: true,
-                        show_dimensions: true,
-                        show_panes: false,
-                        show_layout: false,
-                        show_all: true,
-                        output_json: true,
-                    };
-                    if let Err(e) = sender.send_action_as_self(tabs_action) {
-                        // The InFlightQuery is already owned by the render thread;
-                        // its reply will cancel via RELAY_QUERY_TIMEOUT / close
-                        // detection. Just log — we can't reach `reply` anymore.
-                        log::warn!(
-                            "relay inbound [{session}]: QueryLayout seq={seq}: ListTabs send \
-                             failed (render thread will retire the query): {e:#}"
-                        );
-                        continue;
-                    }
-                    let panes_action = Action::ListPanes {
-                        show_tab: true,
-                        show_command: true,
-                        show_state: true,
-                        show_geometry: true,
-                        show_all: true,
-                        output_json: true,
-                    };
-                    if let Err(e) = sender.send_action_as_self(panes_action) {
-                        log::warn!(
-                            "relay inbound [{session}]: QueryLayout seq={seq}: ListPanes send \
-                             failed (render thread will retire the query): {e:#}"
-                        );
-                        continue;
-                    }
-                    log::trace!(
-                        "relay inbound [{session}]: QueryLayout seq={seq} dispatched \
-                         (render thread will fulfill)"
-                    );
+                    handle_query_layout(&mut *sender, &query_tx, reply, seq, &session);
                 }
 
                 None => {
@@ -363,7 +315,7 @@ pub(crate) async fn inbound_loop(
                                  ({} bytes > {MAX_INPUT_FRAME_BYTES} byte limit)",
                                 bytes.len()
                             );
-                        } else if let Err(e) = forward_input(&mut sender, bytes) {
+                        } else if let Err(e) = forward_input(&mut *sender, bytes) {
                             log::warn!("relay inbound [{session}]: input send failed: {e:#}");
                         }
                     }
@@ -441,11 +393,7 @@ async fn revalidate_token(token: Option<&str>, session: &str) -> bool {
         return false;
     };
     let token = token.to_owned();
-    match tokio::task::spawn_blocking(move || {
-        zellij_utils::web_authentication_tokens::validate_session_token(&token)
-    })
-    .await
-    {
+    match tokio::task::spawn_blocking(move || crate::ipc::validate_session_token(&token)).await {
         Ok(Ok(valid)) => valid,
         Ok(Err(e)) => {
             log::warn!("relay [{session}]: token re-validation DB error (failing closed): {e}");
@@ -464,11 +412,278 @@ async fn revalidate_token(token: Option<&str>, session: &str) -> bool {
 
 /// Forward raw input bytes to the focused pane.
 ///
-/// UTF-8 text goes via `WriteChars` (the A2-proven path); non-UTF-8 byte
-/// sequences (e.g. raw ESC) go via `Write`.
-fn forward_input(sender: &mut AttachSender, bytes: Vec<u8>) -> anyhow::Result<()> {
+/// UTF-8 text goes via `send_input_chars` (the A2-proven `WriteChars` path);
+/// non-UTF-8 byte sequences (e.g. raw ESC) go via `send_input_bytes` (`Write`).
+fn forward_input(sender: &mut dyn MuxSender, bytes: Vec<u8>) -> anyhow::Result<()> {
     match String::from_utf8(bytes) {
-        Ok(text) => sender.send_chars(&text),
-        Err(e) => sender.send_bytes(e.into_bytes()),
+        Ok(text) => sender.send_input_chars(&text),
+        Err(e) => sender.send_input_bytes(e.into_bytes()),
+    }
+}
+
+// ─── Layout-query dispatch (P2.00 A-1) ─────────────────────────────────────────
+
+/// Dispatch a relay-routed `QueryLayout`. **Never awaits and never blocks the
+/// inbound task** — runs inline on the inbound `select!` arm and returns
+/// immediately, so it can never wedge input forwarding or the bearer recheck.
+///
+/// Two paths, chosen by the backend's [`MuxSender::has_sync_layout`] predicate
+/// (B1 — the predicate is cheap and side-effect-free; we can't "peek" by calling
+/// `query_layout_result`, since that call performs the blocking query):
+///
+/// 1. **Out-of-band fast-path** (`has_sync_layout() == true`, herdr) — the backend
+///    answers layout over a separate control socket via
+///    [`MuxSender::query_layout_result`]. That is blocking local-socket I/O
+///    (`2 + N_tabs` round-trips), so we do NOT run it inline: we `box_clone` the
+///    sender and run `query_layout_result` on the **blocking pool**
+///    (`spawn_blocking`), fulfilling `reply` from there. We do NOT arm an in-flight
+///    query nor fire any wire actions, and the arm returns immediately — the
+///    inbound select loop never stalls on the query. The existing
+///    `RELAY_QUERY_TIMEOUT` in `grpc.rs` bounds the `reply` wait (herdr completes
+///    in ms, so it is never hit).
+///
+/// 2. **In-band path** (`has_sync_layout() == false`, zellij — the default) — the
+///    existing zellij flow, byte-identical: hand an [`InFlightQuery`] to the render
+///    thread BEFORE firing the actions (so the first `Log` can't arrive before the
+///    slot is armed), then fire ListTabs THEN ListPanes over the neutral sender and
+///    return. The render thread (sole owner of `recv()`) pairs the two `Log`
+///    replies and fulfills `reply`; the single timeout bound stays
+///    `RELAY_QUERY_TIMEOUT` in `grpc.rs`.
+fn handle_query_layout(
+    sender: &mut dyn MuxSender,
+    query_tx: &QueryTx,
+    reply: QueryReply,
+    seq: u64,
+    session: &str,
+) {
+    // B1: out-of-band fast-path. A sync-layout backend (herdr) answers layout via
+    // blocking local-socket I/O — keep it OFF the inbound task by running it on the
+    // blocking pool. We branch on the cheap predicate (not on the query result)
+    // because `query_layout_result` *does* the blocking work.
+    if sender.has_sync_layout() {
+        log::debug!(
+            "relay inbound [{session}]: QueryLayout seq={seq} → sync-layout backend; \
+             dispatching query_layout_result on the blocking pool (no in-flight arm)"
+        );
+        // `box_clone` only needs `&self`; the clone is `Send + 'static`, so it (and
+        // the `reply` oneshot) move into the spawn_blocking closure. The query only
+        // touches the cloned control Arc; for herdr the dup'd wire fd is unused.
+        let mut q = sender.box_clone();
+        tokio::task::spawn_blocking(move || {
+            let res = q.query_layout_result().unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "query_layout_result returned None for a sync-layout backend"
+                ))
+            });
+            // Receiver may already be gone (grpc RELAY_QUERY_TIMEOUT dropped it) —
+            // a closed-channel send is a harmless no-op.
+            let _ = reply.send(res);
+        });
+        return;
+    }
+
+    log::debug!("relay inbound [{session}]: QueryLayout seq={seq} requested (in-band path)");
+
+    // In-band (zellij) path — unchanged. Hand the query to the render thread
+    // BEFORE sending the actions, so the first Log can't arrive before the render
+    // thread has the slot armed. (Even if it momentarily does, the post-recv
+    // drain in render_loop picks it up; arming first is the simpler ordering.)
+    let in_flight = InFlightQuery {
+        seq,
+        reply,
+        tabs: None,
+    };
+    if let Err(returned) = query_tx.send(in_flight) {
+        // Render thread is gone; reply via the sender we get back so grpc falls
+        // back to the ephemeral path.
+        log::warn!(
+            "relay inbound [{session}]: QueryLayout seq={seq}: render thread \
+             gone (query_tx send failed)"
+        );
+        let _ = returned
+            .0
+            .reply
+            .send(Err(anyhow::anyhow!("render thread not available")));
+        return;
+    }
+
+    // Fire the layout query (ListTabs THEN ListPanes) over the neutral sender.
+    // The InFlightQuery is already owned by the render thread; if a send fails to
+    // produce a Log, its reply cancels via RELAY_QUERY_TIMEOUT / close detection.
+    // We just log — we can't reach `reply` from here anymore.
+    if let Err(e) = sender.query_layout() {
+        log::warn!(
+            "relay inbound [{session}]: QueryLayout seq={seq}: query_layout send \
+             failed (render thread will retire the query): {e:#}"
+        );
+        return;
+    }
+    log::trace!(
+        "relay inbound [{session}]: QueryLayout seq={seq} dispatched \
+         (render thread will fulfill)"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multiplexer::{FullscreenHint, LayoutSnapshot, PaneRef, TabSnapshot};
+    use std::sync::{Arc, Mutex};
+
+    /// A configurable [`MuxSender`] fake for the `QueryLayout` dispatch tests.
+    ///
+    /// `has_sync` is the backend predicate the dispatch branches on; `sync` (taken
+    /// once, shared across `box_clone`s) is what `query_layout_result` returns;
+    /// `wire_fired` records whether the in-band `query_layout()` wire action was
+    /// sent; `cloned` records whether `box_clone` was called (the sync path clones
+    /// the sender to move it onto the blocking pool).
+    struct FakeSender {
+        has_sync: bool,
+        sync: Arc<Mutex<Option<anyhow::Result<LayoutSnapshot>>>>,
+        wire_fired: Arc<Mutex<bool>>,
+        cloned: Arc<Mutex<bool>>,
+    }
+
+    impl MuxSender for FakeSender {
+        fn has_sync_layout(&self) -> bool {
+            self.has_sync
+        }
+        fn query_layout_result(&mut self) -> Option<anyhow::Result<LayoutSnapshot>> {
+            self.sync.lock().unwrap().take()
+        }
+        fn query_layout(&mut self) -> anyhow::Result<()> {
+            *self.wire_fired.lock().unwrap() = true;
+            Ok(())
+        }
+        fn go_to_tab(&mut self, _tab_id: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn focus_pane(&mut self, _pane: PaneRef) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn toggle_fullscreen(&mut self, _p: PaneRef, _h: FullscreenHint) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_input_chars(&mut self, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_input_bytes(&mut self, _bytes: Vec<u8>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_resize(&mut self, _rows: u16, _cols: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_client_exited(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn box_clone(&self) -> Box<dyn MuxSender> {
+            // Sync-layout (herdr) path clones the sender to move it onto the
+            // blocking pool; the clone shares the `sync` slot so the cloned
+            // sender's `query_layout_result` returns the configured snapshot.
+            *self.cloned.lock().unwrap() = true;
+            Box::new(FakeSender {
+                has_sync: self.has_sync,
+                sync: self.sync.clone(),
+                wire_fired: self.wire_fired.clone(),
+                cloned: self.cloned.clone(),
+            })
+        }
+    }
+
+    fn a_snapshot() -> LayoutSnapshot {
+        LayoutSnapshot {
+            tabs: vec![TabSnapshot {
+                tab_id: 1,
+                position: 0,
+                name: "main".into(),
+                active: true,
+                has_bell: false,
+                panes_to_hide: 0,
+                fullscreen_active: false,
+                floating_panes_visible: false,
+                panes: vec![],
+            }],
+        }
+    }
+
+    /// B1 out-of-band fast-path (`has_sync_layout() == true`, herdr): the dispatch
+    /// runs `query_layout_result` on the blocking pool (via `box_clone` +
+    /// `spawn_blocking`) and fulfills the reply from there — NO in-flight query is
+    /// armed and NO wire action is fired. Needs a runtime for `spawn_blocking`.
+    #[tokio::test]
+    async fn sync_layout_fulfills_via_spawn_blocking_without_wire_actions() {
+        let wire_fired = Arc::new(Mutex::new(false));
+        let cloned = Arc::new(Mutex::new(false));
+        let mut sender = FakeSender {
+            has_sync: true,
+            sync: Arc::new(Mutex::new(Some(Ok(a_snapshot())))),
+            wire_fired: wire_fired.clone(),
+            cloned: cloned.clone(),
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let (query_tx, query_rx) = std::sync::mpsc::channel::<InFlightQuery>();
+
+        handle_query_layout(&mut sender, &query_tx, reply_tx, 0, "s");
+
+        // The reply is fulfilled from the blocking pool — await it.
+        let snap = reply_rx
+            .await
+            .expect("reply sent from spawn_blocking")
+            .expect("ok snapshot");
+        assert_eq!(snap.tabs.len(), 1);
+        // The sender was cloned to move it onto the blocking pool.
+        assert!(
+            *cloned.lock().unwrap(),
+            "sync-layout path must box_clone the sender for spawn_blocking"
+        );
+        // No wire action fired and no in-flight query armed.
+        assert!(
+            !*wire_fired.lock().unwrap(),
+            "fast-path must not fire the in-band query_layout() wire action"
+        );
+        assert!(
+            query_rx.try_recv().is_err(),
+            "fast-path must not hand an InFlightQuery to the render thread"
+        );
+    }
+
+    /// In-band (zellij) path (`has_sync_layout() == false`): arms an in-flight
+    /// query AND fires the wire action; the reply stays pending (the render thread
+    /// fulfills it later). Byte-identical to the pre-B1 behaviour — no
+    /// `query_layout_result` call, no thread-hop.
+    #[test]
+    fn query_layout_result_none_arms_in_flight_and_fires_wire() {
+        let wire_fired = Arc::new(Mutex::new(false));
+        let mut sender = FakeSender {
+            has_sync: false,
+            sync: Arc::new(Mutex::new(None)),
+            wire_fired: wire_fired.clone(),
+            cloned: Arc::new(Mutex::new(false)),
+        };
+        let (reply_tx, mut reply_rx) =
+            tokio::sync::oneshot::channel::<anyhow::Result<LayoutSnapshot>>();
+        let (query_tx, query_rx) = std::sync::mpsc::channel::<InFlightQuery>();
+
+        handle_query_layout(&mut sender, &query_tx, reply_tx, 42, "s");
+
+        // An InFlightQuery was handed to the render thread, carrying our seq.
+        let q = query_rx.try_recv().expect("InFlightQuery armed");
+        assert_eq!(q.seq, 42);
+        assert!(q.tabs.is_none(), "fresh in-flight query has no tabs yet");
+        // The wire action was fired.
+        assert!(
+            *wire_fired.lock().unwrap(),
+            "in-band path must fire the query_layout() wire action"
+        );
+        // The reply is owned by the render thread now (moved into InFlightQuery),
+        // so the inbound side never fulfilled it directly.
+        assert!(
+            matches!(
+                reply_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "reply stays pending — the render thread fulfills it from the Log pair"
+        );
+        drop(q); // keeps the moved reply alive until here
     }
 }

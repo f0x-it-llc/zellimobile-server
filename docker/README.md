@@ -9,6 +9,10 @@ interesting target. You SSH into the container and drive everything with
 **Zellij is pinned to v0.44.3** (the version muxrd was compiled against;
 it refuses to start on any other version).
 
+> The rig defaults to the **zellij** backend. To exercise muxrd's **herdr**
+> backend instead, use the opt-in herdr profile — see
+> [Herdr backend (opt-in)](#herdr-backend-opt-in) below.
+
 ## What's inside
 
 - **muxrd** + **muxrctl** (static musl binaries built from the Cargo
@@ -40,6 +44,53 @@ muxrctl                          # Configure → Cert → Tokens → Server → 
 
 In `muxrctl`: generate the cert, create a token, **start** the server, then
 open **Pair** to scan the QR from the app (or copy the token + cert manually).
+
+## Herdr backend (opt-in)
+
+The same rig can drive muxrd's **herdr** backend instead of zellij. This is gated
+behind a Docker Compose `herdr` profile so the default rig is unaffected and never
+downloads herdr:
+
+```bash
+# Loopback (local testing):
+./docker/run.sh --herdr
+# …or compose directly:
+docker compose -f docker/compose.yaml --profile herdr up --build muxrd-herdr
+# LAN/phone: add --host / BIND_ADDR exactly like the zellij rig.
+```
+
+This builds the `runtime-herdr` image (a pinned, **unmodified** upstream herdr
+binary — `HERDR_VERSION`, default `0.7.1`), starts a headless `herdr server`,
+seeds a demo workspace, and exports `MUXRD_BACKEND=herdr` so the `muxrctl`-started
+daemon selects herdr automatically. Then SSH in and drive `muxrctl` exactly as for
+zellij (Configure → Cert → Tokens → **Server (start)** → Pair). The container is
+**`muxr-herdr-rig`**.
+
+> **herdr is pinned to a wire-protocol-14 release (v0.7.1)** — the version muxrd's
+> herdr backend targets. muxrd asserts the version on the wire handshake and fails
+> clearly on a mismatch, so do not bump `HERDR_VERSION` without confirming muxrd's
+> `HERDR_PROTOCOL_VERSION`.
+
+> **AGPL-3.0:** herdr is a separate, unmodified, user-installed binary that muxrd
+> drives only over its public `0600` Unix sockets. The rig downloads the official
+> upstream release for **local** dev use (it is not bundled into the default image,
+> modified, or redistributed). muxrd stays the TLS/bearer boundary; herdr runs
+> same-user/same-host.
+
+> **What you'll see:** herdr per-terminal attach streams the **focused** pane's
+> content (not zellij's all-panes composite); switching panes/tabs in the app
+> re-attaches to that pane. This is expected for the herdr backend. herdr has no
+> floating layer, and pane write/resize/scroll over the ephemeral path return
+> "unsupported" (input/resize/scroll flow through the live attach stream instead).
+
+The two rigs publish the **same host ports** — run one at a time. herdr keeps its
+own state under the `herdr-data` + `muxrd-herdr-data` volumes (separate from the
+zellij rig's). To inspect/drive herdr directly inside the container:
+
+```bash
+docker exec muxr-herdr-rig herdr status server
+docker exec muxr-herdr-rig herdr workspace list
+```
 
 ## LAN / phone access
 

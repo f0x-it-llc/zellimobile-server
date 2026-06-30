@@ -2,13 +2,10 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::actions;
 use crate::proto::{ActionAck as ProtoAck, NewTabReq, RenameTabReq, TabTarget};
 
 use super::MuxrService;
-use super::helpers::{
-    reject_if_read_only, resolve_tab_target, run_action, try_route_control, validate_session,
-};
+use super::helpers::{reject_if_read_only, run_action, short_conn, try_route_control};
 
 impl MuxrService {
     // ── Tab ops (D2) ──────────────────────────────────────────────────────────
@@ -20,15 +17,14 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "NewTab")?;
         let req = request.into_inner();
-        validate_session(&req.session)?;
-        let session = req.session;
+        let (backend, session) = self.resolve_session(&req.session)?;
         let tab_name = if req.tab_name.is_empty() {
             None
         } else {
             Some(req.tab_name)
         };
         log::info!("NewTab: session='{session}' name={tab_name:?}");
-        run_action("NewTab", move || actions::new_tab(&session, tab_name)).await
+        run_action("NewTab", move || backend.new_tab(&session, tab_name)).await
     }
 
     /// Close a tab by id. MUTATING (read-only rejected).
@@ -38,9 +34,10 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "CloseTab")?;
         let req = request.into_inner();
-        let (session, tab_id) = resolve_tab_target(&req)?;
+        let tab_id = req.tab_id;
+        let (backend, session) = self.resolve_session(&req.session)?;
         log::info!("CloseTab: session='{session}' tab_id={tab_id}");
-        run_action("CloseTab", move || actions::close_tab(&session, tab_id)).await
+        run_action("CloseTab", move || backend.close_tab(&session, tab_id)).await
     }
 
     /// Switch focus to a tab by id. MUTATING (read-only rejected).
@@ -51,22 +48,32 @@ impl MuxrService {
         reject_if_read_only(&request, "GoToTab")?;
         let req = request.into_inner();
         let connection_id = req.connection_id.clone();
-        let (session, tab_id) = resolve_tab_target(&req)?;
-        log::info!("GoToTab: session='{session}' tab_id={tab_id} connection_id='{connection_id}'");
+        let tab_id = req.tab_id;
+        let (backend, session) = self.resolve_session(&req.session)?;
+        // FS3: full connection_id must not appear in info/warn logs.
+        log::info!(
+            "GoToTab: session='{session}' tab_id={tab_id} connection_id={}…",
+            short_conn(&connection_id)
+        );
+        log::debug!("GoToTab: session='{session}' tab_id={tab_id} connection_id='{connection_id}'");
         // Route through the live relay client if attached, so the tab switch
         // applies to the *rendering* client (deterministic, no ephemeral).
         // connection_id targets the exact relay that sent the request; falls
         // back to any relay for the session when id is absent/stale.
+        //
+        // Option C: the control registry stores the opaque id the client echoes,
+        // so we route with the original `req.session` (the id), NOT the stripped
+        // bare name — `entry.session == req.session` stays an id-vs-id match.
         if let Some(resp) = try_route_control(
             &self.control,
-            &session,
+            &req.session,
             &connection_id,
             crate::relay::RelayControl::SwitchTab(tab_id),
         ) {
             log::info!("GoToTab: routed via relay client (session='{session}', tab_id={tab_id})");
             return Ok(resp);
         }
-        run_action("GoToTab", move || actions::go_to_tab(&session, tab_id)).await
+        run_action("GoToTab", move || backend.go_to_tab(&session, tab_id)).await
     }
 
     /// Rename a tab by id. MUTATING (read-only rejected).
@@ -76,8 +83,7 @@ impl MuxrService {
     ) -> Result<Response<ProtoAck>, Status> {
         reject_if_read_only(&request, "RenameTab")?;
         let req = request.into_inner();
-        validate_session(&req.session)?;
-        let session = req.session;
+        let (backend, session) = self.resolve_session(&req.session)?;
         let tab_id = req.tab_id;
         let name = req.name;
         if name.is_empty() {
@@ -85,7 +91,7 @@ impl MuxrService {
         }
         log::info!("RenameTab: session='{session}' tab_id={tab_id} name='{name}'");
         run_action("RenameTab", move || {
-            actions::rename_tab(&session, tab_id, name)
+            backend.rename_tab(&session, tab_id, name)
         })
         .await
     }

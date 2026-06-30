@@ -61,6 +61,11 @@ rcgen = { version = "0.14", features = ["pem"] }
 # SHA-256 fingerprint for TLS certificates (used by muxrctl QR pairing).
 sha2 = "0.10"
 
+# CSPRNG for minting unguessable, non-enumerable per-connection ids (S-M4):
+# `rand`'s thread_rng is a ChaCha-based CSPRNG auto-seeded from the OS. Already
+# pulled in transitively via rcgen/ring; promoted to a direct dep here.
+rand = "0.8"
+
 # PEM decoding for cert fingerprinting (already a transitive dep via tonic/rustls).
 rustls-pemfile = "2"
 
@@ -93,6 +98,10 @@ daemonize = "0.5"
 # IPC control socket (LocalSocketStream listener at data_dir()/control.sock).
 # Same crate zellij-utils uses for session sockets; pinned to match.
 interprocess = "2.3"
+
+# Binary framing for herdr wire protocol (v14, length-prefix + bincode standard).
+# bincode 2 API is bincode::serde::encode_to_vec / decode_from_slice.
+bincode = { version = "2", features = ["serde"] }
 
 # Utility
 anyhow = "1"

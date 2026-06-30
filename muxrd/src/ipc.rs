@@ -79,6 +79,21 @@ pub fn validate_session_name(name: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Re-validate a session bearer token against zellij's shared tokens DB.
+///
+/// Thin wrapper over
+/// [`zellij_utils::web_authentication_tokens::validate_session_token`] — sibling
+/// to [`validate_session_name`] — so the relay (which is `zellij_utils`-free as
+/// of P1.03) can re-check a live attach's token mid-stream (Major H) without
+/// naming a zellij type. **Auth is deliberately NOT part of the `MuxBackend`
+/// trait** (Phase 1): a herdr backend's sockets have no auth, so muxrd's token DB
+/// stays the sole security boundary — the relay calls this directly rather than
+/// going through the multiplexer seam (revisited in Phase 3).
+pub fn validate_session_token(token: &str) -> Result<bool> {
+    zellij_utils::web_authentication_tokens::validate_session_token(token)
+        .map_err(|e| anyhow!("validate_session_token: {e}"))
+}
+
 // ─── Attach handle ────────────────────────────────────────────────────────────
 
 /// An open IPC attach to a zellij session.

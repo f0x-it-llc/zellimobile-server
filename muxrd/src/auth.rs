@@ -65,10 +65,7 @@ impl std::fmt::Debug for SessionToken {
 }
 
 /// gRPC URI paths that require **no** bearer auth.
-const PUBLIC_PATHS: &[&str] = &[
-    "/muxr.v1.Muxr/GetVersion",
-    "/muxr.v1.Muxr/Login",
-];
+const PUBLIC_PATHS: &[&str] = &["/muxr.v1.Muxr/GetVersion", "/muxr.v1.Muxr/Login"];
 
 // ─── Layer ────────────────────────────────────────────────────────────────────
 

@@ -21,16 +21,16 @@
 //! Default addr: https://[::1]:50051 ; default session: d1demo.
 
 use anyhow::{Context, Result};
+use muxrd::proto::muxr_client::MuxrClient;
+use muxrd::proto::{
+    LoginRequest, NewPaneReq, PaneTarget, RenamePaneReq, ResizeKind, ResizePaneReq, SessionRef,
+    ToggleFullscreenReq, WriteToPaneReq,
+};
 use tonic::transport::Channel;
 use tonic::{
     Request,
     metadata::MetadataValue,
     transport::{Certificate, ClientTlsConfig},
-};
-use muxrd::proto::muxr_client::MuxrClient;
-use muxrd::proto::{
-    LoginRequest, NewPaneReq, PaneTarget, RenamePaneReq, ResizeKind, ResizePaneReq, SessionRef,
-    ToggleFullscreenReq, WriteToPaneReq,
 };
 
 // ─── Args ─────────────────────────────────────────────────────────────────────

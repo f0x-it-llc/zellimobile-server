@@ -80,6 +80,21 @@ service Muxr {
   // Create a new detached session by name. MUTATING.
   rpc CreateSession(CreateSessionReq) returns (ActionAck);
 
+  // ─── Spaces (herdr workspaces) ────────────────────────────────────────────
+  // Herdr maps workspaces to spaces; zellij returns an empty SpaceList.
+  // All require bearer auth.  MUTATING ops reject read-only tokens.
+
+  // List all spaces (herdr workspaces) for a session. Zellij returns empty.
+  rpc GetSpaces(SessionRef)       returns (SpaceList);
+  // Switch the active space. MUTATING.
+  rpc SwitchSpace(SwitchSpaceReq) returns (ActionAck);
+  // Create a new space with an optional label. MUTATING.
+  rpc CreateSpace(CreateSpaceReq) returns (ActionAck);
+  // Rename an existing space. MUTATING.
+  rpc RenameSpace(RenameSpaceReq) returns (ActionAck);
+  // Close (delete) a space. MUTATING.
+  rpc CloseSpace(CloseSpaceReq)   returns (ActionAck);
+
   // ─── Phase F: token management ─────────────────────────────────────────────
   // Wraps the same zellij `web_authentication_tokens` ops the CLI uses. All
   // require bearer auth and are ADMIN-gated: read-only session tokens are
@@ -95,11 +110,28 @@ service Muxr {
 
 message Empty {}
 
+// Multiplexer backend that owns a session.
+enum Backend {
+  BACKEND_UNSPECIFIED = 0;
+  BACKEND_ZELLIJ      = 1;
+  BACKEND_HERDR       = 2;
+}
+
+// Version string for one available backend.
+message BackendVersion {
+  Backend backend = 1;
+  string  version = 2;
+}
+
 message VersionInfo {
   // Semantic version of muxrd itself.
   string server_version = 1;
-  // Zellij version this server was compiled against.
+  // Zellij version this server was compiled against (back-compat; = the zellij BackendVersion's value).
   string zellij_version = 2;
+  // Per-backend versions for all detected backends.
+  repeated BackendVersion backends           = 3;
+  // Detected/usable backends.
+  repeated Backend        available_backends = 4;
 }
 
 message LoginRequest {
@@ -225,6 +257,15 @@ message SessionInfo {
   // Count of mobile clients currently attached to this session THROUGH
   // muxrd (active AttachTerminal relays), not zellij-level clients.
   uint32 connected_clients  = 8;
+  // Multiplexer backend that owns this session (for client tint).
+  Backend backend           = 9;
+  // Opaque backend-qualified routing key (e.g. "zellij:dev").
+  string  id                = 10;
+  // Number of spaces (herdr workspaces) for this session; 0 for backends
+  // without a space layer (e.g. zellij). Populated by ListSessions so the
+  // client can show a space count on herdr session cards without a separate
+  // GetSpaces call.
+  uint32 space_count        = 11;
 }
 
 // Full tab/pane layout for a session (returned by GetLayout).
@@ -437,4 +478,66 @@ message CreateSessionReq {
   string name   = 1;
   // Optional layout file path (passed as --layout to zellij; unused if empty).
   string layout = 2;
+  // Which backend to create the session on (required when >1 backend available).
+  Backend backend = 3;
+}
+
+// ─── Spaces (herdr workspaces) ────────────────────────────────────────────────
+// A Space is a herdr workspace.  Zellij sessions always return an empty list.
+
+// One herdr workspace / space.
+message Space {
+  // Opaque herdr workspace id.
+  string id     = 1;
+  // Display name of the workspace.
+  string name   = 2;
+  // Whether this is the currently-active workspace.
+  bool   active = 3;
+}
+
+// List of spaces returned by GetSpaces.
+message SpaceList {
+  repeated Space spaces = 1;
+}
+
+// SwitchSpace request — activate a different space.
+message SwitchSpaceReq {
+  // Backend-qualified session id (echoed verbatim from SessionInfo.id).
+  string session       = 1;
+  // Opaque space id to switch to.
+  string space_id      = 2;
+  // optional; per-connection routing (echoed from AttachTerminal connection_id).
+  string connection_id = 3;
+}
+
+// CreateSpace request — create a new herdr workspace.
+message CreateSpaceReq {
+  // Backend-qualified session id.
+  string session       = 1;
+  // Human-readable label for the new space (may be empty).
+  string label         = 2;
+  // optional; per-connection routing.
+  string connection_id = 3;
+}
+
+// RenameSpace request — rename an existing space.
+message RenameSpaceReq {
+  // Backend-qualified session id.
+  string session       = 1;
+  // Opaque space id to rename.
+  string space_id      = 2;
+  // New display label.
+  string label         = 3;
+  // optional; per-connection routing.
+  string connection_id = 4;
+}
+
+// CloseSpace request — close (delete) a space.
+message CloseSpaceReq {
+  // Backend-qualified session id.
+  string session       = 1;
+  // Opaque space id to close.
+  string space_id      = 2;
+  // optional; per-connection routing.
+  string connection_id = 3;
 }

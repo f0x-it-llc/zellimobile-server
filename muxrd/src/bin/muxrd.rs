@@ -25,16 +25,20 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
 use muxrd::auth::BearerAuthLayer;
-use muxrd::cli::{Cli, Command, InitArgs, StartArgs};
+use muxrd::cli::{BackendKind, Cli, Command, InitArgs, StartArgs};
 use muxrd::config::{self, CertSource, check_h2c_bind_safety};
 use muxrd::control::{self, ControlRequest, ControlResponse};
 use muxrd::grpc::MuxrService;
+use muxrd::multiplexer::detect;
+use muxrd::multiplexer::{BackendSet, HerdrBackend, MuxBackend, ZellijBackend};
 use muxrd::proto::muxr_server::MuxrServer;
 use muxrd::tls::SanEntry;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 /// Pidfile name inside the data dir.
 const PIDFILE_NAME: &str = "muxrd.pid";
@@ -90,129 +94,35 @@ fn pidfile_path() -> Result<PathBuf> {
 }
 
 /// Env var that bypasses the zellij version-mismatch check (review Major F).
+/// Referenced in error messages; the actual skip logic lives in
+/// `muxrd::multiplexer::detect::probe_zellij`.
 const SKIP_VERSION_CHECK_ENV: &str = "ZELLIMSERVER_SKIP_VERSION_CHECK";
-
-/// Timeout for the `zellij --version` subprocess.
-const VERSION_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Refuse to start when the **installed** `zellij` binary's version differs from
 /// the zellij crate this server was compiled against.
 ///
-/// A mismatch leads to silent IPC decode failures at runtime (the wire contract
-/// drifted), so we fail fast at `start` with a clear, actionable error.  Set
-/// `ZELLIMSERVER_SKIP_VERSION_CHECK=1` to proceed anyway (power-user override).
+/// Delegates the actual probe (binary discovery, `zellij --version` run,
+/// version comparison, and `ZELLIMSERVER_SKIP_VERSION_CHECK` handling) to
+/// [`detect::probe_zellij`] so the startup check and backend auto-detection
+/// share a single implementation.
 ///
 /// Returns the resolved zellij binary path so the caller can reuse it for
 /// `create_session` (TOCTOU fix: resolve once, pass everywhere).
 fn check_zellij_version() -> Result<PathBuf> {
     if std::env::var(SKIP_VERSION_CHECK_ENV).is_ok_and(|v| !v.is_empty() && v != "0") {
         log::warn!("{SKIP_VERSION_CHECK_ENV} set — skipping zellij version-mismatch check");
-        // Still resolve the binary path so it can be threaded through to create_session.
-        return muxrd::actions::which_zellij()
-            .context("could not locate the zellij binary (even with version check skipped)");
     }
-
-    // The version of the linked zellij crate (our IPC contract).
-    let linked = zellij_utils::consts::VERSION;
-
-    // Resolve the zellij binary ONCE — reused for both version check and
-    // create_session (TOCTOU fix: a single lookup, not two independent ones).
-    let bin = muxrd::actions::which_zellij()
-        .context("version check: could not locate the zellij binary")?;
-
-    // Spawn `zellij --version` with a timeout so a wedged binary can't hang startup.
-    // Use a background thread + channel so we can enforce a hard wall-clock
-    // timeout without depending on an external `wait_timeout` crate.
-    let bin_clone = bin.clone();
-    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<std::process::Output>>();
-    std::thread::Builder::new()
-        .name("zellij-version-check".into())
-        .spawn(move || {
-            let result = std::process::Command::new(&bin_clone)
-                .arg("--version")
-                .output()
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to run '{} --version': {e}", bin_clone.display())
-                });
-            let _ = tx.send(result);
-        })
-        .context("version check: failed to spawn helper thread")?;
-
-    let output = match rx.recv_timeout(VERSION_CHECK_TIMEOUT) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            anyhow::bail!(
-                "version check: '{} --version' failed: {e}. \
-                 Set {SKIP_VERSION_CHECK_ENV}=1 to override.",
-                bin.display(),
-            );
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!(
-                "version check: '{} --version' timed out after {:?} — \
-                 the zellij binary may be wedged. Set {SKIP_VERSION_CHECK_ENV}=1 to override.",
-                bin.display(),
-                VERSION_CHECK_TIMEOUT,
-            );
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!(
-                "version check: helper thread exited unexpectedly. \
-                 Set {SKIP_VERSION_CHECK_ENV}=1 to override."
-            );
-        }
-    };
-
-    if !output.status.success() {
+    if !detect::probe_zellij() {
+        let linked = zellij_utils::consts::VERSION;
         anyhow::bail!(
-            "version check: '{} --version' exited with {} — cannot verify zellij version. \
-             Set {SKIP_VERSION_CHECK_ENV}=1 to override.",
-            bin.display(),
-            output.status,
+            "zellij version check failed: the zellij binary was not found on PATH or its \
+             version does not match the linked IPC contract {linked}. \
+             Install zellij {linked}, or set {SKIP_VERSION_CHECK_ENV}=1 to proceed anyway.",
         );
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let installed = parse_zellij_version(&stdout);
-
-    if installed.is_empty() {
-        anyhow::bail!(
-            "version check: could not parse a version from '{} --version' output: {:?}. \
-             Set {SKIP_VERSION_CHECK_ENV}=1 to override.",
-            bin.display(),
-            stdout.trim(),
-        );
-    }
-
-    if installed != linked {
-        anyhow::bail!(
-            "zellij version mismatch: this server was built against zellij {linked}, but the \
-             installed binary at {} reports {installed}. Running with a mismatched zellij causes \
-             silent IPC decode failures. Install zellij {linked}, or set \
-             {SKIP_VERSION_CHECK_ENV}=1 to proceed anyway.",
-            bin.display(),
-        );
-    }
-
-    log::info!(
-        "zellij version check OK: installed {installed} matches linked contract {linked} ({})",
-        bin.display()
-    );
-    Ok(bin)
-}
-
-/// Parse the version string from `zellij --version` output.
-///
-/// `"zellij 0.44.3\n"` → `"0.44.3"`.  Returns `""` if unparseable.
-///
-/// This is a pure function exposed for unit testing.
-pub fn parse_zellij_version(output: &str) -> String {
-    output
-        .split_whitespace()
-        .last()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    // probe_zellij passed → the binary is present and version-matched.
+    // Resolve its path for the caller (cheap second lookup on the same PATH).
+    muxrd::actions::which_zellij().context("locate zellij binary (post version-check)")
 }
 
 /// Collect extra SANs from CLI `--san` values and the `ZELLIMSERVER_SAN` env var.
@@ -266,9 +176,12 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
 
     // Use the same cert-source resolution as `cmd_start` (env fallbacks +
     // precedence + mutual-exclusion validation — no hand-rolled match here).
-    let cert_source =
-        config::resolve_cert_source(args.tls_cert.clone(), args.tls_key.clone(), args.insecure_h2c)
-            .context("invalid TLS cert configuration")?;
+    let cert_source = config::resolve_cert_source(
+        args.tls_cert.clone(),
+        args.tls_key.clone(),
+        args.insecure_h2c,
+    )
+    .context("invalid TLS cert configuration")?;
 
     match &cert_source {
         CertSource::External { cert, key } => {
@@ -299,7 +212,10 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
                 .copied()
                 .chain(extra_desc.iter().map(String::as_str))
                 .collect();
-            println!("Cert SANs: {} (note: external cert SANs are fixed by the issuer)", all_sans.join(", "));
+            println!(
+                "Cert SANs: {} (note: external cert SANs are fixed by the issuer)",
+                all_sans.join(", ")
+            );
         }
         CertSource::H2c => {
             // No cert needed — plaintext h2c delegates TLS to the proxy.
@@ -321,9 +237,8 @@ async fn cmd_init(bind_override: Option<&str>, args: InitArgs) -> Result<()> {
         }
         CertSource::SelfSigned => {
             // Load or generate the self-signed cert+key (idempotent w.r.t. SANs).
-            let (_identity, _cert_pem) =
-                muxrd::tls::load_or_generate_identity(&extra_sans)
-                    .context("failed to load/generate TLS certificate")?;
+            let (_identity, _cert_pem) = muxrd::tls::load_or_generate_identity(&extra_sans)
+                .context("failed to load/generate TLS certificate")?;
 
             // Print the cert file path.
             let cert_path = data_dir.join("server.crt");
@@ -468,23 +383,84 @@ fn cmd_config(bind_override: Option<&str>, args: muxrd::cli::ConfigArgs) -> Resu
 
 // ── start ─────────────────────────────────────────────────────────────────────
 
-/// `start [--daemonize] [--san <san>...]`.
+/// `start [--daemonize] [--san <san>...] [--backend <zellij|herdr>]`.
 ///
 /// In foreground mode this constructs a tokio runtime and serves directly.  In
 /// daemon mode it forks FIRST (via `daemonize`, while still single-threaded),
 /// and only the detached child builds the runtime and serves.
 fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
-    // Major F: refuse to start if the installed `zellij` binary's version
+    // ── Backend restriction: CLI wins over MUXRD_BACKEND env ────────────────
+    // `--backend`/`MUXRD_BACKEND` is now an OPTIONAL restriction (Phase 3):
+    //   - unset      → serve ALL detected backends (new default).
+    //   - set        → serve ONLY that backend (Phase 2 selector behaviour).
+    // The CLI flag wins over the env var (per DEVELOPMENT.md).
+    let backend_override: Option<BackendKind> = args.backend.or_else(|| {
+        std::env::var("MUXRD_BACKEND")
+            .ok()
+            .and_then(|v| match v.to_lowercase().as_str() {
+                "zellij" => Some(BackendKind::Zellij),
+                "herdr" => Some(BackendKind::Herdr),
+                "" => None,
+                other => {
+                    log::warn!(
+                        "MUXRD_BACKEND={other:?} is not a recognized backend; \
+                         ignoring (serving all detected backends). \
+                         Valid values: zellij, herdr."
+                    );
+                    None
+                }
+            })
+    });
+
+    // ── Auto-detect which backends are usable (fail fast if none) ────────────
+    // `detect_backends(None)` probes every backend and returns the subset that
+    // passes; `detect_backends(Some(kind))` probes only the requested one and
+    // errors if it is unavailable. Either way an empty result is impossible —
+    // the helper bails with a descriptive error, which we surface as a non-zero
+    // exit.
+    let resolved_kinds = detect::detect_backends(backend_override)
+        .context("no usable multiplexer backend available")?;
+
+    // ── Zellij version assert (only when zellij is among the served set) ─────
+    // Major F: refuse to start when the installed `zellij` binary's version
     // disagrees with the zellij crate we linked against — a mismatch causes
-    // silent IPC decode failures at runtime.  Overridable for power users.
-    //
-    // TOCTOU fix: resolve the binary path ONCE here and thread it through
-    // rather than re-running which_zellij() independently in create_session.
-    let _zellij_bin = check_zellij_version()?;
-    // Note: _zellij_bin is currently unused here because create_session
-    // resolves it internally. Future refactor can thread it through
-    // actions::create_session for full TOCTOU elimination; the path
-    // is resolved once and the version verified.
+    // silent IPC decode failures at runtime. `detect_backends` already probed
+    // the version, but we keep the explicit assert for its detailed error
+    // message. The herdr-only path skips it: herdr has no zellij dependency.
+    if resolved_kinds.contains(&BackendKind::Zellij) {
+        let _zellij_bin = check_zellij_version()?;
+        // Note: _zellij_bin is currently unused here because create_session
+        // resolves it internally. Future refactor can thread it through
+        // actions::create_session for full TOCTOU elimination; the path is
+        // resolved once and the version verified.
+    } else {
+        log::info!(
+            "backend: zellij not in served set — skipping zellij version check \
+             (herdr has no zellij dependency)"
+        );
+    }
+
+    // ── Construct each detected backend into the ordered BackendSet ──────────
+    let mut backend_entries: Vec<(BackendKind, Arc<dyn MuxBackend>)> =
+        Vec::with_capacity(resolved_kinds.len());
+    for kind in &resolved_kinds {
+        match kind {
+            BackendKind::Zellij => {
+                log::info!("backend: zellij (Unix-domain IPC)");
+                backend_entries.push((BackendKind::Zellij, Arc::new(ZellijBackend)));
+            }
+            BackendKind::Herdr => {
+                let b = HerdrBackend::from_env();
+                log::info!("backend: herdr ({})", b.backend_version());
+                backend_entries.push((BackendKind::Herdr, Arc::new(b)));
+            }
+        }
+    }
+    let backends = BackendSet::new(backend_entries);
+    log::debug!(
+        "serving backends: {:?}",
+        backends.kinds().collect::<Vec<_>>()
+    );
 
     let cfg = config::resolve(bind_override).context("resolve config")?;
     let addr: std::net::SocketAddr = cfg
@@ -493,9 +469,12 @@ fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
         .with_context(|| format!("invalid bind address '{}'", cfg.bind_addr))?;
 
     // Resolve cert source from CLI args (applies precedence: h2c > external > self-signed).
-    let cert_source =
-        config::resolve_cert_source(args.tls_cert.clone(), args.tls_key.clone(), args.insecure_h2c)
-            .context("invalid TLS cert configuration")?;
+    let cert_source = config::resolve_cert_source(
+        args.tls_cert.clone(),
+        args.tls_key.clone(),
+        args.insecure_h2c,
+    )
+    .context("invalid TLS cert configuration")?;
 
     // Resolve the h2c non-loopback acknowledgement (CLI flag OR env var).
     let h2c_allow_public = args.h2c_allow_public || {
@@ -579,6 +558,7 @@ fn cmd_start(bind_override: Option<&str>, args: StartArgs) -> Result<()> {
         args.daemonize,
         extra_sans,
         cert_source,
+        backends,
     ));
 
     // Foreground cleanup (in daemon mode daemonize owns the pidfile).
@@ -607,14 +587,13 @@ fn cert_identity(
             Ok(Some(pair))
         }
         CertSource::External { cert, key } => {
-            let pair = muxrd::tls::load_external_identity(cert, key)
-                .with_context(|| {
-                    format!(
-                        "failed to load external TLS cert '{}' and key '{}'",
-                        cert.display(),
-                        key.display()
-                    )
-                })?;
+            let pair = muxrd::tls::load_external_identity(cert, key).with_context(|| {
+                format!(
+                    "failed to load external TLS cert '{}' and key '{}'",
+                    cert.display(),
+                    key.display()
+                )
+            })?;
             log::info!(
                 "tls: using external certificate '{}' with key '{}'",
                 cert.display(),
@@ -633,12 +612,17 @@ fn cert_identity(
 /// - `SelfSigned` → load or generate the self-signed cert; serve over TLS.
 /// - `External`   → load the caller-supplied cert+key; serve over TLS.
 /// - `H2c`        → serve plaintext HTTP/2; **MUST** sit behind a trusted TLS proxy.
+///
+/// `backends` is the resolved [`BackendSet`] (every detected backend: zellij
+/// and/or herdr), constructed and logged by [`cmd_start`] before the runtime is
+/// entered.
 async fn serve(
     addr: std::net::SocketAddr,
     bind_addr: String,
     quiet: bool,
     extra_sans: Vec<SanEntry>,
     cert_source: CertSource,
+    backends: BackendSet,
 ) -> Result<()> {
     install_crypto_provider();
 
@@ -676,7 +660,7 @@ async fn serve(
         }
     };
 
-    let service = MuxrService::new();
+    let service = MuxrService::with_backends(backends);
 
     // ── Control socket + graceful shutdown signal ────────────────────────────
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -702,9 +686,7 @@ async fn serve(
     // URI path — it can distinguish Login/GetVersion from AttachTerminal.
     let mut builder = Server::builder();
     if let Some(tls) = maybe_tls {
-        builder = builder
-            .tls_config(tls)
-            .context("failed to configure TLS")?;
+        builder = builder.tls_config(tls).context("failed to configure TLS")?;
     }
     builder
         .layer(BearerAuthLayer)
@@ -729,8 +711,15 @@ mod tests {
     fn cert_identity_h2c_returns_none() {
         // No crypto provider needed — h2c returns before touching TLS.
         let result = cert_identity(&CertSource::H2c, &[]);
-        assert!(result.is_ok(), "cert_identity(H2c) should not error: {:?}", result.err());
-        assert!(result.unwrap().is_none(), "cert_identity(H2c) must return None");
+        assert!(
+            result.is_ok(),
+            "cert_identity(H2c) should not error: {:?}",
+            result.err()
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "cert_identity(H2c) must return None"
+        );
     }
 
     /// `cert_identity` for SelfSigned must return `Some` with a non-empty cert PEM.
@@ -825,9 +814,7 @@ fn cmd_stop() -> Result<()> {
                 // is read from our own pidfile.
                 let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
                 if rc == 0 {
-                    println!(
-                        "muxrd: sent SIGTERM to pid {pid} (control socket was unresponsive)."
-                    );
+                    println!("muxrd: sent SIGTERM to pid {pid} (control socket was unresponsive).");
                 } else {
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::ESRCH) {
